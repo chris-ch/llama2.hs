@@ -394,7 +394,7 @@ generateTokens maxSteps promptTokens temperature vocab seedValue = do
         (kC, vC) <- gets (\cache -> (keyCache cache, valueCache cache))
         put (AttentionKV {keyCache = take timestep kC ++ [[]], valueCache = take timestep vC ++ [[]]})
         (tokenStr, nextToken) <- generateNextToken timestep promptTokens temperature vocab token seedValue
-        liftIO $ printf "%s" (BSC.unpack tokenStr)
+        liftIO $ putStr $ BSC.unpack tokenStr
         liftIO $ hFlush stdout
         go network (timestep + 1) (result ++ [tokenStr]) nextToken
 
