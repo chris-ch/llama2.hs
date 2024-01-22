@@ -2,9 +2,9 @@ cabal-version:  3.4
 
 name:           llama2
 version:        0.1.0.0
-description:    Please see the README on GitHub at <https://github.com/chris-ch/llama2-haskell-inference#readme>
-homepage:       https://github.com/githubuser/llama2-haskell-inference#readme
-bug-reports:    https://github.com/githubuser/llama2-haskell-inference/issues
+description:    Please see the README on GitHub at <https://github.com/chris-ch/llama2.hs#readme>
+homepage:       https://github.com/chris-ch/llama2.hs#readme
+bug-reports:    https://github.com/chris-ch/llama2.hs/issues
 author:         Christophe Alexandre
 maintainer:     christophe.alexandre@pm.me
 category:       LLM
@@ -14,11 +14,10 @@ license-file:   LICENSE
 build-type:     Simple
 extra-source-files:
     README.md
-    CHANGELOG.md
 
 source-repository head
   type: git
-  location: https://github.com/githubuser/llama2-haskell-inference
+  location: https://github.com/chris-ch/llama2.hs
 
 
 executable llama2
