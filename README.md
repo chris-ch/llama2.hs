@@ -42,7 +42,3 @@ The next day, Lily came back to Tom's house with a big smile. She had a big bag 
 From that day on, Lily and Tom became good friends. They would often talk and share potatoes from the humble little house. And they all lived happily ever after.
 <s>
 ```
-
-## License
-
-MIT
