@@ -8,7 +8,7 @@ Have you ever wanted to inference a baby [Llama 2](https://ai.meta.com/llama/) m
 
 This is a fork of Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c), implemented in pure [Haskell](https://haskell.org).
 
-Thanks to GitHub [codespaces](https://github.com/codespaces) you don't even need to have a Haskell compiler installed on your computer. Simply create a new Code Space pointing to this repo, and you will get a brand new remote machine with all the tooling already installed and accessible directly from your browser.
+Thanks to GitHub [codespaces](https://github.com/codespaces) you don't even need to have a Haskell compiler installed on your computer. Simply create a new Code Space pointing to this repo, and you will get a brand new remote machine with all the tooling already installed and accessible directly from your browser. All you need is a coffee machine nearby, because downloading all the Haskell libraries takes several minutes the first time you launch the executable.
 
 ## Running the llama2
 
@@ -25,19 +25,21 @@ There are also bigger models, for better stories:
 wget --directory-prefix=data https://huggingface.co/karpathy/tinyllamas/resolve/main/stories110M.bin
 ```
 
-Once a model is available, you can then run the llama2 right away: 
+Once a model is downloaded, you can then run the llama2 right away: 
 
 ```shell
 cabal run -- llama2 --model-file data/stories15M.bin --temperature 0.8 --steps 256 "In that little town"
 ```
 
-This is the kind of output you will get (here using the 15M model):
+This is the kind of output you will get (here using the 110M model):
 
 ```text
 <s>
-In that little town, there was a girl named Jane. Jane had a big, colorful folder. She loved her folder very much. She took it everywhere she went.
-One day, Jane went to the park with her folder. She saw a boy named Tim. Tim was sad. Jane asked, "Why are you sad, Tim?" Tim said, "I lost my toy car." Jane wanted to help Tim. She said, "Let's look for your toy car together."
-They looked and looked. Then, they found the toy car under a tree. Tim was very happy. He said, "Thank you, Jane!" Jane felt good because she helped her friend. The moral of the story is that helping others can make you feel good too.
+In that little town, there was a humble house. In the house lived a kind man named Tom. Tom had a big potato farm. He loved to grow potatoes and share them with his friends.
+One day, a little girl named Lily came to Tom's house. She was hungry and asked, "Can I have a potato, please?" Tom smiled and said, "Of course, Lily! I have many potatoes to offer you."
+Tom gave Lily a big potato from his farm. Lily was very happy and said, "Thank you, Tom!" She went back to her home and ate the potato. It was the best potato she had ever tasted.
+The next day, Lily came back to Tom's house with a big smile. She had a big bag of coins. "Tom, I want to give you this coins to say thank you for the potato," she said. Tom was very happy and thanked Lily for the coins.
+From that day on, Lily and Tom became good friends. They would often talk and share potatoes from the humble little house. And they all lived happily ever after.
 <s>
 ```
 

@@ -1,56 +1,27 @@
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE OverloadedStrings #-}
 module Main (main) where
 
-import Options.Applicative
-    ( optional,
-      (<**>),
-      auto,
-      fullDesc,
-      help,
-      info,
-      long,
-      metavar,
-      option,
-      strArgument,
-      strOption,
-      value,
-      execParser,
-      helper,
-      Parser )
-import qualified Data.ByteString.Lazy as BS
-import qualified Data.Binary.Get as BG
-import qualified Data.List as DL
-import qualified Data.Vector.Unboxed as V
-
-import System.Directory ( canonicalizePath )
-import Text.Printf (printf)
-import Control.Monad (replicateM)
-import Data.Binary.Get (getInt32le, getFloatle)
-import Data.Maybe (fromMaybe)
-import Data.Int (Int32)
-import Data.Vector.Unboxed (Vector)
-
+import qualified Options.Applicative as OA
 import qualified Data.ByteString.Lazy as BS
 import qualified Data.ByteString.Lazy.Char8 as BSC
+import qualified Data.Binary.Get as BG
+import qualified Data.Vector.Unboxed as V
 import qualified Data.List as DL
 import qualified Data.List.Split as DLS
 import qualified System.Random as R
-import qualified Data.Vector.Unboxed as V
 
-import NetworkBuilder (NetworkConfig(..), AttentionKV(..),
-  Matrix, TransformerWeighting(..), KeyCache, ValueCache, Vocabulary, PromptTokens, Token,
-  initModel, tokenizerInit)
+import Control.Monad (replicateM, foldM)
 import Control.Monad.State ( StateT, evalStateT, MonadState(put), gets )
-import System.IO (hFlush, stdout)
-import Control.Monad (foldM)
-import Text.Printf (printf)
+import Control.Monad.Reader ( MonadIO(liftIO), ReaderT(runReaderT), MonadReader(ask) )
 import Data.Maybe (fromMaybe)
 import Data.Time.Clock.POSIX (getPOSIXTime)
-import Control.Monad.Reader
-    ( MonadIO(liftIO),
-      ReaderT(runReaderT),
-      MonadReader(ask) )
 import GHC.Unicode (isSpace)
+import Text.Printf (printf)
+import Data.Binary.Get (getInt32le, getFloatle)
+import Data.Int (Int32)
+import Data.Vector.Unboxed (Vector)
+import System.IO (hFlush, stdout)
 
 
 data Options = Options
@@ -63,22 +34,20 @@ data Options = Options
     }
 
 -- Parser for command-line options
-optionsParser :: Parser Options
+optionsParser :: OA.Parser Options
 optionsParser = Options
-    <$> optional (option auto (long "seed" <> help "Seed for debugging"))
-    <*> strOption (long "tokenizer-file" <> value "./data/tokenizer.bin" <> help "Tokenizer binary file")
-    <*> strOption (long "model-file" <> value "./data/stories15M.bin" <> metavar "MODEL_FILE" <> help "Model binary file")
-    <*> option auto (long "temperature" <> value 0.0 <> metavar "TEMPERATURE" <> help "Temperature")
-    <*> option auto (long "steps" <> value 256 <> metavar "STEPS" <> help "Number of steps")
-    <*> optional (strArgument (metavar "PROMPT" <> help "Initial prompt"))
+    <$> OA.optional (OA.option OA.auto (OA.long "seed" <> OA.help "Seed for debugging"))
+    <*> OA.strOption (OA.long "tokenizer-file" <> OA.value "./data/tokenizer.bin" <> OA.help "Tokenizer binary file")
+    <*> OA.strOption (OA.long "model-file" <> OA.value "./data/stories15M.bin" <> OA.metavar "MODEL_FILE" <> OA.help "Model binary file")
+    <*> OA.option OA.auto (OA.long "temperature" <> OA.value 0.0 <> OA.metavar "TEMPERATURE" <> OA.help "Temperature")
+    <*> OA.option OA.auto (OA.long "steps" <> OA.value 256 <> OA.metavar "STEPS" <> OA.help "Number of steps")
+    <*> OA.optional (OA.strArgument (OA.metavar "PROMPT" <> OA.help "Initial prompt"))
 
 main :: IO ()
 main = do
-    Options {..} <- execParser $ info (optionsParser <**> helper) fullDesc
+    Options {..} <- OA.execParser $ OA.info (optionsParser OA.<**> OA.helper) OA.fullDesc
     modelFileContent <- BS.readFile modelFile
     tokenizerFileContent <- BS.readFile tokenizerFile
-    tokenizerAbsolutePath <- canonicalizePath tokenizerFile
-    printf "using tokenizer %s\n" tokenizerAbsolutePath
     run modelFileContent tokenizerFileContent (realToFrac temperature) steps prompt seed
 
 type Matrix a = [Vector a] -- Matrix as row vectors
@@ -153,8 +122,8 @@ parseNetworkConfigFile = do
         w2' <- readMatrices nLayers' dim' hiddenDim'
         w3' <- readMatrices nLayers' hiddenDim' dim'
         rmsFinalWeight' <- readVector dim'
-        freqCisReal' <- readVectors seqLen' ((dim' `div` (numAttentionHeads')) `div` 2)
-        freqCisImag' <- readVectors seqLen' ((dim' `div` (numAttentionHeads')) `div` 2)
+        freqCisReal' <- readVectors seqLen' ((dim' `div` numAttentionHeads') `div` 2)
+        freqCisImag' <- readVectors seqLen' ((dim' `div` numAttentionHeads') `div` 2)
 
         let
             headDim = dim' `div` numAttentionHeads'
@@ -225,7 +194,7 @@ processTokens tokens vocab vocabScores = case findBestPair tokens of
         where
           checkPair :: (Int, (Token, Token)) -> Maybe (Int, Token) -> Maybe (Int, Token)
           checkPair (count, (tokenPrev, tokenNext)) acc =
-            case strLookup ((vocab !! (fromIntegral tokenPrev)) `BS.append` (vocab !! (fromIntegral tokenNext))) vocab of
+            case strLookup ((vocab !! fromIntegral tokenPrev) `BS.append` (vocab !! fromIntegral tokenNext)) vocab of
               pos | pos /= -1 && vocabScores !! pos > bestScore -> Just (count, fromIntegral pos)
               _ -> acc
 
@@ -281,12 +250,12 @@ applyRotations headVector freqCisRealRow freqCisImagRow =
   V.fromList $ concatMap applyRotation [0,2..V.length headVector - 2]
   where
     applyRotation :: Int -> [Float]
-    applyRotation headItemIndex = [value * real - valueNext * imag, value * imag + valueNext * real]
+    applyRotation headItemIndex = [v * real - v' * imag, v * imag + v' * real]
       where
         real = freqCisRealRow V.! (headItemIndex `div` 2)
         imag = freqCisImagRow V.! (headItemIndex `div` 2)
-        value = headVector V.! headItemIndex
-        valueNext = headVector V.! (headItemIndex + 1)
+        v = headVector V.! headItemIndex
+        v' = headVector V.! (headItemIndex + 1)
 
 matrixVectorMult :: Matrix Float -> V.Vector Float -> V.Vector Float
 matrixVectorMult mat vec = V.fromList $ map (`dotProduct` vec) mat
@@ -314,7 +283,7 @@ computeDeltaFFN :: TransformerWeighting -> Int -> V.Vector Float -> V.Vector Flo
 computeDeltaFFN weights indexLayer token =
     let
       sigmoidLinearUnit :: Float -> Float
-      sigmoidLinearUnit value = value / (1.0 + exp (-value))
+      sigmoidLinearUnit v = v / (1.0 + exp (-v))
 
       rmsFFNWeight = rmsFfnWeight weights !! indexLayer
       weight1 = w1 weights !! indexLayer
@@ -432,7 +401,6 @@ generateTokens maxSteps promptTokens temperature vocab seedValue = do
 run :: BS.ByteString -> BS.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
 run modelFileContent tokenizerFileContent temperature steps prompt seed = do
   currentTime <- getPOSIXTime
-  putStrLn "running inference..."
   let
     seedValue = fromMaybe (round currentTime) seed
     config = initModel modelFileContent
@@ -440,11 +408,6 @@ run modelFileContent tokenizerFileContent temperature steps prompt seed = do
     (promptTokens, vocab) = tokenizerInit tokenizerFileContent (vocabSize config) (BSC.pack prompt')
     initStateAttentionKV :: AttentionKV
     initStateAttentionKV = AttentionKV { keyCache = [], valueCache = [] }
-  printf "network: # layers %d\n" (nLayers config)
-  printf "network: # attention heads %d / head dimension %d\n" (numAttentionHeads config) (headDimension config)
-  printf "network: vocabulary size %d\n" (vocabSize config)
-  printf "prompt tokens: %s\n" $ show promptTokens
-  printf "seed value %d, temperature %f\n" seedValue temperature
   putStrLn "<s>"
   startTime <- getPOSIXTime
   (_, countTokens) <- evalStateT (runReaderT (generateTokens steps promptTokens temperature vocab seedValue) config) initStateAttentionKV
@@ -454,5 +417,5 @@ run modelFileContent tokenizerFileContent temperature steps prompt seed = do
     duration = round (endTime - startTime)
     tokensPerSec :: Float
     tokensPerSec = fromIntegral countTokens / fromIntegral duration
-  printf "duration: %ds - (%.02f tokens/s)\n" duration tokensPerSec
+  printf "\nduration: %ds - (%.02f tokens/s)\n" duration tokensPerSec
   return ()
