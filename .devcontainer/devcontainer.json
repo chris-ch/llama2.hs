@@ -1,0 +1,15 @@
+{
+	"image": "ghcr.io/chris-ch/docker-ghcup:v1.0.9",
+	"customizations": {
+			"vscode": {
+					"extensions": [
+						"haskell.haskell"
+					]
+			}
+	},
+	"remoteUser": "haskell",
+	"mounts": [
+		"source=${localEnv:HOME}/.ssh,target=/home/haskell/.ssh,type=bind,readonly"
+	],
+	"postStartCommand": "cabal update"
+}
