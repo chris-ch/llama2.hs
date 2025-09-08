@@ -1,5 +1,6 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE NamedFieldPuns #-}
 module Main (main) where
 
 import qualified Options.Applicative as OA
@@ -7,12 +8,13 @@ import qualified Data.ByteString.Lazy as BS
 import qualified Data.ByteString.Lazy.Char8 as BSC
 import qualified Data.Binary.Get as BG
 import qualified Data.Vector.Unboxed as V
+import qualified Data.Vector.Unboxed.Mutable as MV
 import qualified Data.List as DL
 import qualified Data.List.Split as DLS
 import qualified System.Random as R
 
-import Control.Monad (replicateM, foldM)
-import Control.Monad.State ( StateT, evalStateT, MonadState(put), gets )
+import Control.Monad (replicateM, foldM, forM_, forM)
+import Control.Monad.State ( StateT, evalStateT, gets )
 import Control.Monad.Reader ( MonadIO(liftIO), ReaderT(runReaderT), MonadReader(ask) )
 import Data.Maybe (fromMaybe)
 import Data.Time.Clock.POSIX (getPOSIXTime)
@@ -51,8 +53,9 @@ main = do
     run modelFileContent tokenizerFileContent (realToFrac temperature) steps prompt seed
 
 type Matrix a = [Vector a] -- Matrix as row vectors
-type KeyCache = [[Matrix Float]]
-type ValueCache = [[Matrix Float]]
+type MVectorFloat = MV.MVector (MV.PrimState IO) Float
+type KeyCache = [[MVectorFloat]]
+type ValueCache = [[MVectorFloat]]
 type Vocabulary = [BS.ByteString]
 type VocabularyScores = [Float]
 type Token = Int32
@@ -61,7 +64,7 @@ type PromptTokens = [Token]
 data AttentionKV = AttentionKV
     { keyCache :: KeyCache
     , valueCache :: ValueCache
-    } deriving (Show)
+    }
 
 data TransformerWeighting = TransformerWeighting
     { tokenEmbeddingTable :: Matrix Float
@@ -235,15 +238,16 @@ drawSample seedValue probabilities = do
 
   return $ fromIntegral $ indexHighestCDF r probabilities
 
-buildActivation :: Int -> Int -> KeyCache -> Int -> [Float] -> V.Vector Float
-buildActivation dimension indexLayer vC indexHead headScores =
-  DL.foldl' accumulate zeroVector zippedValues
-  where
-    accumulate :: V.Vector Float -> (V.Vector Float, Float) -> V.Vector Float
-    accumulate acc (valueVector, attentionWeight) = V.zipWith (+) acc (scale attentionWeight valueVector)
-    zeroVector = V.replicate dimension 0.0
-    zippedValues = zip (map (\count -> vC !! count !! indexLayer !! indexHead) [0..]) headScores
-    scale w = V.map (w *)
+buildActivation :: Int -> Int -> [[MVectorFloat]] -> Int -> [Float] -> IO (V.Vector Float)
+buildActivation headDim indexLayer vCaches indexHead headScores = do
+  let mv = vCaches !! indexLayer !! indexHead
+  vVec <- V.unsafeFreeze mv
+  let numPos = length headScores
+      zero = V.replicate headDim 0.0
+      addScaled acc pos = let score = headScores !! pos
+                              scaled = V.map (* score) (V.slice (pos * headDim) headDim vVec)
+                          in V.zipWith (+) acc scaled
+  return $ DL.foldl' addScaled zero [0 .. numPos - 1]
 
 applyRotations :: V.Vector Float -> V.Vector Float -> V.Vector Float -> V.Vector Float
 applyRotations headVector freqCisRealRow freqCisImagRow =
@@ -307,39 +311,43 @@ computeQKV weights numHeads indexLayer freqCisRealRow freqCisImagRow token =
   in
     (headsQ, headsK, headsV)
 
-computeScores :: Int -> KeyCache -> Int -> Int -> [V.Vector Float] -> V.Vector Float
-computeScores headDim kC indexLayer indexHead headsQ = V.fromList $ map calculateScore kC
-  where
-    calculateScore :: [[V.Vector Float]] -> Float
-    calculateScore keyVectors =
-      let keyVector = ((keyVectors !! indexLayer) !! indexHead)
-      in dotProduct (headsQ !! indexHead) keyVector / sqrt (fromIntegral headDim)
+computeScores :: Int -> Int -> [[MVectorFloat]] -> Int -> Int -> [V.Vector Float] -> IO (V.Vector Float)
+computeScores numPos headDim kCaches indexLayer indexHead headsQ = do
+  let mv = kCaches !! indexLayer !! indexHead
+  kVec <- V.unsafeFreeze mv
+  let qHead = headsQ !! indexHead
+      sqrtHead = sqrt (fromIntegral headDim)
+  return $ V.generate numPos (\pos -> dotProduct (V.slice (pos * headDim) headDim kVec) qHead / sqrtHead)
 
-multiheadActivation :: Int -> Int -> Int -> KeyCache-> ValueCache -> [V.Vector Float] -> Matrix Float
-multiheadActivation numHeads headDim indexLayer kC vC headsQ =
-    [buildActivation headDim indexLayer vC indexHead (scores indexHead) | indexHead <- [0 .. numHeads - 1]]
-    where
-      scores indexHead = V.toList $ softmax rawScores (V.length rawScores)
-        where
-          rawScores = computeScores headDim kC indexLayer indexHead headsQ
+multiheadActivation :: Int -> Int -> Int -> Int -> [[MVectorFloat]] -> [[MVectorFloat]] -> [V.Vector Float] -> IO (Matrix Float)
+multiheadActivation numHeads headDim stepCount indexLayer kCaches vCaches headsQ = do
+  forM [0 .. numHeads - 1] $ \indexHead -> do
+    rawScores <- computeScores (stepCount + 1) headDim kCaches indexLayer indexHead headsQ
+    let softValues = softmax rawScores (V.length rawScores)
+        headScores = V.toList softValues
+    buildActivation headDim indexLayer vCaches indexHead headScores
 
 createLayerToken :: Int -> Int -> V.Vector Float -> V.Vector Float -> V.Vector Float -> TransformerResult (V.Vector Float)
 createLayerToken stepCount indexLayer freqCisRealRow freqCisImagRow token = do
     network <- ask
-    (kC, vC) <- gets (\cache -> (keyCache cache, valueCache cache))
+    (kCaches, vCaches) <- gets (\cache -> (keyCache cache, valueCache cache))
     let
         (headsQ, headsK, headsV) = computeQKV (weighting network) (numAttentionHeads network) indexLayer freqCisRealRow freqCisImagRow token
-        keyCacheStep = (kC !! stepCount) ++ [headsK]
-        valueCacheStep = (vC !! stepCount) ++ [headsV]
-        keyCache' = take stepCount kC ++ [keyCacheStep]
-        valueCache' = take stepCount vC ++ [valueCacheStep]
-        activations = multiheadActivation (numAttentionHeads network) (headDimension network) indexLayer keyCache' valueCache' headsQ
+        headDim = headDimension network
+        numHeads = numAttentionHeads network
+        offset = stepCount * headDim
+    liftIO $ forM_ [0 .. numHeads - 1] $ \h -> do
+      mk <- V.thaw (headsK !! h)
+      MV.unsafeCopy (MV.slice offset headDim (kCaches !! indexLayer !! h)) mk
+      mv <- V.thaw (headsV !! h)
+      MV.unsafeCopy (MV.slice offset headDim (vCaches !! indexLayer !! h)) mv
+    activations <- liftIO $ multiheadActivation numHeads headDim stepCount indexLayer kCaches vCaches headsQ
+    let
         wO = wo (weighting network)
         deltaTokenQKV = matrixVectorMult (wO !! indexLayer) (V.concat activations)
         token' = V.zipWith (+) token deltaTokenQKV
         deltaTokenFFN = computeDeltaFFN (weighting network) indexLayer token'
         result = V.zipWith (+) token' deltaTokenFFN
-    put (AttentionKV {keyCache = keyCache', valueCache = valueCache'})
     return result
 
 transformer :: Token -> Int -> TransformerResult (V.Vector Float)
@@ -391,12 +399,20 @@ generateTokens maxSteps promptTokens temperature vocab seedValue = do
     go network timestep result token
       | timestep >= maxSteps || (timestep /= 0 && token == 1) = return (result, timestep)
       | otherwise = do
-        (kC, vC) <- gets (\cache -> (keyCache cache, valueCache cache))
-        put (AttentionKV {keyCache = take timestep kC ++ [[]], valueCache = take timestep vC ++ [[]]})
         (tokenStr, nextToken) <- generateNextToken timestep promptTokens temperature vocab token seedValue
         liftIO $ putStr $ BSC.unpack tokenStr
         liftIO $ hFlush stdout
         go network (timestep + 1) (result ++ [tokenStr]) nextToken
+
+initAttentionKV :: NetworkConfig -> IO AttentionKV
+initAttentionKV NetworkConfig {nLayers, numAttentionHeads, seqLen, headDimension} = do
+  let nLayers' = nLayers
+      nHeads = numAttentionHeads -- Assuming numAttentionHeads == numKeyValueHeads
+      hDim = headDimension
+      sLen = seqLen
+  keyCache <- replicateM nLayers' $ replicateM nHeads $ MV.new (sLen * hDim)
+  valueCache <- replicateM nLayers' $ replicateM nHeads $ MV.new (sLen * hDim)
+  return AttentionKV { keyCache = keyCache, valueCache = valueCache }
 
 run :: BS.ByteString -> BS.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
 run modelFileContent tokenizerFileContent temperature steps prompt seed = do
@@ -406,11 +422,10 @@ run modelFileContent tokenizerFileContent temperature steps prompt seed = do
     config = initModel modelFileContent
     prompt' = fromMaybe "" prompt
     (promptTokens, vocab) = tokenizerInit tokenizerFileContent (vocabSize config) (BSC.pack prompt')
-    initStateAttentionKV :: AttentionKV
-    initStateAttentionKV = AttentionKV { keyCache = [], valueCache = [] }
+  attentionKV <- initAttentionKV config
   putStrLn "<s>"
   startTime <- getPOSIXTime
-  (_, countTokens) <- evalStateT (runReaderT (generateTokens steps promptTokens temperature vocab seedValue) config) initStateAttentionKV
+  (_, countTokens) <- evalStateT (runReaderT (generateTokens steps promptTokens temperature vocab seedValue) config) attentionKV
   endTime <- getPOSIXTime
   let
     duration :: Integer

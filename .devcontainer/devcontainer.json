@@ -1,5 +1,5 @@
 {
-	"image": "ghcr.io/chris-ch/docker-ghcup:v1.0.9",
+	"image": "ghcr.io/chris-ch/docker-ghcup:v1.1.0",
 	"customizations": {
 			"vscode": {
 					"extensions": [
