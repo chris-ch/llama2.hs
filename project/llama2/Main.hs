@@ -1,6 +1,7 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE BangPatterns #-}
 module Main (main) where
 
 import qualified Options.Applicative as OA
@@ -365,14 +366,31 @@ matrixVectorMult flatMat nrows ncols vec = V.generate nrows $ \row ->
         rowVec = V.slice rowStart ncols flatMat
     in dotProduct rowVec vec
 
-matrixVectorMultInPlace :: V.Vector Float -> Int -> Int -> V.Vector Float -> MVectorFloat -> IO ()
-matrixVectorMultInPlace flatMat nrows ncols vec result = do
+-- Multiply a flat matrix by a mutable input vector, writing into an output mutable vector
+matrixVectorMultInPlaceMV
+  :: V.Vector Float    -- ^ Flat matrix (nrows * ncols)
+  -> Int               -- ^ nrows
+  -> Int               -- ^ ncols
+  -> MVectorFloat      -- ^ Input vector (mutable)
+  -> MVectorFloat      -- ^ Output vector (mutable)
+  -> IO ()
+matrixVectorMultInPlaceMV flatMat nrows ncols vecM result = do
+  -- For each row
   forM_ [0 .. nrows - 1] $ \row -> do
     let rowStart = row * ncols
-    let rowVec = V.slice rowStart ncols flatMat
-    let s = dotProduct rowVec vec
-    MV.write result row s
-
+        -- local references to avoid repeated lookups
+        flat = flatMat
+        rs = rowStart
+    -- accumulate dot product in a strict loop
+    let loop !i !acc
+          | i >= ncols = return acc
+          | otherwise = do
+              v <- MV.unsafeRead vecM i
+              let m = V.unsafeIndex flat (rs + i)
+              loop (i + 1) (acc + v * m)
+    s <- loop 0 0.0
+    MV.unsafeWrite result row s
+    
 dotProduct :: V.Vector Float -> V.Vector Float -> Float
 dotProduct vec1 vec2 = V.sum $ V.zipWith (*) vec1 vec2
 
@@ -394,21 +412,25 @@ computeDeltaFFN weights indexLayer token = do
       rmsFFNWeight = rmsFfnWeight weights !! indexLayer
       rba = rmsNorm token rmsFFNWeight
 
+  -- thaw rba once (rba is a V.Vector), reuse it
+  rbaM <- liftIO $ V.thaw rba
+  -- W1 * rba  -> ffnBuf1 (length hid)
+  liftIO $ matrixVectorMultInPlaceMV (w1 weights !! indexLayer) hid d rbaM ffnBuf1
+
   -- hidden1 = silu(W1 * rba)
-  liftIO $ matrixVectorMultInPlace (w1 weights !! indexLayer) hid d rba ffnBuf1
-  liftIO $ forM_ [0 .. hid - 1] $ \i -> MV.modify ffnBuf1 silu i
+  liftIO $ forM_ [0 .. hid - 1] $ \i -> MV.unsafeModify ffnBuf1 silu i
 
-  -- hidden3 = W3 * rba
-  liftIO $ matrixVectorMultInPlace (w3 weights !! indexLayer) hid d rba ffnBuf2
+  -- hidden3 = W3 * rba  -> ffnBuf2
+  liftIO $ matrixVectorMultInPlaceMV (w3 weights !! indexLayer) hid d rbaM ffnBuf2
 
-  -- hidden1 *= hidden3
+  -- hidden1 *= hidden3   (in-place on ffnBuf1)
   liftIO $ forM_ [0 .. hid - 1] $ \i -> do
-    h3 <- MV.read ffnBuf2 i
-    MV.modify ffnBuf1 (* h3) i
+    h3 <- MV.unsafeRead ffnBuf2 i
+    MV.unsafeModify ffnBuf1 (* h3) i
 
   -- result = W2 * hidden1
-  productV <- liftIO $ V.freeze ffnBuf1
-  liftIO $ matrixVectorMultInPlace (w2 weights !! indexLayer) d hid productV ffnBufOut
+  -- Use ffnBuf1 directly (no freeze/thaw)
+  liftIO $ matrixVectorMultInPlaceMV (w2 weights !! indexLayer) d hid ffnBuf1 ffnBufOut
   liftIO $ V.freeze ffnBufOut
 
 -- QKV
@@ -421,9 +443,12 @@ computeQKV weights indexLayer freqCisRealRow freqCisImagRow token stepCount = do
     headDim = headDimension network
     numHeads = numAttentionHeads network
     rba = rmsNorm token (rmsAttWeight weights !! indexLayer)
-  liftIO $ matrixVectorMultInPlace (wq weights !! indexLayer) d d rba qBuf
-  liftIO $ matrixVectorMultInPlace (wk weights !! indexLayer) d d rba kBuf
-  liftIO $ matrixVectorMultInPlace (wv weights !! indexLayer) d d rba vBuf
+
+  rbaM <- liftIO $ V.thaw rba               -- mutable copy of rba (one allocation)
+  liftIO $ matrixVectorMultInPlaceMV (wq weights !! indexLayer) d d rbaM qBuf
+  liftIO $ matrixVectorMultInPlaceMV (wk weights !! indexLayer) d d rbaM kBuf
+  liftIO $ matrixVectorMultInPlaceMV (wv weights !! indexLayer) d d rbaM vBuf
+
   liftIO $ applyRotationsToBuf qBuf freqCisRealRow freqCisImagRow numHeads headDim
   liftIO $ applyRotationsToBuf kBuf freqCisRealRow freqCisImagRow numHeads headDim
   liftIO $ forM_ [0 .. numHeads - 1] $ \h -> do
