@@ -302,10 +302,18 @@ applyRotationsToBuf buf freqCisRealRow freqCisImagRow numHeads headDim = do
   forM_ [0 .. numHeads - 1] $ \h -> do
     applyRotationsMV buf (h * headDim) freqCisRealRow freqCisImagRow
 
--- Build activation from value cache into mutable, then freeze
-buildActivation :: NetworkConfig -> Int -> Int -> Int -> [Float] -> MVectorFloat -> IO (V.Vector Float)
-buildActivation net indexLayer indexHead headDim headScores vCache = do
-  out <- MV.new headDim
+-- Build activation directly into a provided mutable vector
+buildActivationInPlace
+  :: NetworkConfig
+  -> Int          -- ^ Layer index
+  -> Int          -- ^ Head index
+  -> Int          -- ^ Head dimension
+  -> [Float]      -- ^ Attention scores
+  -> MVectorFloat -- ^ Value cache
+  -> MVectorFloat -- ^ Output buffer (must be preallocated to headDim)
+  -> IO ()
+buildActivationInPlace net indexLayer indexHead headDim headScores vCache out = do
+  -- Zero the output buffer
   MV.set out 0.0
   let numPos = length headScores
   forM_ [0 .. numPos - 1] $ \pos -> do
@@ -315,7 +323,6 @@ buildActivation net indexLayer indexHead headDim headScores vCache = do
     forM_ [0 .. headDim - 1] $ \j -> do
       v <- MV.read vSlice j
       MV.modify out (+ (scale * v)) j
-  V.freeze out
 
 -- Attention scores
 computeScores :: NetworkConfig -> Int -> Int -> Int -> MVectorFloat -> MVectorFloat -> Int -> IO (V.Vector Float)
@@ -330,13 +337,26 @@ computeScores net headDim indexLayer indexHead qBuf kCache stepCount = do
     return $ dot / sqrtHead
 
 -- Multihead
-multiheadActivation :: NetworkConfig -> Int -> Int -> Int -> MVectorFloat -> MVectorFloat -> MVectorFloat -> Int -> IO [V.Vector Float]
+multiheadActivation
+  :: NetworkConfig
+  -> Int          -- ^ Number of heads
+  -> Int          -- ^ Head dimension
+  -> Int          -- ^ Current step
+  -> MVectorFloat -- ^ Q buffer
+  -> MVectorFloat -- ^ Key cache
+  -> MVectorFloat -- ^ Value cache
+  -> Int          -- ^ Layer index
+  -> IO [V.Vector Float]
 multiheadActivation net numHeads headDim stepCount qBuf kCache vCache indexLayer = do
   forM [0 .. numHeads - 1] $ \indexHead -> do
     rawScores <- computeScores net headDim indexLayer indexHead qBuf kCache stepCount
     let softValues = softmax rawScores (V.length rawScores)
-    let headScores = V.toList softValues
-    buildActivation net indexLayer indexHead headDim headScores vCache
+        headScores = V.toList softValues
+
+    -- Reuse a mutable vector for accumulation
+    outBuf <- MV.new headDim
+    buildActivationInPlace net indexLayer indexHead headDim headScores vCache outBuf
+    V.freeze outBuf
 
 -- Math utils
 matrixVectorMult :: Vector Float -> Int -> Int -> V.Vector Float -> V.Vector Float
