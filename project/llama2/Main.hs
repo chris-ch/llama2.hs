@@ -25,6 +25,9 @@ import Data.Int (Int32)
 import Data.Vector.Unboxed (Vector)
 import System.IO (hFlush, stdout)
 
+--------------------------------------------------------------------------------
+-- Options
+--------------------------------------------------------------------------------
 
 data Options = Options
     { seed :: Maybe Int
@@ -52,18 +55,21 @@ main = do
     tokenizerFileContent <- BS.readFile tokenizerFile
     run modelFileContent tokenizerFileContent (realToFrac temperature) steps prompt seed
 
+--------------------------------------------------------------------------------
+-- Types
+--------------------------------------------------------------------------------
+
 type Matrix a = [Vector a] -- Matrix as row vectors
 type MVectorFloat = MV.MVector (MV.PrimState IO) Float
-type KeyCache = [[MVectorFloat]]
-type ValueCache = [[MVectorFloat]]
 type Vocabulary = [BS.ByteString]
 type VocabularyScores = [Float]
 type Token = Int32
 type PromptTokens = [Token]
 
+-- Flat Key/Value caches
 data AttentionKV = AttentionKV
-    { keyCache :: KeyCache
-    , valueCache :: ValueCache
+    { keyCache :: MVectorFloat
+    , valueCache :: MVectorFloat
     }
 
 data TransformerWeighting = TransformerWeighting
@@ -93,6 +99,10 @@ data NetworkConfig = NetworkConfig
     , headDimension :: Int
     , weighting :: TransformerWeighting
     } deriving (Show)
+
+--------------------------------------------------------------------------------
+-- Binary Parsing
+--------------------------------------------------------------------------------
 
 readVector :: Int -> BG.Get (Vector Float)
 readVector count = do
@@ -160,6 +170,10 @@ parseNetworkConfigFile = do
 initModel :: BS.ByteString -> NetworkConfig
 initModel = BG.runGet parseNetworkConfigFile
 
+--------------------------------------------------------------------------------
+-- Tokenizer
+--------------------------------------------------------------------------------
+
 parseTokens :: BS.ByteString -> Int -> (Vocabulary, VocabularyScores)
 parseTokens fileContent size = (vocab, vocabScores)
   where
@@ -213,8 +227,18 @@ bpeEncode prompt vocab vocabScores =
   let tokens = map (\char -> fromMaybe (error "Character not found in vocabulary") (DL.elemIndex (BS.pack [char]) vocab)) (BS.unpack prompt)
   in processTokens (map fromIntegral tokens) vocab vocabScores
 
+--------------------------------------------------------------------------------
+-- Transformer runtime
+--------------------------------------------------------------------------------
+
 type TransformerResult a = ReaderT NetworkConfig (StateT AttentionKV IO) a
 
+-- Cache indexing helper
+cacheIndex :: NetworkConfig -> Int -> Int -> Int -> Int -> Int
+cacheIndex NetworkConfig {numAttentionHeads, seqLen, headDimension} layer numHead step headIndex =
+    (((layer * numAttentionHeads + numHead) * seqLen) + step) * headDimension + headIndex
+
+-- Softmax
 softmax :: V.Vector Float -> Int -> V.Vector Float
 softmax values size = V.concat [softmaxValues, V.slice size (V.length values - size) values]
   where
@@ -223,32 +247,37 @@ softmax values size = V.concat [softmaxValues, V.slice size (V.length values - s
     sumExpValues = V.sum expValues
     softmaxValues = V.map (/ sumExpValues) expValues
 
+-- Sampling
 drawSample :: Int -> V.Vector Float -> IO Token
 drawSample seedValue probabilities = do
-  let
-    gen = R.mkStdGen seedValue
-    (r, _) = R.random gen :: (Float, R.StdGen)
+  let gen = R.mkStdGen seedValue
+      (r, _) = R.random gen :: (Float, R.StdGen)
+      cdf = V.scanl1 (+) probabilities
+      idx = V.length (V.takeWhile (< r) cdf)
+  return $ fromIntegral (min idx (V.length probabilities - 1))
 
-    indexHighestCDF :: Float -> V.Vector Float -> Int
-    indexHighestCDF rand vec = min (V.ifoldl' (indexHighest rand) 0 cdf) (V.length vec - 1)
-        where
-          cdf = V.scanl1 (+) vec
-          indexHighest :: Float -> Int -> Int -> Float -> Int
-          indexHighest rand' acc i v = if v <= rand' then i + 1 else acc
+-- Helper: write/read single head vector to/from the flat cache
+writeHeadToCache :: NetworkConfig -> MVectorFloat -> Int -> Int -> Int -> V.Vector Float -> IO ()
+writeHeadToCache net cache layer numHead step headVec = do
+  let headDim = headDimension net
+      offset = cacheIndex net layer numHead step 0
+  mk <- V.thaw headVec
+  -- copy mk (source) -> dest
+  MV.copy (MV.slice offset headDim cache) mk
 
-  return $ fromIntegral $ indexHighestCDF r probabilities
-
-buildActivation :: Int -> Int -> [[MVectorFloat]] -> Int -> [Float] -> IO (V.Vector Float)
-buildActivation headDim indexLayer vCaches indexHead headScores = do
-  let mv = vCaches !! indexLayer !! indexHead
-  vVec <- V.unsafeFreeze mv
+-- Build activation from value cache
+buildActivation :: NetworkConfig -> Int -> Int -> Int -> [Float] -> MVectorFloat -> IO (V.Vector Float)
+buildActivation net indexLayer indexHead headDim headScores vCache = do
   let numPos = length headScores
       zero = V.replicate headDim 0.0
-      addScaled acc pos = let score = headScores !! pos
-                              scaled = V.map (* score) (V.slice (pos * headDim) headDim vVec)
-                          in V.zipWith (+) acc scaled
-  return $ DL.foldl' addScaled zero [0 .. numPos - 1]
+      addScaled acc pos = do
+        let offset = cacheIndex net indexLayer indexHead pos 0
+        vVec <- V.freeze (MV.slice offset headDim vCache)
+        let scaled = V.map (* (headScores !! pos)) vVec
+        return $ V.zipWith (+) acc scaled
+  foldM addScaled zero [0 .. numPos - 1]
 
+-- Rotary
 applyRotations :: V.Vector Float -> V.Vector Float -> V.Vector Float -> V.Vector Float
 applyRotations headVector freqCisRealRow freqCisImagRow =
   V.fromList $ concatMap applyRotation [0,2..V.length headVector - 2]
@@ -261,6 +290,7 @@ applyRotations headVector freqCisRealRow freqCisImagRow =
         v = headVector V.! headItemIndex
         v' = headVector V.! (headItemIndex + 1)
 
+-- Math utils
 matrixVectorMult :: Matrix Float -> V.Vector Float -> V.Vector Float
 matrixVectorMult mat vec = V.fromList $ map (`dotProduct` vec) mat
 
@@ -272,76 +302,70 @@ dotProduct vec1 vec2 = V.sum $ V.zipWith (*) vec1 vec2
 
 rmsNorm :: V.Vector Float -> V.Vector Float -> V.Vector Float
 rmsNorm vector weights =
-  let
-    squareNorm :: V.Vector Float -> Float
-    squareNorm = V.foldl' cumSumSquare 0.0
-      where
-        cumSumSquare :: Float -> Float -> Float
-        cumSumSquare acc v = acc + v ^ (2::Int)
-
-    ss = (squareNorm vector / fromIntegral (V.length vector)) + 1e-5
-    normalized = V.map (* (1.0 / sqrt ss)) vector
+  let squareNorm = V.foldl' (\acc v -> acc + v*v) 0.0 vector
+      ss = (squareNorm / fromIntegral (V.length vector)) + 1e-5
+      normalized = V.map (* (1.0 / sqrt ss)) vector
   in V.zipWith (*) weights normalized
 
+-- FFN
 computeDeltaFFN :: TransformerWeighting -> Int -> V.Vector Float -> V.Vector Float
 computeDeltaFFN weights indexLayer token =
-    let
-      sigmoidLinearUnit :: Float -> Float
-      sigmoidLinearUnit v = v / (1.0 + exp (-v))
+    let sigmoidLinearUnit v = v / (1.0 + exp (-v))
+        rmsFFNWeight = rmsFfnWeight weights !! indexLayer
+        weight1 = w1 weights !! indexLayer
+        weight2 = w2 weights !! indexLayer
+        weight3 = w3 weights !! indexLayer
+        rba = rmsNorm token rmsFFNWeight
+        hidden1 = matrixVectorMult weight1 rba
+        hidden2 = matrixVectorMult weight3 rba
+        sigmoided = V.map sigmoidLinearUnit hidden1
+    in matrixVectorMult weight2 (V.zipWith (*) sigmoided hidden2)
 
-      rmsFFNWeight = rmsFfnWeight weights !! indexLayer
-      weight1 = w1 weights !! indexLayer
-      weight2 = w2 weights !! indexLayer
-      weight3 = w3 weights !! indexLayer
-      rba = rmsNorm token rmsFFNWeight
-      hiddenDimensionBuffer1 = matrixVectorMult weight1 rba
-      hiddenDimensionBuffer2 = matrixVectorMult weight3 rba
-      sigmoided = V.map sigmoidLinearUnit hiddenDimensionBuffer1
-    in matrixVectorMult weight2 (V.zipWith (*) sigmoided hiddenDimensionBuffer2)
-
+-- QKV
 computeQKV :: TransformerWeighting -> Int -> Int -> V.Vector Float -> V.Vector Float -> V.Vector Float -> ([V.Vector Float], [V.Vector Float], [V.Vector Float])
 computeQKV weights numHeads indexLayer freqCisRealRow freqCisImagRow token =
-  let
-    rba = rmsNorm token (rmsAttWeight weights !! indexLayer)
-    wQ = splitVector numHeads (matrixVectorMult (wq weights !! indexLayer) rba)
-    headsQ = map (\vector -> applyRotations vector freqCisRealRow freqCisImagRow) wQ
-    wK = splitVector numHeads (matrixVectorMult (wk weights !! indexLayer) rba)
-    headsK = map (\vector -> applyRotations vector freqCisRealRow freqCisImagRow) wK
-    headsV = splitVector numHeads (matrixVectorMult (wv weights !! indexLayer) rba)
-  in
-    (headsQ, headsK, headsV)
+  let rba = rmsNorm token (rmsAttWeight weights !! indexLayer)
+      wQ = splitVector numHeads (matrixVectorMult (wq weights !! indexLayer) rba)
+      headsQ = map (\vector -> applyRotations vector freqCisRealRow freqCisImagRow) wQ
+      wK = splitVector numHeads (matrixVectorMult (wk weights !! indexLayer) rba)
+      headsK = map (\vector -> applyRotations vector freqCisRealRow freqCisImagRow) wK
+      headsV = splitVector numHeads (matrixVectorMult (wv weights !! indexLayer) rba)
+  in (headsQ, headsK, headsV)
 
-computeScores :: Int -> Int -> [[MVectorFloat]] -> Int -> Int -> [V.Vector Float] -> IO (V.Vector Float)
-computeScores numPos headDim kCaches indexLayer indexHead headsQ = do
-  let mv = kCaches !! indexLayer !! indexHead
-  kVec <- V.unsafeFreeze mv
+-- Attention scores
+computeScores :: NetworkConfig -> Int -> Int -> Int -> [V.Vector Float] -> MVectorFloat -> Int -> IO (V.Vector Float)
+computeScores net headDim indexLayer indexHead headsQ kCache stepCount = do
   let qHead = headsQ !! indexHead
       sqrtHead = sqrt (fromIntegral headDim)
-  return $ V.generate numPos (\pos -> dotProduct (V.slice (pos * headDim) headDim kVec) qHead / sqrtHead)
+      numPos = stepCount + 1
+  V.generateM numPos $ \pos -> do
+    let offset = cacheIndex net indexLayer indexHead pos 0
+    kVec <- V.freeze (MV.slice offset headDim kCache)
+    return $ dotProduct kVec qHead / sqrtHead
 
-multiheadActivation :: Int -> Int -> Int -> Int -> [[MVectorFloat]] -> [[MVectorFloat]] -> [V.Vector Float] -> IO (Matrix Float)
-multiheadActivation numHeads headDim stepCount indexLayer kCaches vCaches headsQ = do
+-- Multihead
+multiheadActivation :: NetworkConfig -> Int -> Int -> Int -> [V.Vector Float] -> MVectorFloat -> MVectorFloat -> Int -> IO (Matrix Float)
+multiheadActivation net numHeads headDim stepCount headsQ kCache vCache indexLayer = do
   forM [0 .. numHeads - 1] $ \indexHead -> do
-    rawScores <- computeScores (stepCount + 1) headDim kCaches indexLayer indexHead headsQ
+    rawScores <- computeScores net headDim indexLayer indexHead headsQ kCache stepCount
     let softValues = softmax rawScores (V.length rawScores)
         headScores = V.toList softValues
-    buildActivation headDim indexLayer vCaches indexHead headScores
+    buildActivation net indexLayer indexHead headDim headScores vCache
 
+-- Layer
 createLayerToken :: Int -> Int -> V.Vector Float -> V.Vector Float -> V.Vector Float -> TransformerResult (V.Vector Float)
 createLayerToken stepCount indexLayer freqCisRealRow freqCisImagRow token = do
     network <- ask
-    (kCaches, vCaches) <- gets (\cache -> (keyCache cache, valueCache cache))
-    let
-        (headsQ, headsK, headsV) = computeQKV (weighting network) (numAttentionHeads network) indexLayer freqCisRealRow freqCisImagRow token
+    AttentionKV {keyCache, valueCache} <- gets id
+    let (headsQ, headsK, headsV) = computeQKV (weighting network) (numAttentionHeads network) indexLayer freqCisRealRow freqCisImagRow token
         headDim = headDimension network
         numHeads = numAttentionHeads network
-        offset = stepCount * headDim
+    -- write K and V into the flat caches
     liftIO $ forM_ [0 .. numHeads - 1] $ \h -> do
-      mk <- V.thaw (headsK !! h)
-      MV.unsafeCopy (MV.slice offset headDim (kCaches !! indexLayer !! h)) mk
-      mv <- V.thaw (headsV !! h)
-      MV.unsafeCopy (MV.slice offset headDim (vCaches !! indexLayer !! h)) mv
-    activations <- liftIO $ multiheadActivation numHeads headDim stepCount indexLayer kCaches vCaches headsQ
+      writeHeadToCache network keyCache indexLayer h stepCount (headsK !! h)
+      writeHeadToCache network valueCache indexLayer h stepCount (headsV !! h)
+
+    activations <- liftIO $ multiheadActivation network numHeads headDim stepCount headsQ keyCache valueCache indexLayer
     let
         wO = wo (weighting network)
         deltaTokenQKV = matrixVectorMult (wO !! indexLayer) (V.concat activations)
@@ -350,6 +374,7 @@ createLayerToken stepCount indexLayer freqCisRealRow freqCisImagRow token = do
         result = V.zipWith (+) token' deltaTokenFFN
     return result
 
+-- Transformer step
 transformer :: Token -> Int -> TransformerResult (V.Vector Float)
 transformer tokenCode stepCount = do
     network <- ask
@@ -404,14 +429,12 @@ generateTokens maxSteps promptTokens temperature vocab seedValue = do
         liftIO $ hFlush stdout
         go network (timestep + 1) (result ++ [tokenStr]) nextToken
 
+-- Initialize flat attention KV caches (flattened to one MVector each)
 initAttentionKV :: NetworkConfig -> IO AttentionKV
 initAttentionKV NetworkConfig {nLayers, numAttentionHeads, seqLen, headDimension} = do
-  let nLayers' = nLayers
-      nHeads = numAttentionHeads -- Assuming numAttentionHeads == numKeyValueHeads
-      hDim = headDimension
-      sLen = seqLen
-  keyCache <- replicateM nLayers' $ replicateM nHeads $ MV.new (sLen * hDim)
-  valueCache <- replicateM nLayers' $ replicateM nHeads $ MV.new (sLen * hDim)
+  let size = nLayers * numAttentionHeads * seqLen * headDimension
+  keyCache   <- MV.new size
+  valueCache <- MV.new size
   return AttentionKV { keyCache = keyCache, valueCache = valueCache }
 
 run :: BS.ByteString -> BS.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()

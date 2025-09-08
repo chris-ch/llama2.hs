@@ -28,20 +28,22 @@ executable llama2
     array,
     binary,
     bytestring,
+    containers,
+    deepseq,
     directory,
     filepath,
-    time,
     linear,
-    transformers,
+    matrices,
     mtl,
-    text,
-    vector,
+    optparse-applicative,
     parallel,
     primitive,
     random,
-    matrices,
     split,
-    optparse-applicative
+    text,
+    time,
+    transformers,
+    vector
   ghc-options:
     -Wall
     -Wcompat
