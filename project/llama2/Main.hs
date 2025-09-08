@@ -59,7 +59,6 @@ main = do
 -- Types
 --------------------------------------------------------------------------------
 
-type Matrix a = [Vector a] -- Matrix as row vectors
 type MVectorFloat = MV.MVector (MV.PrimState IO) Float
 type Vocabulary = [BS.ByteString]
 type VocabularyScores = [Float]
@@ -73,16 +72,18 @@ data AttentionKV = AttentionKV
     }
 
 data TransformerWeighting = TransformerWeighting
-    { tokenEmbeddingTable :: Matrix Float
+    { tokenEmbeddingTable :: Vector Float
+    , tokenEmbeddingTableRows :: Int
+    , tokenEmbeddingTableCols :: Int
     , rmsAttWeight :: [Vector Float]
-    , wq :: [Matrix Float]
-    , wk :: [Matrix Float]
-    , wv :: [Matrix Float]
-    , wo :: [Matrix Float]
+    , wq :: [Vector Float]
+    , wk :: [Vector Float]
+    , wv :: [Vector Float]
+    , wo :: [Vector Float]
     , rmsFfnWeight :: [Vector Float]
-    , w1 :: [Matrix Float]
-    , w3 :: [Matrix Float]
-    , w2 :: [Matrix Float]
+    , w1 :: [Vector Float]
+    , w2 :: [Vector Float]
+    , w3 :: [Vector Float]
     , rmsFinalWeight :: Vector Float
     , freqCisReal :: [Vector Float]
     , freqCisImag :: [Vector Float]
@@ -112,7 +113,7 @@ readVector count = do
 readVectors :: Int -> Int -> BG.Get [Vector Float]
 readVectors nrows ncols = replicateM nrows (readVector ncols)
 
-readMatrices :: Int -> Int -> Int -> BG.Get [Matrix Float]
+readMatrices :: Int -> Int -> Int -> BG.Get [[Vector Float]]
 readMatrices ndepth nrows ncols = replicateM ndepth (readVectors nrows ncols)
 
 parseNetworkConfigFile :: BG.Get NetworkConfig
@@ -125,15 +126,23 @@ parseNetworkConfigFile = do
         vocabSize' <- fromIntegral <$> getInt32le
         seqLen' <- fromIntegral <$> getInt32le
         tokenEmbeddingTable' <- readVectors vocabSize' dim'
+        let tokenEmbeddingTableFlat = V.concat tokenEmbeddingTable'
         rmsAttWeight' <- readVectors nLayers' dim'
         wq' <- readMatrices nLayers' dim' dim'
+        let wqFlat = map V.concat wq'
         wk' <- readMatrices nLayers' dim' dim'
+        let wkFlat = map V.concat wk'
         wv' <- readMatrices nLayers' dim' dim'
+        let wvFlat = map V.concat wv'
         wo' <- readMatrices nLayers' dim' dim'
+        let woFlat = map V.concat wo'
         rmsFfnWeight' <- readVectors nLayers' dim'
         w1' <- readMatrices nLayers' hiddenDim' dim'
+        let w1Flat = map V.concat w1'
         w2' <- readMatrices nLayers' dim' hiddenDim'
+        let w2Flat = map V.concat w2'
         w3' <- readMatrices nLayers' hiddenDim' dim'
+        let w3Flat = map V.concat w3'
         rmsFinalWeight' <- readVector dim'
         freqCisReal' <- readVectors seqLen' ((dim' `div` numAttentionHeads') `div` 2)
         freqCisImag' <- readVectors seqLen' ((dim' `div` numAttentionHeads') `div` 2)
@@ -141,16 +150,18 @@ parseNetworkConfigFile = do
         let
             headDim = dim' `div` numAttentionHeads'
             weights = TransformerWeighting
-              { tokenEmbeddingTable = tokenEmbeddingTable'
+              { tokenEmbeddingTable = tokenEmbeddingTableFlat
+              , tokenEmbeddingTableRows = vocabSize'
+              , tokenEmbeddingTableCols = dim'
               , rmsAttWeight = rmsAttWeight'
-              , wq = wq'
-              , wk = wk'
-              , wv = wv'
-              , wo = wo'
+              , wq = wqFlat
+              , wk = wkFlat
+              , wv = wvFlat
+              , wo = woFlat
               , rmsFfnWeight = rmsFfnWeight'
-              , w1 = w1'
-              , w2 = w2'
-              , w3 = w3'
+              , w1 = w1Flat
+              , w2 = w2Flat
+              , w3 = w3Flat
               , rmsFinalWeight = rmsFinalWeight'
               , freqCisReal = freqCisReal'
               , freqCisImag = freqCisImag'
@@ -291,8 +302,11 @@ applyRotations headVector freqCisRealRow freqCisImagRow =
         v' = headVector V.! (headItemIndex + 1)
 
 -- Math utils
-matrixVectorMult :: Matrix Float -> V.Vector Float -> V.Vector Float
-matrixVectorMult mat vec = V.fromList $ map (`dotProduct` vec) mat
+matrixVectorMult :: Vector Float -> Int -> Int -> V.Vector Float -> V.Vector Float
+matrixVectorMult flatMat nrows ncols vec = V.generate nrows $ \row ->
+    let rowStart = row * ncols
+        rowVec = V.slice rowStart ncols flatMat
+    in dotProduct rowVec vec
 
 splitVector :: Int -> V.Vector Float -> [V.Vector Float]
 splitVector m vec = V.fromList <$> DLS.chunksOf (V.length vec `div` m) (V.toList vec)
@@ -308,29 +322,31 @@ rmsNorm vector weights =
   in V.zipWith (*) weights normalized
 
 -- FFN
-computeDeltaFFN :: TransformerWeighting -> Int -> V.Vector Float -> V.Vector Float
-computeDeltaFFN weights indexLayer token =
-    let sigmoidLinearUnit v = v / (1.0 + exp (-v))
-        rmsFFNWeight = rmsFfnWeight weights !! indexLayer
-        weight1 = w1 weights !! indexLayer
-        weight2 = w2 weights !! indexLayer
-        weight3 = w3 weights !! indexLayer
-        rba = rmsNorm token rmsFFNWeight
-        hidden1 = matrixVectorMult weight1 rba
-        hidden2 = matrixVectorMult weight3 rba
-        sigmoided = V.map sigmoidLinearUnit hidden1
-    in matrixVectorMult weight2 (V.zipWith (*) sigmoided hidden2)
+computeDeltaFFN :: TransformerWeighting -> Int -> V.Vector Float -> TransformerResult (V.Vector Float)
+computeDeltaFFN weights indexLayer token = do
+  network <- ask
+  let sigmoidLinearUnit v = v / (1.0 + exp (-v))
+      rmsFFNWeight = rmsFfnWeight weights !! indexLayer
+      rba = rmsNorm token rmsFFNWeight
+      hidden1 = matrixVectorMult (w1 weights !! indexLayer) (hiddenDim network) (dim network) rba
+      hidden2 = matrixVectorMult (w3 weights !! indexLayer) (hiddenDim network) (dim network) rba
+      sigmoided = V.map sigmoidLinearUnit hidden1
+  return $ matrixVectorMult (w2 weights !! indexLayer) (dim network) (hiddenDim network) (V.zipWith (*) sigmoided hidden2)
 
 -- QKV
-computeQKV :: TransformerWeighting -> Int -> Int -> V.Vector Float -> V.Vector Float -> V.Vector Float -> ([V.Vector Float], [V.Vector Float], [V.Vector Float])
-computeQKV weights numHeads indexLayer freqCisRealRow freqCisImagRow token =
+computeQKV :: TransformerWeighting -> Int -> Int -> V.Vector Float -> V.Vector Float -> V.Vector Float -> TransformerResult ([V.Vector Float], [V.Vector Float], [V.Vector Float])
+computeQKV weights numHeads indexLayer freqCisRealRow freqCisImagRow token = do
+  network <- ask
   let rba = rmsNorm token (rmsAttWeight weights !! indexLayer)
-      wQ = splitVector numHeads (matrixVectorMult (wq weights !! indexLayer) rba)
-      headsQ = map (\vector -> applyRotations vector freqCisRealRow freqCisImagRow) wQ
-      wK = splitVector numHeads (matrixVectorMult (wk weights !! indexLayer) rba)
-      headsK = map (\vector -> applyRotations vector freqCisRealRow freqCisImagRow) wK
-      headsV = splitVector numHeads (matrixVectorMult (wv weights !! indexLayer) rba)
-  in (headsQ, headsK, headsV)
+      wQ = matrixVectorMult (wq weights !! indexLayer) (dim network) (dim network) rba
+      headsQ = splitVector numHeads wQ
+      headsQ' = map (\vector -> applyRotations vector freqCisRealRow freqCisImagRow) headsQ
+      wK = matrixVectorMult (wk weights !! indexLayer) (dim network) (dim network) rba
+      headsK = splitVector numHeads wK
+      headsK' = map (\vector -> applyRotations vector freqCisRealRow freqCisImagRow) headsK
+      wV = matrixVectorMult (wv weights !! indexLayer) (dim network) (dim network) rba
+      headsV = splitVector numHeads wV
+  return (headsQ', headsK', headsV)
 
 -- Attention scores
 computeScores :: NetworkConfig -> Int -> Int -> Int -> [V.Vector Float] -> MVectorFloat -> Int -> IO (V.Vector Float)
@@ -344,7 +360,7 @@ computeScores net headDim indexLayer indexHead headsQ kCache stepCount = do
     return $ dotProduct kVec qHead / sqrtHead
 
 -- Multihead
-multiheadActivation :: NetworkConfig -> Int -> Int -> Int -> [V.Vector Float] -> MVectorFloat -> MVectorFloat -> Int -> IO (Matrix Float)
+multiheadActivation :: NetworkConfig -> Int -> Int -> Int -> [V.Vector Float] -> MVectorFloat -> MVectorFloat -> Int -> IO [V.Vector Float]
 multiheadActivation net numHeads headDim stepCount headsQ kCache vCache indexLayer = do
   forM [0 .. numHeads - 1] $ \indexHead -> do
     rawScores <- computeScores net headDim indexLayer indexHead headsQ kCache stepCount
@@ -357,9 +373,10 @@ createLayerToken :: Int -> Int -> V.Vector Float -> V.Vector Float -> V.Vector F
 createLayerToken stepCount indexLayer freqCisRealRow freqCisImagRow token = do
     network <- ask
     AttentionKV {keyCache, valueCache} <- gets id
-    let (headsQ, headsK, headsV) = computeQKV (weighting network) (numAttentionHeads network) indexLayer freqCisRealRow freqCisImagRow token
+    let weights = weighting network
         headDim = headDimension network
         numHeads = numAttentionHeads network
+    (headsQ, headsK, headsV) <- computeQKV weights (numAttentionHeads network) indexLayer freqCisRealRow freqCisImagRow token
     -- write K and V into the flat caches
     liftIO $ forM_ [0 .. numHeads - 1] $ \h -> do
       writeHeadToCache network keyCache indexLayer h stepCount (headsK !! h)
@@ -367,12 +384,11 @@ createLayerToken stepCount indexLayer freqCisRealRow freqCisImagRow token = do
 
     activations <- liftIO $ multiheadActivation network numHeads headDim stepCount headsQ keyCache valueCache indexLayer
     let
-        wO = wo (weighting network)
-        deltaTokenQKV = matrixVectorMult (wO !! indexLayer) (V.concat activations)
+        deltaTokenQKV = matrixVectorMult (wo weights !! indexLayer) (dim network) (dim network) (V.concat activations)
         token' = V.zipWith (+) token deltaTokenQKV
-        deltaTokenFFN = computeDeltaFFN (weighting network) indexLayer token'
-        result = V.zipWith (+) token' deltaTokenFFN
-    return result
+      
+    deltaTokenFFN <- computeDeltaFFN weights indexLayer token'
+    return $ V.zipWith (+) token' deltaTokenFFN
 
 -- Transformer step
 transformer :: Token -> Int -> TransformerResult (V.Vector Float)
@@ -380,11 +396,13 @@ transformer tokenCode stepCount = do
     network <- ask
 
     -- Getting the token embedding
-    let token = tokenEmbeddingTable (weighting network) !! fromIntegral tokenCode
+    let weights = weighting network
+        rowStart = fromIntegral tokenCode * tokenEmbeddingTableCols weights
+        token = V.slice rowStart (tokenEmbeddingTableCols weights) (tokenEmbeddingTable weights)
 
     -- Plucking out the current row of freq_cis_real and freq_cis_imag
-    let freqCisRealRow = freqCisReal (weighting network) !! stepCount
-    let freqCisImagRow = freqCisImag (weighting network) !! stepCount
+    let freqCisRealRow = freqCisReal weights !! stepCount
+    let freqCisImagRow = freqCisImag weights !! stepCount
 
     -- Forwarding all the layers
     finalToken <- foldM (\accToken indexLayer -> createLayerToken stepCount indexLayer freqCisRealRow freqCisImagRow accToken)
@@ -392,10 +410,10 @@ transformer tokenCode stepCount = do
                   [0..nLayers network - 1]
 
     -- Final rmsnorm
-    let tokenWithRms = rmsNorm finalToken (rmsFinalWeight $ weighting network)
+    let tokenWithRms = rmsNorm finalToken (rmsFinalWeight weights)
 
     -- Classifier into logits
-    let logits = matrixVectorMult (tokenEmbeddingTable (weighting network)) tokenWithRms
+    let logits = matrixVectorMult (tokenEmbeddingTable weights) (tokenEmbeddingTableRows weights) (tokenEmbeddingTableCols weights) tokenWithRms
 
     return logits
 
