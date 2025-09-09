@@ -323,14 +323,15 @@ drawSample randomSeed probabilities = do
   return $ fromIntegral (min selectedIndex (V.length probabilities - 1))
 
 -- Helper: write single head vector from mutable slice to the flat cache
-updateCacheWithHead :: NetworkConfig -> LayerIndex -> HeadIndex -> StepCount -> MVectorFloat -> MVectorFloat -> IO ()
-updateCacheWithHead network layerIndex headIndex stepIndex headSlice cache = do
+updateCacheWithHead :: LayerIndex -> HeadIndex -> StepCount -> MVectorFloat -> MVectorFloat -> TransformerResult ()
+updateCacheWithHead layerIndex headIndex stepIndex headSlice cache = do
+  network <- ask
   let headDim = headDimension network
   let cacheOffset = cacheIndex network stepIndex layerIndex headIndex 0
   MV.copy (MV.slice cacheOffset headDim cache) headSlice
 
 -- Rotary application to mutable buffer slice
-applyRotaryPositionEncoding :: Int -> V.Vector Float -> V.Vector Float ->  MVectorFloat -> IO ()
+applyRotaryPositionEncoding :: Int -> V.Vector Float -> V.Vector Float ->  MVectorFloat -> TransformerResult ()
 applyRotaryPositionEncoding startOffset cosFrequencies sinFrequencies buffer = do
   let headDim = V.length cosFrequencies * 2
   forM_ [0, 2 .. headDim - 2] $ \pairIndex -> do
@@ -345,8 +346,11 @@ applyRotaryPositionEncoding startOffset cosFrequencies sinFrequencies buffer = d
     MV.write buffer (realIndex + 1) rotatedImag
 
 -- Apply rotations to entire buffer (per head)
-applyRotations :: V.Vector Float -> V.Vector Float -> Int -> Int -> MVectorFloat -> IO ()
-applyRotations cosFrequencies sinFrequencies numHeads headDim buffer = do
+applyRotations :: V.Vector Float -> V.Vector Float -> MVectorFloat -> TransformerResult ()
+applyRotations cosFrequencies sinFrequencies buffer = do
+  network <- ask
+  let headDim = headDimension network
+      numHeads = numAttentionHeads network
   forM_ [0 .. numHeads - 1] $ \headIndex -> do
     applyRotaryPositionEncoding (headIndex * headDim) cosFrequencies sinFrequencies buffer
 
@@ -416,13 +420,13 @@ computeMultiHeadAttention :: StepCount -> LayerIndex ->
   -- | Output buffer (concatenated heads)
   MVectorFloat ->
   TransformerResult  ()
-computeMultiHeadAttention currentStep layerIndex queryBuffer keyCache valueCache multiHeadOutput = do
+computeMultiHeadAttention currentStep layerIndex queryOutput keyCache valueCache multiHeadOutput = do
   network <- ask
   let
       attentionHeadDim = headDimension network
       numHeads = numAttentionHeads network
   forM_ [0 .. numHeads - 1] $ \headIndex -> do
-    rawAttentionScores <- computeScores layerIndex (HeadIndex headIndex) queryBuffer keyCache currentStep
+    rawAttentionScores <- computeScores layerIndex (HeadIndex headIndex) queryOutput keyCache currentStep
     let normalizedScores = softmax rawAttentionScores (V.length rawAttentionScores)
         attentionWeights = V.toList normalizedScores
         outputOffset = headIndex * attentionHeadDim
@@ -509,15 +513,15 @@ computeQKV weights currentStep layerIndex freqCosValues freqSinValues (TokenVect
     applyMatrixVectorMult (getArray2D layerIdx (wk weights)) normalizedInputMutable keyOutput
     applyMatrixVectorMult (getArray2D layerIdx (wv weights)) normalizedInputMutable valueOutput
 
-    -- Rotary position encodings are applied to Q and K
-    applyRotations freqCosValues freqSinValues numHeads headDim queryOutput
-    applyRotations freqCosValues freqSinValues numHeads headDim keyOutput
+  -- Rotary position encodings are applied to Q and K
+  applyRotations freqCosValues freqSinValues queryOutput
+  applyRotations freqCosValues freqSinValues keyOutput
 
-    forM_ [0 .. numHeads - 1] $ \headIndex -> do
-      let keyHeadSlice = MV.slice (headIndex * headDim) headDim keyOutput
-      let valueHeadSlice = MV.slice (headIndex * headDim) headDim valueOutput
-      updateCacheWithHead network layerIndex (HeadIndex headIndex) currentStep keyHeadSlice keyCache
-      updateCacheWithHead network layerIndex (HeadIndex headIndex) currentStep valueHeadSlice valueCache
+  forM_ [0 .. numHeads - 1] $ \headIndex -> do
+    let keyHeadSlice = MV.slice (headIndex * headDim) headDim keyOutput
+    let valueHeadSlice = MV.slice (headIndex * headDim) headDim valueOutput
+    updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep keyHeadSlice keyCache
+    updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep valueHeadSlice valueCache
 
 -- Layer Token
 createLayerToken :: StepCount -> LayerIndex -> V.Vector Float -> V.Vector Float -> TokenVector -> TransformerResult TokenVector
@@ -622,10 +626,8 @@ generateTokens maxSteps promptTokens temperature vocab seedValue = do
 -- Initialize flat attention KV caches (flattened to one MVector each)
 initAttentionKV :: NetworkConfig -> IO AttentionKV
 initAttentionKV NetworkConfig {numLayers, numAttentionHeads, seqLen, headDimension, hiddenDim, modelDim} = do
-  let size = numLayers * numAttentionHeads * seqLen * headDimension
-      concatenatedHeadsSize = numAttentionHeads * headDimension  -- Size for concatenated heads
-  keyCache <- MV.new size
-  valueCache <- MV.new size
+  keyCache <- MV.new (numLayers * numAttentionHeads * seqLen * headDimension)
+  valueCache <- MV.new (numLayers * numAttentionHeads * seqLen * headDimension)
   gateOutput <- MV.new hiddenDim
   upProjectionOutput <- MV.new hiddenDim
   feedforwardNetworkOutput <- MV.new modelDim
@@ -633,7 +635,7 @@ initAttentionKV NetworkConfig {numLayers, numAttentionHeads, seqLen, headDimensi
   keyOutput <- MV.new modelDim
   valueOutput <- MV.new modelDim
   projectedAttentionOutput <- MV.new modelDim
-  multiHeadOutput <- MV.new concatenatedHeadsSize
+  multiHeadOutput <- MV.new (numAttentionHeads * headDimension)
   return AttentionKV {keyCache, valueCache, gateOutput, upProjectionOutput, feedforwardNetworkOutput, queryOutput, keyOutput, valueOutput, projectedAttentionOutput, multiHeadOutput}
 
 runModel :: BS.ByteString -> BS.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
