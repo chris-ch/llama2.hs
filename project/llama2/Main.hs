@@ -32,9 +32,16 @@ import Control.DeepSeq (deepseq)
 --------------------------------------------------------------------------------
 
 data Array2D = Array2D
-    { vec :: V.Vector Float
+    { struct2D :: V.Vector Float
     , nrows :: Int
     , ncols :: Int
+    } deriving (Show)
+
+data Array3D = Array3D
+    { struct3D :: V.Vector Float
+    , sizeX :: Int
+    , sizeY :: Int
+    , sizeZ :: Int
     } deriving (Show)
 
 class Array2DOps a where
@@ -44,12 +51,32 @@ class Array2DOps a where
 instance Array2DOps Array2D where
 
     getRow :: Int -> Array2D -> V.Vector Float
-    getRow i Array2D {vec, ncols} = V.slice (i * ncols) ncols vec
+    getRow i Array2D {struct2D, ncols} = V.slice (i * ncols) ncols struct2D
 
     readArray2D :: Int -> Int -> BG.Get Array2D
     readArray2D rows cols = do
         vec <- readVector (rows * cols) >>= \v -> v `deepseq` return v
-        return $ Array2D {vec = vec, nrows = rows, ncols = cols}
+        return $ Array2D {struct2D = vec, nrows = rows, ncols = cols}
+
+class Array3DOps a where
+    getArray2D :: Int -> a -> Array2D
+    readArray3D :: Int -> Int -> Int -> BG.Get a
+
+instance Array3DOps Array3D where
+    getArray2D :: Int -> Array3D -> Array2D
+    getArray2D k Array3D {struct3D, sizeX, sizeY, sizeZ}
+        | k < 0 || k >= sizeX = error "getArray2D: index out of bounds"
+        | otherwise = Array2D
+            { struct2D = V.slice (k * sizeY * sizeZ) (sizeY * sizeZ) struct3D
+            , nrows = sizeY
+            , ncols = sizeZ
+            }
+
+    readArray3D :: Int -> Int -> Int -> BG.Get Array3D
+    readArray3D sx sy sz = do
+        let totalSize = sx * sy * sz
+        vec <- readVector totalSize >>= \v -> v `deepseq` return v
+        return $ Array3D {struct3D = vec, sizeX = sx, sizeY = sy, sizeZ = sz}
 
 --------------------------------------------------------------------------------
 -- Options
@@ -104,18 +131,16 @@ data AttentionKV = AttentionKV
     }
 
 data TransformerWeighting = TransformerWeighting
-    { tokenEmbeddingTable :: V.Vector Float
-    , tokenEmbeddingTableRows :: Int
-    , tokenEmbeddingTableCols :: Int
+    { tokenEmbeddingTable :: Array2D
     , rmsAttWeight :: Array2D
-    , wq :: Array2D
-    , wk :: Array2D
-    , wv :: Array2D
-    , wo :: Array2D
+    , wq :: Array3D
+    , wk :: Array3D
+    , wv :: Array3D
+    , wo :: Array3D
     , rmsFfnWeight :: Array2D
-    , w1 :: Array2D
-    , w2 :: Array2D
-    , w3 :: Array2D
+    , w1 :: Array3D
+    , w2 :: Array3D
+    , w3 :: Array3D
     , rmsFinalWeight :: V.Vector Float
     , freqCisReal :: Array2D
     , freqCisImag :: Array2D
@@ -149,16 +174,16 @@ parseNetworkConfigFile = do
         numKeyValueHeads' <- fromIntegral <$> getInt32le
         vocabSize' <- fromIntegral <$> getInt32le
         seqLen' <- fromIntegral <$> getInt32le
-        tokenEmbeddingTable' <- readVector (vocabSize' * dim') >>= \v -> v `deepseq` return v
+        tokenEmbeddingTable' <- readArray2D vocabSize' dim'
         rmsAttWeight' <- readArray2D nLayers' dim'
-        wq' <- readArray2D nLayers' (dim' * dim')
-        wk' <- readArray2D nLayers' (dim' * dim')
-        wv' <- readArray2D nLayers' (dim' * dim')
-        wo' <- readArray2D nLayers' (dim' * dim')
+        wq' <- readArray3D nLayers' dim' dim'
+        wk' <- readArray3D nLayers' dim' dim'
+        wv' <- readArray3D nLayers' dim' dim'
+        wo' <- readArray3D nLayers' dim' dim'
         rmsFfnWeight' <- readArray2D nLayers' dim'
-        w1' <- readArray2D nLayers' (hiddenDim' * dim')
-        w2' <- readArray2D nLayers' (dim' * hiddenDim')
-        w3' <- readArray2D nLayers' (hiddenDim' * dim')
+        w1' <- readArray3D nLayers' hiddenDim' dim'
+        w2' <- readArray3D nLayers' dim' hiddenDim'
+        w3' <- readArray3D nLayers' hiddenDim' dim'
         rmsFinalWeight' <- readVector dim' >>= \v -> v `deepseq` return v
         freqCisReal' <- readArray2D seqLen' ((dim' `div` numAttentionHeads') `div` 2)
         freqCisImag' <- readArray2D seqLen' ((dim' `div` numAttentionHeads') `div` 2)
@@ -167,8 +192,6 @@ parseNetworkConfigFile = do
             headDim = dim' `div` numAttentionHeads'
             weights = TransformerWeighting
                 { tokenEmbeddingTable = tokenEmbeddingTable'
-                , tokenEmbeddingTableRows = vocabSize'
-                , tokenEmbeddingTableCols = dim'
                 , rmsAttWeight = rmsAttWeight'
                 , wq = wq'
                 , wk = wk'
@@ -378,30 +401,31 @@ multiheadActivation net numHeads headDim stepCount qBuf kCache vCache indexLayer
     V.freeze outBuf
 
 -- Math utils
-matrixVectorMult :: V.Vector Float -> Int -> Int -> V.Vector Float -> V.Vector Float
-matrixVectorMult flatMat nrows ncols vec = V.generate nrows $ \row ->
-    let rowStart = row * ncols
-        rowVec = V.slice rowStart ncols flatMat
+matrixVectorMult :: Array2D -> V.Vector Float -> V.Vector Float
+matrixVectorMult flatMap' vec = V.generate (nrows flatMap') $ \row ->
+    let rowStart = row * ncols flatMap'
+        rowVec = V.slice rowStart (ncols flatMap') (struct2D flatMap')
     in dotProduct rowVec vec
 
 -- Multiply a flat matrix by a mutable input vector, writing into an output mutable vector
-matrixVectorMultInPlaceMV
-  :: V.Vector Float    -- ^ Flat matrix (nrows * ncols)
-  -> Int               -- ^ nrows
-  -> Int               -- ^ ncols
+matrixVectorMultInPlace
+  :: Array2D
   -> MVectorFloat      -- ^ Input vector (mutable)
   -> MVectorFloat      -- ^ Output vector (mutable)
   -> IO ()
-matrixVectorMultInPlaceMV flatMat nrows ncols vecM result = do
+matrixVectorMultInPlace flatMat' vecM result = do
   -- For each row
-  forM_ [0 .. nrows - 1] $ \row -> do
-    let rowStart = row * ncols
+  let nrows' = nrows flatMat'
+      ncols' = ncols flatMat'
+      flatMat = struct2D flatMat'
+  forM_ [0 .. nrows' - 1] $ \row -> do
+    let rowStart = row * ncols'
         -- local references to avoid repeated lookups
         flat = flatMat
         rs = rowStart
     -- accumulate dot product in a strict loop
     let loop !i !acc
-          | i >= ncols = return acc
+          | i >= ncols' = return acc
           | otherwise = do
               v <- MV.unsafeRead vecM i
               let m = V.unsafeIndex flat (rs + i)
@@ -425,7 +449,6 @@ computeDeltaFFN weights indexLayer token = do
   network <- ask
   AttentionKV {ffnBuf1, ffnBuf2, ffnBufOut} <- gets id
   let hid = hiddenDim network
-      d   = dim network
       silu v = v / (1.0 + exp (-v))
       rmsFFNWeight = getRow indexLayer $ rmsFfnWeight weights
       rba = rmsNorm token rmsFFNWeight
@@ -433,13 +456,13 @@ computeDeltaFFN weights indexLayer token = do
   -- thaw rba once (rba is a V.Vector), reuse it
   rbaM <- liftIO $ V.thaw rba
   -- W1 * rba  -> ffnBuf1 (length hid)
-  liftIO $ matrixVectorMultInPlaceMV (getRow indexLayer (w1 weights)) hid d rbaM ffnBuf1
+  liftIO $ matrixVectorMultInPlace (getArray2D indexLayer (w1 weights)) rbaM ffnBuf1
 
   -- hidden1 = silu(W1 * rba)
   liftIO $ forM_ [0 .. hid - 1] $ \i -> MV.unsafeModify ffnBuf1 silu i
 
   -- hidden3 = W3 * rba  -> ffnBuf2
-  liftIO $ matrixVectorMultInPlaceMV (getRow indexLayer (w3 weights)) hid d rbaM ffnBuf2
+  liftIO $ matrixVectorMultInPlace (getArray2D indexLayer (w3 weights)) rbaM ffnBuf2
 
   -- hidden1 *= hidden3   (in-place on ffnBuf1)
   liftIO $ forM_ [0 .. hid - 1] $ \i -> do
@@ -448,7 +471,7 @@ computeDeltaFFN weights indexLayer token = do
 
   -- result = W2 * hidden1
   -- Use ffnBuf1 directly (no freeze/thaw)
-  liftIO $ matrixVectorMultInPlaceMV (getRow indexLayer (w2 weights)) d hid ffnBuf1 ffnBufOut
+  liftIO $ matrixVectorMultInPlace (getArray2D indexLayer (w2 weights)) ffnBuf1 ffnBufOut
   liftIO $ V.freeze ffnBufOut
 
 -- QKV
@@ -463,9 +486,9 @@ computeQKV weights indexLayer freqCisRealRow freqCisImagRow token stepCount = do
     rba = rmsNorm token (getRow indexLayer (rmsAttWeight weights))
 
   rbaM <- liftIO $ V.thaw rba               -- mutable copy of rba (one allocation)
-  liftIO $ matrixVectorMultInPlaceMV (getRow indexLayer (wq weights)) d d rbaM qBuf
-  liftIO $ matrixVectorMultInPlaceMV (getRow indexLayer (wk weights)) d d rbaM kBuf
-  liftIO $ matrixVectorMultInPlaceMV (getRow indexLayer (wv weights )) d d rbaM vBuf
+  liftIO $ matrixVectorMultInPlace (getArray2D indexLayer (wq weights)) rbaM qBuf
+  liftIO $ matrixVectorMultInPlace (getArray2D indexLayer (wk weights)) rbaM kBuf
+  liftIO $ matrixVectorMultInPlace (getArray2D indexLayer (wv weights)) rbaM vBuf
 
   liftIO $ applyRotationsToBuf qBuf freqCisRealRow freqCisImagRow numHeads headDim
   liftIO $ applyRotationsToBuf kBuf freqCisRealRow freqCisImagRow numHeads headDim
@@ -487,7 +510,7 @@ createLayerToken stepCount indexLayer freqCisRealRow freqCisImagRow token = do
     computeQKV weights indexLayer freqCisRealRow freqCisImagRow token stepCount
     activations <- liftIO $ multiheadActivation network numHeads headDim stepCount qBuf keyCache valueCache indexLayer
     let
-      deltaTokenQKV = matrixVectorMult (getRow indexLayer (wo weights)) (dim network) (dim network) (V.concat activations)
+      deltaTokenQKV = matrixVectorMult (getArray2D indexLayer (wo weights)) (V.concat activations)
       token' = V.zipWith (+) token deltaTokenQKV
 
     deltaTokenFFN <- computeDeltaFFN weights indexLayer token'
@@ -500,8 +523,9 @@ transformer tokenCode stepCount = do
 
     -- Getting the token embedding
     let weights = weighting network
-        rowStart = fromIntegral tokenCode * tokenEmbeddingTableCols weights
-        token = V.slice rowStart (tokenEmbeddingTableCols weights) (tokenEmbeddingTable weights)
+        vocab = tokenEmbeddingTable weights
+        rowStart = fromIntegral tokenCode * ncols vocab
+        token = V.slice rowStart (ncols vocab) (struct2D vocab)
 
     -- Plucking out the current row of freq_cis_real and freq_cis_imag
     let freqCisRealRow = getRow stepCount (freqCisReal weights)
@@ -516,7 +540,7 @@ transformer tokenCode stepCount = do
     let tokenWithRms = rmsNorm finalToken (rmsFinalWeight weights)
 
     -- Classifier into logits
-    let logits = matrixVectorMult (tokenEmbeddingTable weights) (tokenEmbeddingTableRows weights) (tokenEmbeddingTableCols weights) tokenWithRms
+    let logits = matrixVectorMult vocab tokenWithRms
 
     return logits
 
