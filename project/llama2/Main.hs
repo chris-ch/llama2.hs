@@ -31,14 +31,14 @@ import Text.Printf (printf)
 --------------------------------------------------------------------------------
 
 data Array2D = Array2D
-  { struct2D :: V.Vector Float,
+  { items2D :: V.Vector Float,
     nrows :: Int,
     ncols :: Int
   }
   deriving (Show)
 
 data Array3D = Array3D
-  { struct3D :: V.Vector Float,
+  { items3D :: V.Vector Float,
     sizeX :: Int,
     sizeY :: Int,
     sizeZ :: Int
@@ -51,12 +51,12 @@ class Array2DOps a where
 
 instance Array2DOps Array2D where
   getRow :: Int -> Array2D -> V.Vector Float
-  getRow i Array2D {struct2D, ncols} = V.slice (i * ncols) ncols struct2D
+  getRow i Array2D {items2D, ncols} = V.slice (i * ncols) ncols items2D
 
   readArray2D :: Int -> Int -> BG.Get Array2D
   readArray2D rows cols = do
     vec <- readVector (rows * cols) >>= \v -> v `deepseq` return v
-    return $ Array2D {struct2D = vec, nrows = rows, ncols = cols}
+    return $ Array2D {items2D = vec, nrows = rows, ncols = cols}
 
 class Array3DOps a where
   getArray2D :: Int -> a -> Array2D
@@ -64,11 +64,11 @@ class Array3DOps a where
 
 instance Array3DOps Array3D where
   getArray2D :: Int -> Array3D -> Array2D
-  getArray2D k Array3D {struct3D, sizeX, sizeY, sizeZ}
+  getArray2D k Array3D {items3D, sizeX, sizeY, sizeZ}
     | k < 0 || k >= sizeX = error "getArray2D: index out of bounds"
     | otherwise =
         Array2D
-          { struct2D = V.slice (k * sizeY * sizeZ) (sizeY * sizeZ) struct3D,
+          { items2D = V.slice (k * sizeY * sizeZ) (sizeY * sizeZ) items3D,
             nrows = sizeY,
             ncols = sizeZ
           }
@@ -77,7 +77,7 @@ instance Array3DOps Array3D where
   readArray3D sx sy sz = do
     let totalSize = sx * sy * sz
     vec <- readVector totalSize
-    return $ Array3D {struct3D = vec, sizeX = sx, sizeY = sy, sizeZ = sz}
+    return $ Array3D {items3D = vec, sizeX = sx, sizeY = sy, sizeZ = sz}
 
 --------------------------------------------------------------------------------
 -- Options
@@ -108,11 +108,14 @@ main = do
   Options {..} <- OA.execParser $ OA.info (optionsParser OA.<**> OA.helper) OA.fullDesc
   modelFileContent <- BS.readFile modelFile
   tokenizerFileContent <- BS.readFile tokenizerFile
-  run modelFileContent tokenizerFileContent (realToFrac temperature) steps prompt seed
+  runModel modelFileContent tokenizerFileContent (realToFrac temperature) steps prompt seed
 
 --------------------------------------------------------------------------------
 -- Types
 --------------------------------------------------------------------------------
+
+newtype HeadIndex = HeadIndex Int deriving (Show)
+newtype LayerIndex = LayerIndex Int deriving (Show)
 
 type MVectorFloat = MV.MVector (MV.PrimState IO) Float
 
@@ -127,13 +130,13 @@ type PromptTokens = [Token]
 data AttentionKV = AttentionKV
   { keyCache :: MVectorFloat,
     valueCache :: MVectorFloat,
-    gateBuffer :: MVectorFloat,
-    upProjectionBuffer :: MVectorFloat,
+    gateOutput :: MVectorFloat,
+    upProjectionOutput :: MVectorFloat,
     feedforwardNetworkOutput :: MVectorFloat,
-    queryBuffer :: MVectorFloat,
-    keyBuffer :: MVectorFloat,
-    valueBuffer :: MVectorFloat,
-    attentionOutputBuffer :: MVectorFloat
+    queryOutput :: MVectorFloat,
+    keyOutput :: MVectorFloat,
+    valueOutput :: MVectorFloat,
+    projectedAttentionOutput :: MVectorFloat
   }
 
 data TransformerWeighting = TransformerWeighting
@@ -154,7 +157,7 @@ data TransformerWeighting = TransformerWeighting
   deriving (Show)
 
 data NetworkConfig = NetworkConfig
-  { dim :: Int,
+  { modelDim :: Int,
     hiddenDim :: Int,
     numLayers :: Int,
     numAttentionHeads :: Int,
@@ -175,28 +178,28 @@ readVector count = V.replicateM count getFloatle >>= \v -> v `deepseq` return v
 
 parseNetworkConfigFile :: BG.Get NetworkConfig
 parseNetworkConfigFile = do
-  dim' <- fromIntegral <$> getInt32le
+  modelDim' <- fromIntegral <$> getInt32le
   hiddenDim' <- fromIntegral <$> getInt32le
   nLayers' <- fromIntegral <$> getInt32le
   numAttentionHeads' <- fromIntegral <$> getInt32le
   numKeyValueHeads' <- fromIntegral <$> getInt32le
   vocabSize' <- fromIntegral <$> getInt32le
   seqLen' <- fromIntegral <$> getInt32le
-  tokenEmbeddingTable' <- readArray2D vocabSize' dim'
-  rmsAttWeight' <- readArray2D nLayers' dim'
-  wq' <- readArray3D nLayers' dim' dim'
-  wk' <- readArray3D nLayers' dim' dim'
-  wv' <- readArray3D nLayers' dim' dim'
-  wo' <- readArray3D nLayers' dim' dim'
-  rmsFfnWeight' <- readArray2D nLayers' dim'
-  w1' <- readArray3D nLayers' hiddenDim' dim'
-  w2' <- readArray3D nLayers' dim' hiddenDim'
-  w3' <- readArray3D nLayers' hiddenDim' dim'
-  rmsFinalWeight' <- readVector dim'
-  freqCisReal' <- readArray2D seqLen' ((dim' `div` numAttentionHeads') `div` 2)
-  freqCisImag' <- readArray2D seqLen' ((dim' `div` numAttentionHeads') `div` 2)
+  tokenEmbeddingTable' <- readArray2D vocabSize' modelDim'
+  rmsAttWeight' <- readArray2D nLayers' modelDim'
+  wq' <- readArray3D nLayers' modelDim' modelDim'
+  wk' <- readArray3D nLayers' modelDim' modelDim'
+  wv' <- readArray3D nLayers' modelDim' modelDim'
+  wo' <- readArray3D nLayers' modelDim' modelDim'
+  rmsFfnWeight' <- readArray2D nLayers' modelDim'
+  w1' <- readArray3D nLayers' hiddenDim' modelDim'
+  w2' <- readArray3D nLayers' modelDim' hiddenDim'
+  w3' <- readArray3D nLayers' hiddenDim' modelDim'
+  rmsFinalWeight' <- readVector modelDim'
+  freqCisReal' <- readArray2D seqLen' ((modelDim' `div` numAttentionHeads') `div` 2)
+  freqCisImag' <- readArray2D seqLen' ((modelDim' `div` numAttentionHeads') `div` 2)
 
-  let headDim = dim' `div` numAttentionHeads'
+  let headDim = modelDim' `div` numAttentionHeads'
       weights =
         TransformerWeighting
           { tokenEmbeddingTable = tokenEmbeddingTable',
@@ -215,7 +218,7 @@ parseNetworkConfigFile = do
           }
   return $
     NetworkConfig
-      { dim = dim',
+      { modelDim = modelDim',
         hiddenDim = hiddenDim',
         numLayers = nLayers',
         numAttentionHeads = numAttentionHeads',
@@ -258,10 +261,10 @@ tokenizerInit file size prompt = (bpeEncode prompt vocab vocabScores, vocab)
 strLookup :: BS.ByteString -> Vocabulary -> Int
 strLookup occurrence = fromMaybe (-1) . DL.elemIndex occurrence
 
-processTokens :: [Token] -> Vocabulary -> VocabularyScores -> PromptTokens
-processTokens tokens vocab vocabScores = case findBestPair tokens of
+applyBPEMerges :: [Token] -> Vocabulary -> VocabularyScores -> PromptTokens
+applyBPEMerges tokens vocab vocabScores = case findBestPair tokens of
   Just (bestIndex, bestToken) ->
-    processTokens (mergePair bestIndex bestToken tokens) vocab vocabScores
+    applyBPEMerges (mergePair bestIndex bestToken tokens) vocab vocabScores
   Nothing ->
     tokens
   where
@@ -284,7 +287,7 @@ processTokens tokens vocab vocabScores = case findBestPair tokens of
 bpeEncode :: BS.ByteString -> Vocabulary -> VocabularyScores -> PromptTokens
 bpeEncode prompt vocab vocabScores =
   let tokens = map (\char -> fromMaybe (error "Character not found in vocabulary") (DL.elemIndex (BS.pack [char]) vocab)) (BS.unpack prompt)
-   in processTokens (map fromIntegral tokens) vocab vocabScores
+   in applyBPEMerges (map fromIntegral tokens) vocab vocabScores
 
 --------------------------------------------------------------------------------
 -- Transformer runtime
@@ -293,8 +296,8 @@ bpeEncode prompt vocab vocabScores =
 type TransformerResult a = ReaderT NetworkConfig (StateT AttentionKV IO) a
 
 -- Cache indexing helper
-cacheIndex :: NetworkConfig -> Int -> Int -> Int -> Int -> Int
-cacheIndex NetworkConfig {numAttentionHeads, seqLen, headDimension} layerIndex headIndex stepIndex dimensionIndex =
+cacheIndex :: NetworkConfig -> LayerIndex -> HeadIndex -> Int -> Int -> Int
+cacheIndex NetworkConfig {numAttentionHeads, seqLen, headDimension} (LayerIndex layerIndex) (HeadIndex headIndex) stepIndex dimensionIndex =
   (((layerIndex * numAttentionHeads + headIndex) * seqLen) + stepIndex) * headDimension + dimensionIndex
 
 -- Softmax
@@ -316,15 +319,15 @@ drawSample randomSeed probabilities = do
   return $ fromIntegral (min selectedIndex (V.length probabilities - 1))
 
 -- Helper: write single head vector from mutable slice to the flat cache
-updateCacheWithHead :: NetworkConfig -> Int -> Int -> Int -> MVectorFloat -> MVectorFloat -> IO ()
+updateCacheWithHead :: NetworkConfig -> LayerIndex -> HeadIndex -> Int -> MVectorFloat -> MVectorFloat -> IO ()
 updateCacheWithHead network layerIndex headIndex stepIndex headSlice cache = do
   let headDim = headDimension network
   let cacheOffset = cacheIndex network layerIndex headIndex stepIndex 0
   MV.copy (MV.slice cacheOffset headDim cache) headSlice
 
 -- Rotary application to mutable buffer slice
-applyRotaryPositionEncoding :: MVectorFloat -> Int -> V.Vector Float -> V.Vector Float -> IO ()
-applyRotaryPositionEncoding buffer startOffset cosFrequencies sinFrequencies = do
+applyRotaryPositionEncoding :: Int -> V.Vector Float -> V.Vector Float ->  MVectorFloat -> IO ()
+applyRotaryPositionEncoding startOffset cosFrequencies sinFrequencies buffer = do
   let headDim = V.length cosFrequencies * 2
   forM_ [0, 2 .. headDim - 2] $ \pairIndex -> do
     let realIndex = startOffset + pairIndex
@@ -338,18 +341,14 @@ applyRotaryPositionEncoding buffer startOffset cosFrequencies sinFrequencies = d
     MV.write buffer (realIndex + 1) rotatedImag
 
 -- Apply rotations to entire buffer (per head)
-applyRotationsToBuf :: V.Vector Float -> V.Vector Float -> Int -> Int -> MVectorFloat -> IO ()
-applyRotationsToBuf cosFrequencies sinFrequencies numHeads headDim buffer = do
+applyRotations :: V.Vector Float -> V.Vector Float -> Int -> Int -> MVectorFloat -> IO ()
+applyRotations cosFrequencies sinFrequencies numHeads headDim buffer = do
   forM_ [0 .. numHeads - 1] $ \headIndex -> do
-    applyRotaryPositionEncoding buffer (headIndex * headDim) cosFrequencies sinFrequencies
+    applyRotaryPositionEncoding (headIndex * headDim) cosFrequencies sinFrequencies buffer
 
 -- Build activation directly into a provided mutable vector
-applyAttentionWeights ::
-  NetworkConfig ->
-  -- | Layer index
-  Int ->
-  -- | Head index
-  Int ->
+accumulateAttentionOutput ::
+  NetworkConfig -> LayerIndex -> HeadIndex ->
   -- | Head dimension
   Int ->
   -- | Attention scores
@@ -359,7 +358,7 @@ applyAttentionWeights ::
   -- | Output buffer (must be preallocated to headDim)
   MVectorFloat ->
   IO ()
-applyAttentionWeights network layerIndex headIndex headDim attentionScores valueCache outputBuffer = do
+accumulateAttentionOutput network layerIndex headIndex headDim attentionScores valueCache outputBuffer = do
   -- Zero the output buffer
   MV.set outputBuffer 0.0
   let sequenceLength = length attentionScores
@@ -372,14 +371,16 @@ applyAttentionWeights network layerIndex headIndex headDim attentionScores value
       MV.modify outputBuffer (+ (attentionWeight * valueComponent)) dimIndex
 
 -- Attention scores
-computeScores :: NetworkConfig -> Int -> Int -> Int -> MVectorFloat -> MVectorFloat -> Int -> IO (V.Vector Float)
+computeScores :: NetworkConfig -> Int -> LayerIndex -> HeadIndex -> MVectorFloat -> MVectorFloat -> Int -> IO (V.Vector Float)
 computeScores network headDim layerIndex headIndex queryBuffer keyCache currentStep = do
   let scalingFactor = sqrt (fromIntegral headDim)
   let sequenceLength = currentStep + 1
   V.generateM sequenceLength $ \positionIndex -> do
-    let keyCacheOffset = cacheIndex network layerIndex headIndex positionIndex 0
-    let keySlice = MV.slice keyCacheOffset headDim keyCache
-    let querySlice = MV.slice (headIndex * headDim) headDim queryBuffer
+    let
+      keyCacheOffset = cacheIndex network layerIndex headIndex positionIndex 0
+      keySlice = MV.slice keyCacheOffset headDim keyCache
+      HeadIndex hIndex = headIndex
+      querySlice = MV.slice (hIndex * headDim) headDim queryBuffer
     dotProduct <- dotProductMV querySlice keySlice
     return $ dotProduct / scalingFactor
 
@@ -397,8 +398,7 @@ dotProductMV vec1 vec2 = do
     [0 .. len - 1]
 
 -- Multihead
-computeMultiHeadAttention ::
-  NetworkConfig ->
+computeMultiHeadAttention :: NetworkConfig -> LayerIndex ->
   -- | Number of heads
   Int ->
   -- | Head dimension
@@ -411,31 +411,19 @@ computeMultiHeadAttention ::
   MVectorFloat ->
   -- | Value cache
   MVectorFloat ->
-  -- | Layer index
-  Int ->
   IO [V.Vector Float]
-computeMultiHeadAttention network numHeads headDim currentStep queryBuffer keyCache valueCache layerIndex = do
+computeMultiHeadAttention network layerIndex numHeads headDim currentStep queryBuffer keyCache valueCache = do
   forM [0 .. numHeads - 1] $ \headIndex -> do
-    rawAttentionScores <- computeScores network headDim layerIndex headIndex queryBuffer keyCache currentStep
+    rawAttentionScores <- computeScores network headDim layerIndex (HeadIndex headIndex) queryBuffer keyCache currentStep
     let normalizedScores = softmax rawAttentionScores (V.length rawAttentionScores)
         attentionWeights = V.toList normalizedScores
 
     -- Reuse a mutable vector for accumulation
     headOutputBuffer <- MV.new headDim
-    applyAttentionWeights network layerIndex headIndex headDim attentionWeights valueCache headOutputBuffer
+    accumulateAttentionOutput network layerIndex (HeadIndex headIndex) headDim attentionWeights valueCache headOutputBuffer
     V.freeze headOutputBuffer
 
 -- Math utils
-matrixVectorMult :: Array2D -> V.Vector Float -> V.Vector Float
-matrixVectorMult array2D vec = V.generate (nrows array2D) $ \row ->
-  let start = row * ncols array2D
-      end = start + ncols array2D
-      dot =
-        sum
-          [ (struct2D array2D V.! i) * (vec V.! (i - start))
-            | i <- [start .. end - 1]
-          ]
-   in dot
 
 -- Multiply a matrix by a mutable input vector, writing into an output mutable vector
 applyMatrixVectorMult ::
@@ -449,7 +437,7 @@ applyMatrixVectorMult array2D vecM result = do
   -- For each row
   let nrows' = nrows array2D
       ncols' = ncols array2D
-      flatMat = struct2D array2D
+      flatMat = items2D array2D
   forM_ [0 .. nrows' - 1] $ \row -> do
     let rowStart = row * ncols'
         -- local references to avoid repeated lookups
@@ -473,10 +461,10 @@ rmsNorm vector weights =
    in V.zipWith (*) weights normalized
 
 -- FFN
-applyFeedForwardNetwork :: TransformerWeighting -> Int -> V.Vector Float -> TransformerResult ()
-applyFeedForwardNetwork weights layerIndex inputToken = do
+applyFeedForwardNetwork :: TransformerWeighting -> LayerIndex -> V.Vector Float -> TransformerResult ()
+applyFeedForwardNetwork weights (LayerIndex layerIndex) inputToken = do
   network <- ask
-  AttentionKV {gateBuffer, upProjectionBuffer, feedforwardNetworkOutput} <- gets id
+  AttentionKV {gateOutput, upProjectionOutput, feedforwardNetworkOutput} <- gets id
   let hiddenFFNDim = hiddenDim network
       silu activation = activation / (1.0 + exp (-activation))
       rmsFFNWeights = getRow layerIndex $ rmsFfnWeight weights
@@ -484,67 +472,70 @@ applyFeedForwardNetwork weights layerIndex inputToken = do
 
   -- thaw normalizedInput once (normalizedInput is a V.Vector), reuse it
   normalizedInputMutable <- liftIO $ V.thaw normalizedInput
-  liftIO $ applyMatrixVectorMult (getArray2D layerIndex (w1 weights)) normalizedInputMutable gateBuffer
+  liftIO $ applyMatrixVectorMult (getArray2D layerIndex (w1 weights)) normalizedInputMutable gateOutput
 
   -- gateActivation = silu(W1 * normalizedInput)
-  liftIO $ forM_ [0 .. hiddenFFNDim - 1] $ \i -> MV.unsafeModify gateBuffer silu i
+  liftIO $ forM_ [0 .. hiddenFFNDim - 1] $ \i -> MV.unsafeModify gateOutput silu i
 
   -- upProjection = W3 * normalizedInput  -> upProjectionBuffer
-  liftIO $ applyMatrixVectorMult (getArray2D layerIndex (w3 weights)) normalizedInputMutable upProjectionBuffer
+  liftIO $ applyMatrixVectorMult (getArray2D layerIndex (w3 weights)) normalizedInputMutable upProjectionOutput
 
   -- gateActivation *= upProjection   (in-place on gateBuffer)
   liftIO $ forM_ [0 .. hiddenFFNDim - 1] $ \i -> do
-    upValue <- MV.unsafeRead upProjectionBuffer i
-    MV.unsafeModify gateBuffer (* upValue) i
+    upValue <- MV.unsafeRead upProjectionOutput i
+    MV.unsafeModify gateOutput (* upValue) i
 
   -- result = W2 * gateActivation
-  liftIO $ applyMatrixVectorMult (getArray2D layerIndex (w2 weights)) gateBuffer feedforwardNetworkOutput
+  liftIO $ applyMatrixVectorMult (getArray2D layerIndex (w2 weights)) gateOutput feedforwardNetworkOutput
 
 -- QKV
-computeQKV :: TransformerWeighting -> Int -> V.Vector Float -> V.Vector Float -> V.Vector Float -> Int -> TransformerResult ()
+computeQKV :: TransformerWeighting -> LayerIndex -> V.Vector Float -> V.Vector Float -> V.Vector Float -> Int -> TransformerResult ()
 computeQKV weights layerIndex freqCosValues freqSinValues inputToken currentStep = do
   network <- ask
-  AttentionKV {queryBuffer, keyBuffer, valueBuffer, keyCache, valueCache} <- gets id
+  AttentionKV {queryOutput, keyOutput, valueOutput, keyCache, valueCache} <- gets id
   let headDim = headDimension network
       numHeads = numAttentionHeads network
+      LayerIndex layerIdx = layerIndex
       -- The input token gets RMS normalized
-      normalizedInput = rmsNorm inputToken (getRow layerIndex (rmsAttWeight weights))
+      normalizedInput = rmsNorm inputToken (getRow layerIdx (rmsAttWeight weights))
 
   normalizedInputMutable <- liftIO $ V.thaw normalizedInput -- mutable copy of normalizedInput (one allocation)
 
   -- This normalized input is projected into Q, K, V spaces
-  liftIO $ applyMatrixVectorMult (getArray2D layerIndex (wq weights)) normalizedInputMutable queryBuffer
-  liftIO $ applyMatrixVectorMult (getArray2D layerIndex (wk weights)) normalizedInputMutable keyBuffer
-  liftIO $ applyMatrixVectorMult (getArray2D layerIndex (wv weights)) normalizedInputMutable valueBuffer
+  liftIO $ applyMatrixVectorMult (getArray2D layerIdx (wq weights)) normalizedInputMutable queryOutput
+  liftIO $ applyMatrixVectorMult (getArray2D layerIdx (wk weights)) normalizedInputMutable keyOutput
+  liftIO $ applyMatrixVectorMult (getArray2D layerIdx (wv weights)) normalizedInputMutable valueOutput
 
   -- Rotary position encodings are applied to Q and K
-  liftIO $ applyRotationsToBuf freqCosValues freqSinValues numHeads headDim queryBuffer
-  liftIO $ applyRotationsToBuf freqCosValues freqSinValues numHeads headDim keyBuffer
+  liftIO $ applyRotations freqCosValues freqSinValues numHeads headDim queryOutput
+  liftIO $ applyRotations freqCosValues freqSinValues numHeads headDim keyOutput
 
   liftIO $ forM_ [0 .. numHeads - 1] $ \headIndex -> do
-    let keyHeadSlice = MV.slice (headIndex * headDim) headDim keyBuffer
-    let valueHeadSlice = MV.slice (headIndex * headDim) headDim valueBuffer
-    updateCacheWithHead network layerIndex headIndex currentStep keyHeadSlice keyCache
-    updateCacheWithHead network layerIndex headIndex currentStep valueHeadSlice valueCache
+    let keyHeadSlice = MV.slice (headIndex * headDim) headDim keyOutput
+    let valueHeadSlice = MV.slice (headIndex * headDim) headDim valueOutput
+    updateCacheWithHead network layerIndex (HeadIndex headIndex) currentStep keyHeadSlice keyCache
+    updateCacheWithHead network layerIndex (HeadIndex headIndex) currentStep valueHeadSlice valueCache
 
 -- Layer
-createLayerToken :: Int -> Int -> V.Vector Float -> V.Vector Float -> V.Vector Float -> TransformerResult (V.Vector Float)
+createLayerToken :: Int -> LayerIndex -> V.Vector Float -> V.Vector Float -> V.Vector Float -> TransformerResult (V.Vector Float)
 createLayerToken currentStep layerIndex freqCosValues freqSinValues inputToken = do
   network <- ask
-  AttentionKV {queryBuffer, keyCache, valueCache, attentionOutputBuffer, feedforwardNetworkOutput} <- gets id
+  AttentionKV {queryOutput, keyCache, valueCache, projectedAttentionOutput, feedforwardNetworkOutput} <- gets id
   let weights = weighting network
       attentionHeadDim = headDimension network
       numHeads = numAttentionHeads network
   computeQKV weights layerIndex freqCosValues freqSinValues inputToken currentStep
-  attentionOutputs <- liftIO $ computeMultiHeadAttention network numHeads attentionHeadDim currentStep queryBuffer keyCache valueCache layerIndex
-  let outputProjectionWeights = getArray2D layerIndex (wo weights)
-      concatenatedHeads = V.concat attentionOutputs
+  headAttentionOutputs <- liftIO $ computeMultiHeadAttention network layerIndex numHeads attentionHeadDim currentStep queryOutput keyCache valueCache
+  let
+    LayerIndex layerIdx = layerIndex
+    outputProjectionWeights = getArray2D layerIdx (wo weights)
+    concatenatedHeads = V.concat headAttentionOutputs
   -- Convert immutable input vector to mutable
   concatenatedHeadsMutable <- liftIO $ V.thaw concatenatedHeads
   -- Perform in-place matrix-vector multiplication
-  liftIO $ applyMatrixVectorMult outputProjectionWeights concatenatedHeadsMutable attentionOutputBuffer
+  liftIO $ applyMatrixVectorMult outputProjectionWeights concatenatedHeadsMutable projectedAttentionOutput
   -- Convert mutable output vector back to immutable
-  attentionDelta <- liftIO $ V.freeze attentionOutputBuffer
+  attentionDelta <- liftIO $ V.freeze projectedAttentionOutput
   let tokenAfterAttention = V.zipWith (+) inputToken attentionDelta
   applyFeedForwardNetwork weights layerIndex tokenAfterAttention
   ffnOut <- V.freeze feedforwardNetworkOutput
@@ -559,7 +550,7 @@ transformer tokenCode stepCount = do
   let weights = weighting network
       vocab = tokenEmbeddingTable weights
       rowStart = fromIntegral tokenCode * ncols vocab
-      token = V.slice rowStart (ncols vocab) (struct2D vocab)
+      token = V.slice rowStart (ncols vocab) (items2D vocab)
 
   -- Plucking out the current row of freq_cis_real and freq_cis_imag
   let freqCosValues = getRow stepCount (freqCisReal weights)
@@ -568,7 +559,7 @@ transformer tokenCode stepCount = do
   -- Forwarding all the layers
   finalToken <-
     foldM
-      (\accToken indexLayer -> createLayerToken stepCount indexLayer freqCosValues freqSinValues accToken)
+      (\accToken layerIndex -> createLayerToken stepCount (LayerIndex layerIndex) freqCosValues freqSinValues accToken)
       token
       [0 .. numLayers network - 1]
 
@@ -576,7 +567,12 @@ transformer tokenCode stepCount = do
   let tokenWithRms = rmsNorm finalToken (rmsFinalWeight weights)
 
   -- Classifier into logits
-  let logits = matrixVectorMult vocab tokenWithRms
+  let
+    logits = V.generate (nrows vocab) $ \row ->
+      let start = row * ncols vocab
+          end = start + ncols vocab
+          dot = sum [ (items2D vocab V.! i) * (tokenWithRms V.! (i - start)) | i <- [start .. end - 1] ]
+      in dot
 
   return logits
 
@@ -615,21 +611,21 @@ generateTokens maxSteps promptTokens temperature vocab seedValue = do
 
 -- Initialize flat attention KV caches (flattened to one MVector each)
 initAttentionKV :: NetworkConfig -> IO AttentionKV
-initAttentionKV NetworkConfig {numLayers, numAttentionHeads, seqLen, headDimension, hiddenDim, dim} = do
+initAttentionKV NetworkConfig {numLayers, numAttentionHeads, seqLen, headDimension, hiddenDim, modelDim} = do
   let size = numLayers * numAttentionHeads * seqLen * headDimension
   keyCache <- MV.new size
   valueCache <- MV.new size
-  gateBuffer <- MV.new hiddenDim
-  upProjectionBuffer <- MV.new hiddenDim
-  feedforwardNetworkOutput <- MV.new dim
-  queryBuffer <- MV.new dim
-  keyBuffer <- MV.new dim
-  valueBuffer <- MV.new dim
-  attentionOutputBuffer <- MV.new dim
-  return AttentionKV {keyCache, valueCache, gateBuffer, upProjectionBuffer, feedforwardNetworkOutput, queryBuffer, keyBuffer, valueBuffer, attentionOutputBuffer}
+  gateOutput <- MV.new hiddenDim
+  upProjectionOutput <- MV.new hiddenDim
+  feedforwardNetworkOutput <- MV.new modelDim
+  queryOutput <- MV.new modelDim
+  keyOutput <- MV.new modelDim
+  valueOutput <- MV.new modelDim
+  projectedAttentionOutput <- MV.new modelDim
+  return AttentionKV {keyCache, valueCache, gateOutput, upProjectionOutput, feedforwardNetworkOutput, queryOutput, keyOutput, valueOutput, projectedAttentionOutput}
 
-run :: BS.ByteString -> BS.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
-run modelFileContent tokenizerFileContent temperature steps prompt seed = do
+runModel :: BS.ByteString -> BS.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
+runModel modelFileContent tokenizerFileContent temperature steps prompt seed = do
   currentTime <- getPOSIXTime
   let seedValue = fromMaybe (round currentTime) seed
       config = initModel modelFileContent
