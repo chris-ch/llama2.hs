@@ -3,6 +3,7 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE InstanceSigs #-}
+{-# LANGUAGE LambdaCase #-}
 module Main (main) where
 
 import qualified Options.Applicative as OA
@@ -23,25 +24,32 @@ import GHC.Unicode (isSpace)
 import Text.Printf (printf)
 import Data.Binary.Get (getInt32le, getFloatle)
 import Data.Int (Int32)
-import Data.Vector.Unboxed (Vector)
 import System.IO (hFlush, stdout)
+import Control.DeepSeq (deepseq)
 
 --------------------------------------------------------------------------------
--- Matrix Data Structure and Class
+-- Array2D Data Structure and Class
 --------------------------------------------------------------------------------
 
-data Matrix = Matrix
-    { vec :: Vector Float
+data Array2D = Array2D
+    { vec :: V.Vector Float
     , nrows :: Int
     , ncols :: Int
     } deriving (Show)
 
-class MatrixOps a where
-    getRow :: Int -> a -> Vector Float
+class Array2DOps a where
+    getRow :: Int -> a -> V.Vector Float
+    readArray2D :: Int -> Int -> BG.Get a  -- rows -> cols -> parser
 
-instance MatrixOps Matrix where
-    getRow :: Int -> Matrix -> Vector Float
-    getRow i Matrix {vec, ncols} = V.slice (i * ncols) ncols vec
+instance Array2DOps Array2D where
+
+    getRow :: Int -> Array2D -> V.Vector Float
+    getRow i Array2D {vec, ncols} = V.slice (i * ncols) ncols vec
+
+    readArray2D :: Int -> Int -> BG.Get Array2D
+    readArray2D rows cols = do
+        vec <- readVector (rows * cols) >>= \v -> v `deepseq` return v
+        return $ Array2D {vec = vec, nrows = rows, ncols = cols}
 
 --------------------------------------------------------------------------------
 -- Options
@@ -96,21 +104,21 @@ data AttentionKV = AttentionKV
     }
 
 data TransformerWeighting = TransformerWeighting
-    { tokenEmbeddingTable :: Vector Float
+    { tokenEmbeddingTable :: V.Vector Float
     , tokenEmbeddingTableRows :: Int
     , tokenEmbeddingTableCols :: Int
-    , rmsAttWeight :: Matrix
-    , wq :: Matrix
-    , wk :: Matrix
-    , wv :: Matrix
-    , wo :: Matrix
-    , rmsFfnWeight :: Matrix
-    , w1 :: Matrix
-    , w2 :: Matrix
-    , w3 :: Matrix
-    , rmsFinalWeight :: Vector Float
-    , freqCisReal :: Matrix
-    , freqCisImag :: Matrix
+    , rmsAttWeight :: Array2D
+    , wq :: Array2D
+    , wk :: Array2D
+    , wv :: Array2D
+    , wo :: Array2D
+    , rmsFfnWeight :: Array2D
+    , w1 :: Array2D
+    , w2 :: Array2D
+    , w3 :: Array2D
+    , rmsFinalWeight :: V.Vector Float
+    , freqCisReal :: Array2D
+    , freqCisImag :: Array2D
     } deriving (Show)
 
 data NetworkConfig = NetworkConfig
@@ -129,10 +137,8 @@ data NetworkConfig = NetworkConfig
 -- Binary Parsing
 --------------------------------------------------------------------------------
 
-readVector :: Int -> BG.Get (Vector Float)
-readVector count = do
-    values <- replicateM count getFloatle
-    return $ V.fromList values
+readVector :: Int -> BG.Get (V.Vector Float)
+readVector count = V.replicateM count getFloatle
 
 parseNetworkConfigFile :: BG.Get NetworkConfig
 parseNetworkConfigFile = do
@@ -143,39 +149,39 @@ parseNetworkConfigFile = do
         numKeyValueHeads' <- fromIntegral <$> getInt32le
         vocabSize' <- fromIntegral <$> getInt32le
         seqLen' <- fromIntegral <$> getInt32le
-        tokenEmbeddingTable' <- readVector (vocabSize' * dim')
-        rmsAttWeight' <- readVector (nLayers' * dim')
-        wq' <- readVector (nLayers' * dim' * dim')
-        wk' <- readVector (nLayers' * dim' * dim')
-        wv' <- readVector (nLayers' * dim' * dim')
-        wo' <- readVector (nLayers' * dim' * dim')
-        rmsFfnWeight' <- readVector (nLayers' * dim')
-        w1' <- readVector (nLayers' * hiddenDim' * dim')
-        w2' <- readVector (nLayers' * dim' * hiddenDim')
-        w3' <- readVector (nLayers' * hiddenDim' * dim')
-        rmsFinalWeight' <- readVector dim'
-        freqCisReal' <- readVector (seqLen' * ((dim' `div` numAttentionHeads') `div` 2))
-        freqCisImag' <- readVector (seqLen' * ((dim' `div` numAttentionHeads') `div` 2))
+        tokenEmbeddingTable' <- readVector (vocabSize' * dim') >>= \v -> v `deepseq` return v
+        rmsAttWeight' <- readArray2D nLayers' dim'
+        wq' <- readArray2D nLayers' (dim' * dim')
+        wk' <- readArray2D nLayers' (dim' * dim')
+        wv' <- readArray2D nLayers' (dim' * dim')
+        wo' <- readArray2D nLayers' (dim' * dim')
+        rmsFfnWeight' <- readArray2D nLayers' dim'
+        w1' <- readArray2D nLayers' (hiddenDim' * dim')
+        w2' <- readArray2D nLayers' (dim' * hiddenDim')
+        w3' <- readArray2D nLayers' (hiddenDim' * dim')
+        rmsFinalWeight' <- readVector dim' >>= \v -> v `deepseq` return v
+        freqCisReal' <- readArray2D seqLen' ((dim' `div` numAttentionHeads') `div` 2)
+        freqCisImag' <- readArray2D seqLen' ((dim' `div` numAttentionHeads') `div` 2)
 
         let
             headDim = dim' `div` numAttentionHeads'
             weights = TransformerWeighting
-              { tokenEmbeddingTable = tokenEmbeddingTable'
-              , tokenEmbeddingTableRows = vocabSize'
-              , tokenEmbeddingTableCols = dim'
-              , rmsAttWeight = Matrix {vec=rmsAttWeight', nrows = nLayers', ncols = dim'}
-              , wq = Matrix {vec=wq', nrows = nLayers', ncols = dim' * dim'}
-              , wk = Matrix {vec=wk', nrows = nLayers', ncols = dim' * dim'}
-              , wv = Matrix {vec=wv', nrows = nLayers', ncols = dim' * dim'}
-              , wo = Matrix {vec=wo', nrows = nLayers', ncols = dim' * dim'}
-              , rmsFfnWeight = Matrix {vec=rmsFfnWeight', nrows = nLayers', ncols = dim'}
-              , w1 = Matrix {vec=w1', nrows = nLayers', ncols = hiddenDim' * dim'}
-              , w2 = Matrix {vec=w2', nrows = nLayers', ncols = dim' * hiddenDim'}
-              , w3 = Matrix {vec=w3', nrows = nLayers', ncols = hiddenDim' * dim'}
-              , rmsFinalWeight = rmsFinalWeight'
-              , freqCisReal = Matrix {vec=freqCisReal', nrows = seqLen', ncols = (dim' `div` numAttentionHeads') `div` 2}
-              , freqCisImag = Matrix {vec=freqCisImag', nrows = seqLen', ncols = (dim' `div` numAttentionHeads') `div` 2}
-              }
+                { tokenEmbeddingTable = tokenEmbeddingTable'
+                , tokenEmbeddingTableRows = vocabSize'
+                , tokenEmbeddingTableCols = dim'
+                , rmsAttWeight = rmsAttWeight'
+                , wq = wq'
+                , wk = wk'
+                , wv = wv'
+                , wo = wo'
+                , rmsFfnWeight = rmsFfnWeight'
+                , w1 = w1'
+                , w2 = w2'
+                , w3 = w3'
+                , rmsFinalWeight = rmsFinalWeight'
+                , freqCisReal = freqCisReal'
+                , freqCisImag = freqCisImag'
+                }
         return $ NetworkConfig
             { dim = dim'
             , hiddenDim = hiddenDim'
@@ -372,7 +378,7 @@ multiheadActivation net numHeads headDim stepCount qBuf kCache vCache indexLayer
     V.freeze outBuf
 
 -- Math utils
-matrixVectorMult :: Vector Float -> Int -> Int -> V.Vector Float -> V.Vector Float
+matrixVectorMult :: V.Vector Float -> Int -> Int -> V.Vector Float -> V.Vector Float
 matrixVectorMult flatMat nrows ncols vec = V.generate nrows $ \row ->
     let rowStart = row * ncols
         rowVec = V.slice rowStart ncols flatMat
