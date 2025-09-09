@@ -3,11 +3,12 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 module Main (main) where
 
 import Control.DeepSeq (deepseq)
-import Control.Monad (foldM, forM, forM_, replicateM)
+import Control.Monad (foldM, forM_, replicateM)
 import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT (runReaderT))
 import Control.Monad.State (StateT, evalStateT, gets)
 import Data.Binary.Get (getFloatle, getInt32le)
@@ -116,6 +117,8 @@ main = do
 
 newtype HeadIndex = HeadIndex Int deriving (Show)
 newtype LayerIndex = LayerIndex Int deriving (Show)
+newtype StepCount = StepCount Int deriving (Show, Eq, Ord, Num)
+newtype TokenVector = TokenVector (V.Vector Float) deriving (Show)
 
 type MVectorFloat = MV.MVector (MV.PrimState IO) Float
 
@@ -136,7 +139,8 @@ data AttentionKV = AttentionKV
     queryOutput :: MVectorFloat,
     keyOutput :: MVectorFloat,
     valueOutput :: MVectorFloat,
-    projectedAttentionOutput :: MVectorFloat
+    projectedAttentionOutput :: MVectorFloat,
+    multiHeadOutput :: MVectorFloat
   }
 
 data TransformerWeighting = TransformerWeighting
@@ -296,8 +300,8 @@ bpeEncode prompt vocab vocabScores =
 type TransformerResult a = ReaderT NetworkConfig (StateT AttentionKV IO) a
 
 -- Cache indexing helper
-cacheIndex :: NetworkConfig -> LayerIndex -> HeadIndex -> Int -> Int -> Int
-cacheIndex NetworkConfig {numAttentionHeads, seqLen, headDimension} (LayerIndex layerIndex) (HeadIndex headIndex) stepIndex dimensionIndex =
+cacheIndex :: NetworkConfig -> LayerIndex -> HeadIndex -> StepCount -> Int -> Int
+cacheIndex NetworkConfig {numAttentionHeads, seqLen, headDimension} (LayerIndex layerIndex) (HeadIndex headIndex) (StepCount stepIndex) dimensionIndex =
   (((layerIndex * numAttentionHeads + headIndex) * seqLen) + stepIndex) * headDimension + dimensionIndex
 
 -- Softmax
@@ -319,7 +323,7 @@ drawSample randomSeed probabilities = do
   return $ fromIntegral (min selectedIndex (V.length probabilities - 1))
 
 -- Helper: write single head vector from mutable slice to the flat cache
-updateCacheWithHead :: NetworkConfig -> LayerIndex -> HeadIndex -> Int -> MVectorFloat -> MVectorFloat -> IO ()
+updateCacheWithHead :: NetworkConfig -> LayerIndex -> HeadIndex -> StepCount -> MVectorFloat -> MVectorFloat -> IO ()
 updateCacheWithHead network layerIndex headIndex stepIndex headSlice cache = do
   let headDim = headDimension network
   let cacheOffset = cacheIndex network layerIndex headIndex stepIndex 0
@@ -363,7 +367,7 @@ accumulateAttentionOutput network layerIndex headIndex headDim attentionScores v
   MV.set outputBuffer 0.0
   let sequenceLength = length attentionScores
   forM_ [0 .. sequenceLength - 1] $ \positionIndex -> do
-    let valueCacheOffset = cacheIndex network layerIndex headIndex positionIndex 0
+    let valueCacheOffset = cacheIndex network layerIndex headIndex (StepCount positionIndex) 0
     let valueSlice = MV.slice valueCacheOffset headDim valueCache
     let attentionWeight = attentionScores !! positionIndex
     forM_ [0 .. headDim - 1] $ \dimIndex -> do
@@ -371,13 +375,15 @@ accumulateAttentionOutput network layerIndex headIndex headDim attentionScores v
       MV.modify outputBuffer (+ (attentionWeight * valueComponent)) dimIndex
 
 -- Attention scores
-computeScores :: NetworkConfig -> Int -> LayerIndex -> HeadIndex -> MVectorFloat -> MVectorFloat -> Int -> IO (V.Vector Float)
+computeScores :: NetworkConfig -> Int -> LayerIndex -> HeadIndex -> MVectorFloat -> MVectorFloat -> StepCount -> IO (V.Vector Float)
 computeScores network headDim layerIndex headIndex queryBuffer keyCache currentStep = do
   let scalingFactor = sqrt (fromIntegral headDim)
-  let sequenceLength = currentStep + 1
+  let
+    StepCount step = currentStep
+    sequenceLength = step + 1
   V.generateM sequenceLength $ \positionIndex -> do
     let
-      keyCacheOffset = cacheIndex network layerIndex headIndex positionIndex 0
+      keyCacheOffset = cacheIndex network layerIndex headIndex (StepCount positionIndex) 0
       keySlice = MV.slice keyCacheOffset headDim keyCache
       HeadIndex hIndex = headIndex
       querySlice = MV.slice (hIndex * headDim) headDim queryBuffer
@@ -404,24 +410,26 @@ computeMultiHeadAttention :: NetworkConfig -> LayerIndex ->
   -- | Head dimension
   Int ->
   -- | Current step
-  Int ->
+  StepCount ->
   -- | Query buffer
   MVectorFloat ->
   -- | Key cache
   MVectorFloat ->
   -- | Value cache
   MVectorFloat ->
-  IO [V.Vector Float]
-computeMultiHeadAttention network layerIndex numHeads headDim currentStep queryBuffer keyCache valueCache = do
-  forM [0 .. numHeads - 1] $ \headIndex -> do
+  -- | Output buffer (concatenated heads)
+  MVectorFloat ->
+  IO ()
+computeMultiHeadAttention network layerIndex numHeads headDim currentStep queryBuffer keyCache valueCache outputBuffer = do
+  forM_ [0 .. numHeads - 1] $ \headIndex -> do
     rawAttentionScores <- computeScores network headDim layerIndex (HeadIndex headIndex) queryBuffer keyCache currentStep
     let normalizedScores = softmax rawAttentionScores (V.length rawAttentionScores)
         attentionWeights = V.toList normalizedScores
+        outputOffset = headIndex * headDim
+        headOutputSlice = MV.slice outputOffset headDim outputBuffer
 
-    -- Reuse a mutable vector for accumulation
-    headOutputBuffer <- MV.new headDim
-    accumulateAttentionOutput network layerIndex (HeadIndex headIndex) headDim attentionWeights valueCache headOutputBuffer
-    V.freeze headOutputBuffer
+    -- Write directly to the appropriate slice of the output buffer
+    accumulateAttentionOutput network layerIndex (HeadIndex headIndex) headDim attentionWeights valueCache headOutputSlice
 
 -- Math utils
 
@@ -489,8 +497,8 @@ applyFeedForwardNetwork weights (LayerIndex layerIndex) inputToken = do
   liftIO $ applyMatrixVectorMult (getArray2D layerIndex (w2 weights)) gateOutput feedforwardNetworkOutput
 
 -- QKV
-computeQKV :: TransformerWeighting -> LayerIndex -> V.Vector Float -> V.Vector Float -> V.Vector Float -> Int -> TransformerResult ()
-computeQKV weights layerIndex freqCosValues freqSinValues inputToken currentStep = do
+computeQKV :: TransformerWeighting -> LayerIndex -> V.Vector Float -> V.Vector Float -> TokenVector -> StepCount -> TransformerResult ()
+computeQKV weights layerIndex freqCosValues freqSinValues (TokenVector inputToken) currentStep = do
   network <- ask
   AttentionKV {queryOutput, keyOutput, valueOutput, keyCache, valueCache} <- gets id
   let headDim = headDimension network
@@ -516,33 +524,39 @@ computeQKV weights layerIndex freqCosValues freqSinValues inputToken currentStep
     updateCacheWithHead network layerIndex (HeadIndex headIndex) currentStep keyHeadSlice keyCache
     updateCacheWithHead network layerIndex (HeadIndex headIndex) currentStep valueHeadSlice valueCache
 
--- Layer
-createLayerToken :: Int -> LayerIndex -> V.Vector Float -> V.Vector Float -> V.Vector Float -> TransformerResult (V.Vector Float)
+-- Layer Token
+createLayerToken :: StepCount -> LayerIndex -> V.Vector Float -> V.Vector Float -> TokenVector -> TransformerResult TokenVector
 createLayerToken currentStep layerIndex freqCosValues freqSinValues inputToken = do
   network <- ask
-  AttentionKV {queryOutput, keyCache, valueCache, projectedAttentionOutput, feedforwardNetworkOutput} <- gets id
+  AttentionKV {queryOutput, keyCache, valueCache, projectedAttentionOutput, feedforwardNetworkOutput, multiHeadOutput} <- gets id
   let weights = weighting network
       attentionHeadDim = headDimension network
       numHeads = numAttentionHeads network
   computeQKV weights layerIndex freqCosValues freqSinValues inputToken currentStep
-  headAttentionOutputs <- liftIO $ computeMultiHeadAttention network layerIndex numHeads attentionHeadDim currentStep queryOutput keyCache valueCache
+
+  -- Compute multi-head attention directly into concatenatedHeads buffer
+  liftIO $ computeMultiHeadAttention network layerIndex numHeads attentionHeadDim currentStep queryOutput keyCache valueCache multiHeadOutput
+
   let
     LayerIndex layerIdx = layerIndex
     outputProjectionWeights = getArray2D layerIdx (wo weights)
-    concatenatedHeads = V.concat headAttentionOutputs
-  -- Convert immutable input vector to mutable
-  concatenatedHeadsMutable <- liftIO $ V.thaw concatenatedHeads
-  -- Perform in-place matrix-vector multiplication
-  liftIO $ applyMatrixVectorMult outputProjectionWeights concatenatedHeadsMutable projectedAttentionOutput
+
+  -- Apply output projection in-place
+  liftIO $ applyMatrixVectorMult outputProjectionWeights multiHeadOutput projectedAttentionOutput
+
   -- Convert mutable output vector back to immutable
   attentionDelta <- liftIO $ V.freeze projectedAttentionOutput
-  let tokenAfterAttention = V.zipWith (+) inputToken attentionDelta
+  let
+    TokenVector tokenVector = inputToken
+    tokenAfterAttention = V.zipWith (+) tokenVector attentionDelta
+
+  -- Apply FFN (this is a TransformerResult action, not IO)
   applyFeedForwardNetwork weights layerIndex tokenAfterAttention
-  ffnOut <- V.freeze feedforwardNetworkOutput
-  return $ V.zipWith (+) tokenAfterAttention ffnOut
+  ffnOut <- liftIO $ V.freeze feedforwardNetworkOutput
+  return $ TokenVector $ V.zipWith (+) tokenAfterAttention ffnOut
 
 -- Transformer step
-transformer :: Token -> Int -> TransformerResult (V.Vector Float)
+transformer :: Token -> StepCount -> TransformerResult (V.Vector Float)
 transformer tokenCode stepCount = do
   network <- ask
 
@@ -550,21 +564,23 @@ transformer tokenCode stepCount = do
   let weights = weighting network
       vocab = tokenEmbeddingTable weights
       rowStart = fromIntegral tokenCode * ncols vocab
-      token = V.slice rowStart (ncols vocab) (items2D vocab)
+      tokenVector = TokenVector $ V.slice rowStart (ncols vocab) (items2D vocab)
 
   -- Plucking out the current row of freq_cis_real and freq_cis_imag
-  let freqCosValues = getRow stepCount (freqCisReal weights)
-  let freqSinValues = getRow stepCount (freqCisImag weights)
+  let
+    StepCount step = stepCount
+    freqCosValues = getRow step (freqCisReal weights)
+    freqSinValues = getRow step (freqCisImag weights)
 
   -- Forwarding all the layers
-  finalToken <-
+  TokenVector finalTokenVector <-
     foldM
       (\accToken layerIndex -> createLayerToken stepCount (LayerIndex layerIndex) freqCosValues freqSinValues accToken)
-      token
+      tokenVector
       [0 .. numLayers network - 1]
 
   -- Final rmsnorm
-  let tokenWithRms = rmsNorm finalToken (rmsFinalWeight weights)
+  let tokenWithRms = rmsNorm finalTokenVector (rmsFinalWeight weights)
 
   -- Classifier into logits
   let
@@ -576,13 +592,14 @@ transformer tokenCode stepCount = do
 
   return logits
 
-generateNextToken :: Int -> PromptTokens -> Float -> Vocabulary -> Token -> Int -> TransformerResult (BS.ByteString, Token)
+generateNextToken :: StepCount -> PromptTokens -> Float -> Vocabulary -> Token -> Int -> TransformerResult (BS.ByteString, Token)
 generateNextToken timestep promptTokens temperature vocab tokenCode seedValue = do
   network <- ask
   logits <- transformer tokenCode timestep
+  let StepCount step = timestep
   nextToken <-
-    if timestep < length promptTokens
-      then return (promptTokens !! timestep)
+    if step < length promptTokens
+      then return (promptTokens !! step)
       else
         if temperature == 0.0
           then return $ fromIntegral (V.maxIndex logits)
@@ -596,23 +613,24 @@ generateNextToken timestep promptTokens temperature vocab tokenCode seedValue = 
           else vocab !! fromIntegral nextToken
   return (tokenStr, nextToken)
 
-generateTokens :: Int -> PromptTokens -> Float -> Vocabulary -> Int -> TransformerResult ([BS.ByteString], Int)
+generateTokens :: StepCount -> PromptTokens -> Float -> Vocabulary -> Int -> TransformerResult ([BS.ByteString], StepCount)
 generateTokens maxSteps promptTokens temperature vocab seedValue = do
   network <- ask
-  go network 0 [] 1
+  go network (StepCount 0) [] 1
   where
     go network timestep result token
-      | timestep >= maxSteps || (timestep /= 0 && token == 1) = return (result, timestep)
+      | timestep >= maxSteps || (timestep /= StepCount 0 && token == 1) = return (result, timestep)
       | otherwise = do
           (tokenStr, nextToken) <- generateNextToken timestep promptTokens temperature vocab token seedValue
           liftIO $ putStr $ BSC.unpack tokenStr
           liftIO $ hFlush stdout
-          go network (timestep + 1) (result ++ [tokenStr]) nextToken
+          go network (timestep + StepCount 1) (result ++ [tokenStr]) nextToken
 
 -- Initialize flat attention KV caches (flattened to one MVector each)
 initAttentionKV :: NetworkConfig -> IO AttentionKV
 initAttentionKV NetworkConfig {numLayers, numAttentionHeads, seqLen, headDimension, hiddenDim, modelDim} = do
   let size = numLayers * numAttentionHeads * seqLen * headDimension
+      concatenatedHeadsSize = numAttentionHeads * headDimension  -- Size for concatenated heads
   keyCache <- MV.new size
   valueCache <- MV.new size
   gateOutput <- MV.new hiddenDim
@@ -622,7 +640,8 @@ initAttentionKV NetworkConfig {numLayers, numAttentionHeads, seqLen, headDimensi
   keyOutput <- MV.new modelDim
   valueOutput <- MV.new modelDim
   projectedAttentionOutput <- MV.new modelDim
-  return AttentionKV {keyCache, valueCache, gateOutput, upProjectionOutput, feedforwardNetworkOutput, queryOutput, keyOutput, valueOutput, projectedAttentionOutput}
+  multiHeadOutput <- MV.new concatenatedHeadsSize
+  return AttentionKV {keyCache, valueCache, gateOutput, upProjectionOutput, feedforwardNetworkOutput, queryOutput, keyOutput, valueOutput, projectedAttentionOutput, multiHeadOutput}
 
 runModel :: BS.ByteString -> BS.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
 runModel modelFileContent tokenizerFileContent temperature steps prompt seed = do
@@ -634,7 +653,7 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
   attentionKV <- initAttentionKV config
   putStrLn "<s>"
   startTime <- getPOSIXTime
-  (_, countTokens) <- evalStateT (runReaderT (generateTokens steps promptTokens temperature vocab seedValue) config) attentionKV
+  (_, StepCount countTokens) <- evalStateT (runReaderT (generateTokens (StepCount steps) promptTokens temperature vocab seedValue) config) attentionKV
   endTime <- getPOSIXTime
   let duration :: Integer
       duration = round (endTime - startTime)
