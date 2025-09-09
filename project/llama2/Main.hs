@@ -300,8 +300,8 @@ bpeEncode prompt vocab vocabScores =
 type TransformerResult a = ReaderT NetworkConfig (StateT AttentionKV IO) a
 
 -- Cache indexing helper
-cacheIndex :: NetworkConfig -> LayerIndex -> HeadIndex -> StepCount -> Int -> Int
-cacheIndex NetworkConfig {numAttentionHeads, seqLen, headDimension} (LayerIndex layerIndex) (HeadIndex headIndex) (StepCount stepIndex) dimensionIndex =
+cacheIndex :: NetworkConfig -> StepCount -> LayerIndex -> HeadIndex -> Int -> Int
+cacheIndex NetworkConfig {numAttentionHeads, seqLen, headDimension} (StepCount stepIndex) (LayerIndex layerIndex) (HeadIndex headIndex) dimensionIndex =
   (((layerIndex * numAttentionHeads + headIndex) * seqLen) + stepIndex) * headDimension + dimensionIndex
 
 -- Softmax
@@ -326,7 +326,7 @@ drawSample randomSeed probabilities = do
 updateCacheWithHead :: NetworkConfig -> LayerIndex -> HeadIndex -> StepCount -> MVectorFloat -> MVectorFloat -> IO ()
 updateCacheWithHead network layerIndex headIndex stepIndex headSlice cache = do
   let headDim = headDimension network
-  let cacheOffset = cacheIndex network layerIndex headIndex stepIndex 0
+  let cacheOffset = cacheIndex network stepIndex layerIndex headIndex 0
   MV.copy (MV.slice cacheOffset headDim cache) headSlice
 
 -- Rotary application to mutable buffer slice
@@ -351,43 +351,45 @@ applyRotations cosFrequencies sinFrequencies numHeads headDim buffer = do
     applyRotaryPositionEncoding (headIndex * headDim) cosFrequencies sinFrequencies buffer
 
 -- Build activation directly into a provided mutable vector
-accumulateAttentionOutput ::
-  NetworkConfig -> LayerIndex -> HeadIndex ->
-  -- | Head dimension
-  Int ->
+accumulateAttentionOutput :: LayerIndex -> HeadIndex ->
   -- | Attention scores
   [Float] ->
   -- | Value cache
   MVectorFloat ->
   -- | Output buffer (must be preallocated to headDim)
   MVectorFloat ->
-  IO ()
-accumulateAttentionOutput network layerIndex headIndex headDim attentionScores valueCache outputBuffer = do
+  TransformerResult ()
+accumulateAttentionOutput layerIndex headIndex attentionScores valueCache outputBuffer = do
+  network <- ask
+  let
+      attentionHeadDim = headDimension network
   -- Zero the output buffer
   MV.set outputBuffer 0.0
   let sequenceLength = length attentionScores
   forM_ [0 .. sequenceLength - 1] $ \positionIndex -> do
-    let valueCacheOffset = cacheIndex network layerIndex headIndex (StepCount positionIndex) 0
-    let valueSlice = MV.slice valueCacheOffset headDim valueCache
+    let valueCacheOffset = cacheIndex network (StepCount positionIndex) layerIndex headIndex 0
+    let valueSlice = MV.slice valueCacheOffset attentionHeadDim valueCache
     let attentionWeight = attentionScores !! positionIndex
-    forM_ [0 .. headDim - 1] $ \dimIndex -> do
+    forM_ [0 .. attentionHeadDim - 1] $ \dimIndex -> do
       valueComponent <- MV.read valueSlice dimIndex
       MV.modify outputBuffer (+ (attentionWeight * valueComponent)) dimIndex
 
 -- Attention scores
-computeScores :: NetworkConfig -> Int -> LayerIndex -> HeadIndex -> MVectorFloat -> MVectorFloat -> StepCount -> IO (V.Vector Float)
-computeScores network headDim layerIndex headIndex queryBuffer keyCache currentStep = do
-  let scalingFactor = sqrt (fromIntegral headDim)
+computeScores :: LayerIndex -> HeadIndex -> MVectorFloat -> MVectorFloat -> StepCount -> TransformerResult (V.Vector Float)
+computeScores layerIndex headIndex queryBuffer keyCache currentStep = do
+  network <- ask
   let
+    attentionHeadDim = headDimension network
+    scalingFactor = sqrt (fromIntegral attentionHeadDim)
     StepCount step = currentStep
     sequenceLength = step + 1
   V.generateM sequenceLength $ \positionIndex -> do
     let
-      keyCacheOffset = cacheIndex network layerIndex headIndex (StepCount positionIndex) 0
-      keySlice = MV.slice keyCacheOffset headDim keyCache
+      keyCacheOffset = cacheIndex network (StepCount positionIndex) layerIndex headIndex 0
+      keySlice = MV.slice keyCacheOffset attentionHeadDim keyCache
       HeadIndex hIndex = headIndex
-      querySlice = MV.slice (hIndex * headDim) headDim queryBuffer
-    dotProduct <- dotProductMV querySlice keySlice
+      querySlice = MV.slice (hIndex * attentionHeadDim) attentionHeadDim queryBuffer
+    dotProduct <- liftIO $ dotProductMV querySlice keySlice
     return $ dotProduct / scalingFactor
 
 -- Dot product on mutable vectors
@@ -404,13 +406,7 @@ dotProductMV vec1 vec2 = do
     [0 .. len - 1]
 
 -- Multihead
-computeMultiHeadAttention :: NetworkConfig -> LayerIndex ->
-  -- | Number of heads
-  Int ->
-  -- | Head dimension
-  Int ->
-  -- | Current step
-  StepCount ->
+computeMultiHeadAttention :: StepCount -> LayerIndex ->
   -- | Query buffer
   MVectorFloat ->
   -- | Key cache
@@ -419,44 +415,39 @@ computeMultiHeadAttention :: NetworkConfig -> LayerIndex ->
   MVectorFloat ->
   -- | Output buffer (concatenated heads)
   MVectorFloat ->
-  IO ()
-computeMultiHeadAttention network layerIndex numHeads headDim currentStep queryBuffer keyCache valueCache outputBuffer = do
+  TransformerResult  ()
+computeMultiHeadAttention currentStep layerIndex queryBuffer keyCache valueCache multiHeadOutput = do
+  network <- ask
+  let
+      attentionHeadDim = headDimension network
+      numHeads = numAttentionHeads network
   forM_ [0 .. numHeads - 1] $ \headIndex -> do
-    rawAttentionScores <- computeScores network headDim layerIndex (HeadIndex headIndex) queryBuffer keyCache currentStep
+    rawAttentionScores <- computeScores layerIndex (HeadIndex headIndex) queryBuffer keyCache currentStep
     let normalizedScores = softmax rawAttentionScores (V.length rawAttentionScores)
         attentionWeights = V.toList normalizedScores
-        outputOffset = headIndex * headDim
-        headOutputSlice = MV.slice outputOffset headDim outputBuffer
+        outputOffset = headIndex * attentionHeadDim
+        headOutputSlice = MV.slice outputOffset attentionHeadDim multiHeadOutput
 
     -- Write directly to the appropriate slice of the output buffer
-    accumulateAttentionOutput network layerIndex (HeadIndex headIndex) headDim attentionWeights valueCache headOutputSlice
+    accumulateAttentionOutput layerIndex (HeadIndex headIndex) attentionWeights valueCache headOutputSlice
 
 -- Math utils
 
 -- Multiply a matrix by a mutable input vector, writing into an output mutable vector
-applyMatrixVectorMult ::
-  Array2D ->
-  -- | Input vector (mutable)
-  MVectorFloat ->
-  -- | Output vector (mutable)
-  MVectorFloat ->
-  IO ()
+applyMatrixVectorMult :: Array2D -> MVectorFloat -> MVectorFloat -> IO ()
 applyMatrixVectorMult array2D vecM result = do
   -- For each row
   let nrows' = nrows array2D
       ncols' = ncols array2D
-      flatMat = items2D array2D
+      items = items2D array2D
   forM_ [0 .. nrows' - 1] $ \row -> do
     let rowStart = row * ncols'
-        -- local references to avoid repeated lookups
-        flat = flatMat
-        rs = rowStart
     -- accumulate dot product in a strict loop
     let loop !i !acc
           | i >= ncols' = return acc
           | otherwise = do
               v <- MV.unsafeRead vecM i
-              let m = V.unsafeIndex flat (rs + i)
+              let m = V.unsafeIndex items (rowStart + i)
               loop (i + 1) (acc + v * m)
     s <- loop 0 0.0
     MV.unsafeWrite result row s
@@ -478,27 +469,30 @@ applyFeedForwardNetwork weights (LayerIndex layerIndex) inputToken = do
       rmsFFNWeights = getRow layerIndex $ rmsFfnWeight weights
       normalizedInput = rmsNorm inputToken rmsFFNWeights
 
-  -- thaw normalizedInput once (normalizedInput is a V.Vector), reuse it
-  normalizedInputMutable <- liftIO $ V.thaw normalizedInput
-  liftIO $ applyMatrixVectorMult (getArray2D layerIndex (w1 weights)) normalizedInputMutable gateOutput
+  liftIO $ do
 
-  -- gateActivation = silu(W1 * normalizedInput)
-  liftIO $ forM_ [0 .. hiddenFFNDim - 1] $ \i -> MV.unsafeModify gateOutput silu i
+    -- thaw normalizedInput once (normalizedInput is a V.Vector), reuse it
+    normalizedInputMutable <- liftIO $ V.thaw normalizedInput
 
-  -- upProjection = W3 * normalizedInput  -> upProjectionBuffer
-  liftIO $ applyMatrixVectorMult (getArray2D layerIndex (w3 weights)) normalizedInputMutable upProjectionOutput
+    applyMatrixVectorMult (getArray2D layerIndex (w1 weights)) normalizedInputMutable gateOutput
 
-  -- gateActivation *= upProjection   (in-place on gateBuffer)
-  liftIO $ forM_ [0 .. hiddenFFNDim - 1] $ \i -> do
-    upValue <- MV.unsafeRead upProjectionOutput i
-    MV.unsafeModify gateOutput (* upValue) i
+    -- gateActivation = silu(W1 * normalizedInput)
+    forM_ [0 .. hiddenFFNDim - 1] $ \i -> MV.unsafeModify gateOutput silu i
 
-  -- result = W2 * gateActivation
-  liftIO $ applyMatrixVectorMult (getArray2D layerIndex (w2 weights)) gateOutput feedforwardNetworkOutput
+    -- upProjection = W3 * normalizedInput  -> upProjectionBuffer
+    applyMatrixVectorMult (getArray2D layerIndex (w3 weights)) normalizedInputMutable upProjectionOutput
+
+    -- gateActivation *= upProjection   (in-place on gateBuffer)
+    forM_ [0 .. hiddenFFNDim - 1] $ \i -> do
+      upValue <- MV.unsafeRead upProjectionOutput i
+      MV.unsafeModify gateOutput (* upValue) i
+
+    -- result = W2 * gateActivation
+    applyMatrixVectorMult (getArray2D layerIndex (w2 weights)) gateOutput feedforwardNetworkOutput
 
 -- QKV
-computeQKV :: TransformerWeighting -> LayerIndex -> V.Vector Float -> V.Vector Float -> TokenVector -> StepCount -> TransformerResult ()
-computeQKV weights layerIndex freqCosValues freqSinValues (TokenVector inputToken) currentStep = do
+computeQKV :: TransformerWeighting -> StepCount -> LayerIndex -> V.Vector Float -> V.Vector Float -> TokenVector -> TransformerResult ()
+computeQKV weights currentStep layerIndex freqCosValues freqSinValues (TokenVector inputToken) = do
   network <- ask
   AttentionKV {queryOutput, keyOutput, valueOutput, keyCache, valueCache} <- gets id
   let headDim = headDimension network
@@ -507,39 +501,38 @@ computeQKV weights layerIndex freqCosValues freqSinValues (TokenVector inputToke
       -- The input token gets RMS normalized
       normalizedInput = rmsNorm inputToken (getRow layerIdx (rmsAttWeight weights))
 
-  normalizedInputMutable <- liftIO $ V.thaw normalizedInput -- mutable copy of normalizedInput (one allocation)
+  liftIO  $ do
+    normalizedInputMutable <- V.thaw normalizedInput -- mutable copy of normalizedInput (one allocation)
 
-  -- This normalized input is projected into Q, K, V spaces
-  liftIO $ applyMatrixVectorMult (getArray2D layerIdx (wq weights)) normalizedInputMutable queryOutput
-  liftIO $ applyMatrixVectorMult (getArray2D layerIdx (wk weights)) normalizedInputMutable keyOutput
-  liftIO $ applyMatrixVectorMult (getArray2D layerIdx (wv weights)) normalizedInputMutable valueOutput
+    -- This normalized input is projected into Q, K, V spaces
+    applyMatrixVectorMult (getArray2D layerIdx (wq weights)) normalizedInputMutable queryOutput
+    applyMatrixVectorMult (getArray2D layerIdx (wk weights)) normalizedInputMutable keyOutput
+    applyMatrixVectorMult (getArray2D layerIdx (wv weights)) normalizedInputMutable valueOutput
 
-  -- Rotary position encodings are applied to Q and K
-  liftIO $ applyRotations freqCosValues freqSinValues numHeads headDim queryOutput
-  liftIO $ applyRotations freqCosValues freqSinValues numHeads headDim keyOutput
+    -- Rotary position encodings are applied to Q and K
+    applyRotations freqCosValues freqSinValues numHeads headDim queryOutput
+    applyRotations freqCosValues freqSinValues numHeads headDim keyOutput
 
-  liftIO $ forM_ [0 .. numHeads - 1] $ \headIndex -> do
-    let keyHeadSlice = MV.slice (headIndex * headDim) headDim keyOutput
-    let valueHeadSlice = MV.slice (headIndex * headDim) headDim valueOutput
-    updateCacheWithHead network layerIndex (HeadIndex headIndex) currentStep keyHeadSlice keyCache
-    updateCacheWithHead network layerIndex (HeadIndex headIndex) currentStep valueHeadSlice valueCache
+    forM_ [0 .. numHeads - 1] $ \headIndex -> do
+      let keyHeadSlice = MV.slice (headIndex * headDim) headDim keyOutput
+      let valueHeadSlice = MV.slice (headIndex * headDim) headDim valueOutput
+      updateCacheWithHead network layerIndex (HeadIndex headIndex) currentStep keyHeadSlice keyCache
+      updateCacheWithHead network layerIndex (HeadIndex headIndex) currentStep valueHeadSlice valueCache
 
 -- Layer Token
 createLayerToken :: StepCount -> LayerIndex -> V.Vector Float -> V.Vector Float -> TokenVector -> TransformerResult TokenVector
 createLayerToken currentStep layerIndex freqCosValues freqSinValues inputToken = do
   network <- ask
   AttentionKV {queryOutput, keyCache, valueCache, projectedAttentionOutput, feedforwardNetworkOutput, multiHeadOutput} <- gets id
-  let weights = weighting network
-      attentionHeadDim = headDimension network
-      numHeads = numAttentionHeads network
-  computeQKV weights layerIndex freqCosValues freqSinValues inputToken currentStep
-
-  -- Compute multi-head attention directly into concatenatedHeads buffer
-  liftIO $ computeMultiHeadAttention network layerIndex numHeads attentionHeadDim currentStep queryOutput keyCache valueCache multiHeadOutput
-
   let
+    weights = weighting network
     LayerIndex layerIdx = layerIndex
     outputProjectionWeights = getArray2D layerIdx (wo weights)
+
+  computeQKV weights currentStep layerIndex freqCosValues freqSinValues inputToken
+
+  -- Compute multi-head attention directly into concatenatedHeads buffer
+  computeMultiHeadAttention currentStep layerIndex queryOutput keyCache valueCache multiHeadOutput
 
   -- Apply output projection in-place
   liftIO $ applyMatrixVectorMult outputProjectionWeights multiHeadOutput projectedAttentionOutput
@@ -550,7 +543,7 @@ createLayerToken currentStep layerIndex freqCosValues freqSinValues inputToken =
     TokenVector tokenVector = inputToken
     tokenAfterAttention = V.zipWith (+) tokenVector attentionDelta
 
-  -- Apply FFN (this is a TransformerResult action, not IO)
+  -- Apply FFN
   applyFeedForwardNetwork weights layerIndex tokenAfterAttention
   ffnOut <- liftIO $ V.freeze feedforwardNetworkOutput
   return $ TokenVector $ V.zipWith (+) tokenAfterAttention ffnOut
