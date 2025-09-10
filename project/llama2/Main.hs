@@ -114,8 +114,8 @@ parseTokens :: BS.ByteString -> Int -> (Vocabulary, VocabularyScores)
 parseTokens fileContent size = (vocab, vocabScores)
   where
     scoresTokens = BG.runGet scoresAndTokens fileContent
-    vocabScores = fst <$> scoresTokens
-    vocab = snd <$> scoresTokens
+    vocabScores = map fst scoresTokens
+    vocab = map snd scoresTokens
 
     scoresAndTokens :: BG.Get [(Float, BS.ByteString)]
     scoresAndTokens = replicateM size readToken

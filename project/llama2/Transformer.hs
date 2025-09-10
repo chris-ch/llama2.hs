@@ -110,7 +110,7 @@ instance Array2DOps Array2D where
   readArray2D :: Int -> Int -> BG.Get Array2D
   readArray2D rows cols = do
     vec <- readVector (rows * cols)
-    return $ Array2D {items2D = vec, nrows = rows, ncols = cols}
+    return Array2D {items2D = vec, nrows = rows, ncols = cols}
 
 class Array3DOps a where
   getArray2D :: Int -> a -> Array2D
@@ -131,7 +131,7 @@ instance Array3DOps Array3D where
   readArray3D sx sy sz = do
     let totalSize = sx * sy * sz
     vec <- readVector totalSize
-    return $ Array3D {items3D = vec, sizeX = sx, sizeY = sy, sizeZ = sz}
+    return Array3D {items3D = vec, sizeX = sx, sizeY = sy, sizeZ = sz}
 
 readVector :: Int -> BG.Get (V.Vector Float)
 readVector count = V.replicateM count getFloatle >>= \v -> v `deepseq` return v
