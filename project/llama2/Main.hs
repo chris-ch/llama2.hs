@@ -14,8 +14,8 @@ import qualified Data.Vector.Unboxed.Mutable as MV
 import qualified Options.Applicative as OA
 import Text.Printf (printf)
 import Transformer (generateTokens)
-import Types (AttentionKV (..), NetworkConfig (..), PromptTokens, StepCount (..), Token, TransformerModel (..), Vocabulary, VocabularyScores, readArray2D, readArray3D, readVector)
-
+import Types (AttentionKV (..), PromptTokens, StepCount (..), Token, Vocabulary, VocabularyScores, readArray2D, readArray3D, readVector)
+import Architecture (NetworkConfig (..), TransformerParams (..))
 --------------------------------------------------------------------------------
 -- Options
 --------------------------------------------------------------------------------
@@ -75,8 +75,8 @@ parseNetworkConfigFile = do
   freqCisImag' <- readArray2D seqLen' ((modelDim' `div` numAttentionHeads') `div` 2)
 
   let headDim = modelDim' `div` numAttentionHeads'
-      weights =
-        TransformerModel
+      model =
+        TransformerParams
           { tokenEmbeddingTable = tokenEmbeddingTable',
             rmsAttWeight = rmsAttWeight',
             wq = wq',
@@ -101,7 +101,7 @@ parseNetworkConfigFile = do
         vocabSize = abs vocabSize',
         seqLen = seqLen',
         headDimension = headDim,
-        model = weights
+        params = model
       }
 
 initModel :: BS.ByteString -> NetworkConfig

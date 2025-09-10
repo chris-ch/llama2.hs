@@ -1,6 +1,5 @@
 module Types
-  ( NetworkConfig (..),
-    TransformerModel (..),
+  ( 
     AttentionKV (..),
     StepCount (..),
     LayerIndex(..),
@@ -64,36 +63,6 @@ data AttentionKV = AttentionKV
     projectedAttentionOutput :: MVectorFloat,
     multiHeadOutput :: MVectorFloat
   }
-
-data TransformerModel = TransformerModel
-  { tokenEmbeddingTable :: Array2D,
-    rmsAttWeight :: Array2D,
-    wq :: Array3D,
-    wk :: Array3D,
-    wv :: Array3D,
-    wo :: Array3D,
-    rmsFfnWeight :: Array2D,
-    w1 :: Array3D,
-    w2 :: Array3D,
-    w3 :: Array3D,
-    rmsFinalWeight :: V.Vector Float,
-    freqCisReal :: Array2D,
-    freqCisImag :: Array2D
-  }
-  deriving (Show)
-
-data NetworkConfig = NetworkConfig
-  { modelDim :: Int,
-    hiddenDim :: Int,
-    numLayers :: Int,
-    numAttentionHeads :: Int,
-    numKeyValueHeads :: Int,
-    vocabSize :: Int,
-    seqLen :: Int,
-    headDimension :: Int,
-    model :: TransformerModel
-  }
-  deriving (Show)
 
 --------------------------------------------------------------------------------
 -- Array2D Data Structure and Class

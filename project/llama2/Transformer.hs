@@ -8,9 +8,9 @@ import qualified Data.ByteString.Lazy.Char8 as BSC
 import qualified Data.Vector.Unboxed as V
 import GHC.Unicode (isSpace)
 import System.IO (hFlush, stdout)
-import Types (NetworkConfig (..), AttentionKV (..), StepCount (..), LayerIndex(..), Token, TransformerModel (..), TokenVector(..), PromptTokens, Vocabulary, getArray2D, getRow)
-import Primitives (transformerLogits, getTokenEmbedding, applyFeedForwardNetwork, computeQKV, computeMultiHeadAttention, applyMatrixVectorMult, drawSample, softmax, TransformerResult)
-
+import Types (AttentionKV (..), StepCount (..), LayerIndex(..), Token, TokenVector(..), PromptTokens, Vocabulary, getArray2D, getRow)
+import Primitives (applyMatrixVectorMult, drawSample, softmax)
+import Architecture (transformerLogits, getTokenEmbedding, applyFeedForwardNetwork, computeQKV, computeMultiHeadAttention, TransformerResult, NetworkConfig (..), TransformerParams(..))
 --------------------------------------------------------------------------------
 -- Transformer runtime
 --------------------------------------------------------------------------------
@@ -20,11 +20,11 @@ createLayerToken :: StepCount -> LayerIndex -> V.Vector Float -> V.Vector Float 
 createLayerToken currentStep layerIndex freqCosValues freqSinValues inputToken = do
   network <- ask
   AttentionKV {queryOutput, keyCache, valueCache, projectedAttentionOutput, feedforwardNetworkOutput, multiHeadOutput} <- gets id
-  let weights = model network
+  let model = params network
       LayerIndex layerIdx = layerIndex
-      outputProjectionWeights = getArray2D layerIdx (wo weights)
+      outputProjectionWeights = getArray2D layerIdx (wo model)
 
-  computeQKV weights currentStep layerIndex freqCosValues freqSinValues inputToken
+  computeQKV model currentStep layerIndex freqCosValues freqSinValues inputToken
 
   -- Compute multi-head attention directly into concatenatedHeads buffer
   computeMultiHeadAttention currentStep layerIndex queryOutput keyCache valueCache multiHeadOutput
@@ -38,7 +38,7 @@ createLayerToken currentStep layerIndex freqCosValues freqSinValues inputToken =
       tokenAfterAttention = V.zipWith (+) tokenVector attentionDelta
 
   -- Apply FFN
-  applyFeedForwardNetwork weights layerIndex tokenAfterAttention
+  applyFeedForwardNetwork model layerIndex tokenAfterAttention
   ffnOut <- liftIO $ V.freeze feedforwardNetworkOutput
   return $ TokenVector $ V.zipWith (+) tokenAfterAttention ffnOut
 
@@ -48,14 +48,14 @@ transformer tokenCode stepCount = do
   network <- ask
 
   -- Getting the token embedding
-  let weights = model network
+  let model = params network
   
   tokenVector <- getTokenEmbedding tokenCode
 
   -- Plucking out the current row of freq_cis_real and freq_cis_imag
   let StepCount step = stepCount
-      freqCosValues = getRow step (freqCisReal weights)
-      freqSinValues = getRow step (freqCisImag weights)
+      freqCosValues = getRow step (freqCisReal model)
+      freqSinValues = getRow step (freqCisImag model)
 
   -- Forwarding all the layers
   TokenVector finalTokenVector <-
