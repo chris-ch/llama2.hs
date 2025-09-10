@@ -24,6 +24,8 @@ executable llama2
   main-is: Main.hs
   other-modules:
       Transformer
+      , Architecture
+      , Primitives
       , Types
   hs-source-dirs:
       project/llama2

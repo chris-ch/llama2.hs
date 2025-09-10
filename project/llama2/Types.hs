@@ -1,6 +1,6 @@
 module Types
   ( NetworkConfig (..),
-    TransformerWeighting (..),
+    TransformerModel (..),
     AttentionKV (..),
     StepCount (..),
     LayerIndex(..),
@@ -65,7 +65,7 @@ data AttentionKV = AttentionKV
     multiHeadOutput :: MVectorFloat
   }
 
-data TransformerWeighting = TransformerWeighting
+data TransformerModel = TransformerModel
   { tokenEmbeddingTable :: Array2D,
     rmsAttWeight :: Array2D,
     wq :: Array3D,
@@ -91,7 +91,7 @@ data NetworkConfig = NetworkConfig
     vocabSize :: Int,
     seqLen :: Int,
     headDimension :: Int,
-    weighting :: TransformerWeighting
+    model :: TransformerModel
   }
   deriving (Show)
 
