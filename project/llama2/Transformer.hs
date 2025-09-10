@@ -10,7 +10,8 @@ import GHC.Unicode (isSpace)
 import System.IO (hFlush, stdout)
 import Types (AttentionKV (..), StepCount (..), LayerIndex(..), Token, TokenVector(..), PromptTokens, Vocabulary, getArray2D)
 import Primitives (applyMatrixVectorMult, drawSample, softmax)
-import Architecture (transformerLogits, applyFeedForwardNetwork, computeQKV, computeMultiHeadAttention, TransformerResult, NetworkConfig (..), TransformerParams(..), TransformerDecoder (..), embed)
+import Architecture (transformerLogits, computeQKV, computeMultiHeadAttention,
+ TransformerResult, NetworkConfig (..), TransformerParams(..), TransformerDecoder (..), embed, TransformerLayer (..), runFeedForward)
 --------------------------------------------------------------------------------
 -- Transformer runtime
 --------------------------------------------------------------------------------
@@ -19,10 +20,14 @@ import Architecture (transformerLogits, applyFeedForwardNetwork, computeQKV, com
 createLayerToken :: StepCount -> LayerIndex -> TokenVector -> TransformerResult TokenVector
 createLayerToken currentStep layerIndex inputToken = do
   network <- ask
-  AttentionKV {queryOutput, keyCache, valueCache, projectedAttentionOutput, feedforwardNetworkOutput, multiHeadOutput} <- gets id
+  AttentionKV {queryOutput, keyCache, valueCache, projectedAttentionOutput, multiHeadOutput} <- gets id
   let model = params network
       LayerIndex layerIdx = layerIndex
       outputProjectionWeights = getArray2D layerIdx (wo model)
+      dec = decoder network
+      LayerIndex li = layerIndex
+      layer = modelLayers dec !! li
+      ffn = feedforwardNetwork layer
 
   computeQKV model currentStep layerIndex inputToken
 
@@ -38,8 +43,7 @@ createLayerToken currentStep layerIndex inputToken = do
       tokenAfterAttention = V.zipWith (+) tokenVector attentionDelta
 
   -- Apply FFN
-  applyFeedForwardNetwork model layerIndex tokenAfterAttention
-  ffnOut <- liftIO $ V.freeze feedforwardNetworkOutput
+  ffnOut <- runFeedForward ffn tokenAfterAttention
   return $ TokenVector $ V.zipWith (+) tokenAfterAttention ffnOut
 
 -- Transformer step

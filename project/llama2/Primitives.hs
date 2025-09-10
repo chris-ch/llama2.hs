@@ -1,8 +1,9 @@
 module Primitives
   ( 
     applyMatrixVectorMult,
+    matrixVectorMult,
     rmsNorm,
-    silu,
+    sigmoidLinearUnit,
     dotProductMV,
     softmax,
     drawSample,
@@ -38,6 +39,12 @@ applyMatrixVectorMult array2D vecM result = do
     s <- loop 0 0.0
     MV.unsafeWrite result row s
 
+matrixVectorMult :: Array2D -> V.Vector Float -> V.Vector Float
+matrixVectorMult (Array2D items rows cols) vec = V.generate rows $ \i ->
+      let rowStart = i * cols
+          rowElements = V.slice rowStart cols items
+      in V.sum $ V.zipWith (*) rowElements vec
+
 -- dot product on mutable vectors
 dotProductMV :: MVectorFloat -> MVectorFloat -> IO Float
 dotProductMV vec1 vec2 = do
@@ -60,8 +67,8 @@ rmsNorm vector weights =
    in V.zipWith (*) weights normalized
 
 -- Activation
-silu :: Float -> Float
-silu x = x / (1.0 + exp (-x))
+sigmoidLinearUnit :: Float -> Float
+sigmoidLinearUnit x = x / (1.0 + exp (-x))
 
 -- Softmax (applies to prefix)
 softmax :: V.Vector Float -> Int -> V.Vector Float

@@ -6,9 +6,9 @@ module Architecture
     TransformerLayer (..),
     TransformerDecoder (..),
     TransformerParams(..),
-    transformerLogits, applyFeedForwardNetwork, computeQKV, computeMultiHeadAttention, TransformerResult
+    transformerLogits, computeQKV, computeMultiHeadAttention, TransformerResult
     , NetworkConfig (..)
-    , embed
+    , embed, runFeedForward
   ) where
 
 import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT)
@@ -28,7 +28,7 @@ import Types
       LayerIndex(..), Array3D, MVectorFloat, HeadIndex (..), getRow )
 import Primitives
     (
-      applyMatrixVectorMult, dotProductMV, softmax, rmsNorm, silu, applyRotaryPositionEncoding )
+      applyMatrixVectorMult, dotProductMV, softmax, rmsNorm, sigmoidLinearUnit, applyRotaryPositionEncoding, matrixVectorMult )
 
 -- Data definitions mirroring architecture boxes
 newtype Embedding = Embedding
@@ -73,6 +73,9 @@ class Embeddable e where
 class RotaryEncodable r where
   applyRotary :: r -> StepCount -> HeadIndex -> V.Vector Float -> TransformerResult (V.Vector Float)
 
+class FeedForwardLayer f where
+  runFeedForward :: f -> V.Vector Float -> TransformerResult (V.Vector Float)
+
 instance Embeddable Embedding where
   embed :: Embedding -> Token -> TransformerResult TokenVector
   embed (Embedding vocabulary) tokenCode = do
@@ -93,11 +96,23 @@ instance RotaryEncodable RotaryEncoding where
     -- Apply rotation per head
     return $ applyRotaryPositionEncoding headDim headIndex cosFrequencies sinFrequencies input
 
+instance FeedForwardLayer FeedForwardNetwork where
+  runFeedForward :: FeedForwardNetwork -> V.Vector Float -> TransformerResult (V.Vector Float)
+  runFeedForward ffn inputToken = do
+    let
+      rmsFfnWeights = fRMSFfn ffn
+      w1 = fW1 ffn
+      w2 = fW2 ffn
+      w3 = fW3 ffn
+      normalizedInput = rmsNorm inputToken rmsFfnWeights
+      gateOutput' = matrixVectorMult w1 normalizedInput
+      upProjectionOutput' = matrixVectorMult w3 normalizedInput
+      gateOutput = V.map sigmoidLinearUnit gateOutput'
+      feedforwardNetworkOutput' = matrixVectorMult w2 (V.zipWith (*) gateOutput upProjectionOutput')
+    return feedforwardNetworkOutput' 
+
 class AttentionLayer a where
   runAttention :: a -> V.Vector Float -> StepCount -> TransformerResult (V.Vector Float)
-
-class FeedForwardLayer f where
-  runFeedForward :: f -> V.Vector Float -> TransformerResult (V.Vector Float)
 
 class TransformerBlock l where
   runBlock :: l -> V.Vector Float -> StepCount -> TransformerResult (V.Vector Float)
@@ -222,7 +237,6 @@ computeQKV params currentStep layerIndex (TokenVector inputToken) = do
       rotatedQuery <- applyRotary rotaryEncoding currentStep (HeadIndex headIndex) queryInput
       rotatedKey   <- applyRotary rotaryEncoding currentStep (HeadIndex headIndex) keyInput
 
-
       -- Write the rotated results back to the mutable vectors
       liftIO $ do
         rotatedQueryMutable <- V.thaw rotatedQuery
@@ -238,30 +252,6 @@ computeQKV params currentStep layerIndex (TokenVector inputToken) = do
         valueHeadSlice = MV.slice (headIndex * headDim) headDim valueOutput
     updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep keyHeadSlice keyCache
     updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep valueHeadSlice valueCache
-
--- FFN
-applyFeedForwardNetwork :: TransformerParams -> LayerIndex -> V.Vector Float -> TransformerResult ()
-applyFeedForwardNetwork params (LayerIndex layerIndex) inputToken = do
-  network <- ask
-  AttentionKV {gateOutput, upProjectionOutput, feedforwardNetworkOutput} <- gets id
-  let hiddenFFNDim = hiddenDim network
-      rmsFFNWeights = getRow layerIndex $ rmsFfnWeight params
-      normalizedInput = rmsNorm inputToken rmsFFNWeights
-
-  liftIO $ do
-    normalizedInputMutable <- V.thaw normalizedInput
-
-    applyMatrixVectorMult (getArray2D layerIndex (w1 params)) normalizedInputMutable gateOutput
-
-    forM_ [0 .. hiddenFFNDim - 1] $ \i -> MV.unsafeModify gateOutput silu i
-
-    applyMatrixVectorMult (getArray2D layerIndex (w3 params)) normalizedInputMutable upProjectionOutput
-
-    forM_ [0 .. hiddenFFNDim - 1] $ \i -> do
-      upValue <- MV.unsafeRead upProjectionOutput i
-      MV.unsafeModify gateOutput (* upValue) i
-
-    applyMatrixVectorMult (getArray2D layerIndex (w2 params)) gateOutput feedforwardNetworkOutput
 
 -- classifier logits for a given token vector
 transformerLogits :: V.Vector Float -> TransformerResult (V.Vector Float)
