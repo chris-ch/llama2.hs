@@ -74,16 +74,7 @@ applyRotations cosFrequencies sinFrequencies buffer = do
     applyRotaryPositionEncoding (headIndex * headDim) cosFrequencies sinFrequencies buffer
 
 -- Build activation directly into a provided mutable vector
-accumulateAttentionOutput ::
-  LayerIndex ->
-  HeadIndex ->
-  -- | Attention scores
-  [Float] ->
-  -- | Value cache
-  MVectorFloat ->
-  -- | Output buffer (must be preallocated to headDim)
-  MVectorFloat ->
-  TransformerResult ()
+accumulateAttentionOutput :: LayerIndex -> HeadIndex -> [Float] -> MVectorFloat -> MVectorFloat -> TransformerResult ()
 accumulateAttentionOutput layerIndex headIndex attentionScores valueCache outputBuffer = do
   network <- ask
   let attentionHeadDim = headDimension network
@@ -128,18 +119,7 @@ dotProductMV vec1 vec2 = do
     [0 .. len - 1]
 
 -- Multihead
-computeMultiHeadAttention ::
-  StepCount ->
-  LayerIndex ->
-  -- | Query buffer
-  MVectorFloat ->
-  -- | Key cache
-  MVectorFloat ->
-  -- | Value cache
-  MVectorFloat ->
-  -- | Output buffer (concatenated heads)
-  MVectorFloat ->
-  TransformerResult ()
+computeMultiHeadAttention :: StepCount -> LayerIndex -> MVectorFloat -> MVectorFloat -> MVectorFloat -> MVectorFloat -> TransformerResult ()
 computeMultiHeadAttention currentStep layerIndex queryOutput keyCache valueCache multiHeadOutput = do
   network <- ask
   let attentionHeadDim = headDimension network
