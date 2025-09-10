@@ -13,7 +13,8 @@ import Data.Time.Clock.POSIX (getPOSIXTime)
 import qualified Data.Vector.Unboxed.Mutable as MV
 import qualified Options.Applicative as OA
 import Text.Printf (printf)
-import Transformer (AttentionKV (..), NetworkConfig (..), PromptTokens, StepCount (..), Token, TransformerWeighting (..), Vocabulary, VocabularyScores, generateTokens, readArray2D, readArray3D, readVector)
+import Transformer (generateTokens)
+import Types (AttentionKV (..), NetworkConfig (..), PromptTokens, StepCount (..), Token, TransformerWeighting (..), Vocabulary, VocabularyScores, readArray2D, readArray3D, readVector)
 
 --------------------------------------------------------------------------------
 -- Options
