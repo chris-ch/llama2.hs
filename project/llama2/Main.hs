@@ -7,11 +7,10 @@
 
 module Main (main) where
 
-import Control.DeepSeq (deepseq)
 import Control.Monad (foldM, forM_, replicateM)
 import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT (runReaderT))
 import Control.Monad.State (StateT, evalStateT, gets)
-import Data.Binary.Get (getFloatle, getInt32le)
+import Data.Binary.Get (getInt32le)
 import qualified Data.Binary.Get as BG
 import qualified Data.ByteString.Lazy as BS
 import qualified Data.ByteString.Lazy.Char8 as BSC
@@ -178,17 +177,25 @@ data NetworkConfig = NetworkConfig
 --------------------------------------------------------------------------------
 
 readVector :: Int -> BG.Get (V.Vector Float)
-readVector count = V.replicateM count getFloatle >>= \v -> v `deepseq` return v
+readVector count = do
+  byteData <- BG.getLazyByteString (fromIntegral count * 4) -- Read 4 bytes per Float
+  return $ V.unfoldrN count parseFloatFromBytes byteData
+  where
+    parseFloatFromBytes :: BS.ByteString -> Maybe (Float, BS.ByteString)
+    parseFloatFromBytes bs =
+      if BS.null bs
+        then Nothing
+        else Just (BG.runGet BG.getFloatle (BS.take 4 bs), BS.drop 4 bs)
 
 parseNetworkConfigFile :: BG.Get NetworkConfig
 parseNetworkConfigFile = do
-  modelDim' <- fromIntegral <$> getInt32le
-  hiddenDim' <- fromIntegral <$> getInt32le
-  nLayers' <- fromIntegral <$> getInt32le
-  numAttentionHeads' <- fromIntegral <$> getInt32le
-  numKeyValueHeads' <- fromIntegral <$> getInt32le
-  vocabSize' <- fromIntegral <$> getInt32le
-  seqLen' <- fromIntegral <$> getInt32le
+  modelDim' <- fmap fromIntegral getInt32le
+  hiddenDim' <- fmap fromIntegral getInt32le
+  nLayers' <- fmap fromIntegral getInt32le
+  numAttentionHeads' <- fmap fromIntegral getInt32le
+  numKeyValueHeads' <- fmap fromIntegral getInt32le
+  vocabSize' <- fmap fromIntegral getInt32le
+  seqLen' <- fmap fromIntegral getInt32le
   tokenEmbeddingTable' <- readArray2D vocabSize' modelDim'
   rmsAttWeight' <- readArray2D nLayers' modelDim'
   wq' <- readArray3D nLayers' modelDim' modelDim'
@@ -244,8 +251,8 @@ parseTokens :: BS.ByteString -> Int -> (Vocabulary, VocabularyScores)
 parseTokens fileContent size = (vocab, vocabScores)
   where
     scoresTokens = BG.runGet scoresAndTokens fileContent
-    vocabScores = fst <$> scoresTokens
-    vocab = snd <$> scoresTokens
+    vocabScores = map fst scoresTokens
+    vocab = map snd scoresTokens
 
     scoresAndTokens :: BG.Get [(Float, BS.ByteString)]
     scoresAndTokens = replicateM size readToken
