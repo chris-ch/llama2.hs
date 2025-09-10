@@ -179,13 +179,10 @@ data NetworkConfig = NetworkConfig
 readVector :: Int -> BG.Get (V.Vector Float)
 readVector count = do
   byteData <- BG.getLazyByteString (fromIntegral count * 4) -- Read 4 bytes per Float
-  return $ V.unfoldrN count parseFloatFromBytes byteData
+  return $ V.unfoldrExactN count parseFloatFromBytes byteData
   where
-    parseFloatFromBytes :: BS.ByteString -> Maybe (Float, BS.ByteString)
-    parseFloatFromBytes bs =
-      if BS.null bs
-        then Nothing
-        else Just (BG.runGet BG.getFloatle (BS.take 4 bs), BS.drop 4 bs)
+    parseFloatFromBytes :: BS.ByteString -> (Float, BS.ByteString)
+    parseFloatFromBytes bs = (BG.runGet BG.getFloatle (BS.take 4 bs), BS.drop 4 bs)
 
 parseNetworkConfigFile :: BG.Get NetworkConfig
 parseNetworkConfigFile = do
