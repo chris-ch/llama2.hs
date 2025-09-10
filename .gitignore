@@ -19,3 +19,5 @@ cabal.sandbox.config
 .HTF/
 .ghc.environment.*
 data
+run
+runq

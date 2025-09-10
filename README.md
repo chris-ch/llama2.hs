@@ -42,3 +42,65 @@ The next day, Lily came back to Tom's house with a big smile. She had a big bag 
 From that day on, Lily and Tom became good friends. They would often talk and share potatoes from the humble little house. And they all lived happily ever after.
 <s>
 ```
+
+## Testing performance
+
+### C Version
+
+```shell
+haskell@a050ba3ea910:/workspaces/llama2.hs$ /usr/bin/time -v ./run data/stories110M.bin -t 0.8 -n 256 -i "In that little town"
+achieved tok/s: 15.105312
+        Command being timed: "./run data/stories110M.bin -t 0.8 -n 256 -i In that little town"
+        User time (seconds): 14.15
+        System time (seconds): 0.05
+        Percent of CPU this job got: 99%
+        Elapsed (wall clock) time (h:mm:ss or m:ss): 0:14.21
+        Average shared text size (kbytes): 0
+        Average unshared data size (kbytes): 0
+        Average stack size (kbytes): 0
+        Average total size (kbytes): 0
+        Maximum resident set size (kbytes): 447516
+        Average resident set size (kbytes): 0
+        Major (requiring I/O) page faults: 0
+        Minor (reclaiming a frame) page faults: 11291
+        Voluntary context switches: 1
+        Involuntary context switches: 40
+        Swaps: 0
+        File system inputs: 0
+        File system outputs: 0
+        Socket messages sent: 0
+        Socket messages received: 0
+        Signals delivered: 0
+        Page size (bytes): 4096
+        Exit status: 0
+```
+
+### Haskell Version
+
+```shell
+haskell@a050ba3ea910:/workspaces/llama2.hs$ /usr/bin/time -v cabal run -- llama2 --model-file data/stories110M.bin --temperature 0.8 --steps 256 "In that little town"
+duration: 16s - (10.44 tokens/s)
+        Command being timed: "cabal run -- llama2 --model-file data/stories110M.bin --temperature 0.8 --steps 256 In that little town"
+        User time (seconds): 16.23
+        System time (seconds): 0.69
+        Percent of CPU this job got: 99%
+        Elapsed (wall clock) time (h:mm:ss or m:ss): 0:17.02
+        Average shared text size (kbytes): 0
+        Average unshared data size (kbytes): 0
+        Average stack size (kbytes): 0
+        Average total size (kbytes): 0
+        Maximum resident set size (kbytes): 890648
+        Average resident set size (kbytes): 0
+        Major (requiring I/O) page faults: 0
+        Minor (reclaiming a frame) page faults: 322931
+        Voluntary context switches: 2435
+        Involuntary context switches: 260
+        Swaps: 0
+        File system inputs: 0
+        File system outputs: 1056
+        Socket messages sent: 0
+        Socket messages received: 0
+        Signals delivered: 0
+        Page size (bytes): 4096
+        Exit status: 0
+```
