@@ -22,6 +22,8 @@ source-repository head
 
 executable llama2
   main-is: Main.hs
+  other-modules:
+      Transformer
   hs-source-dirs:
       project/llama2
   build-depends: base,
@@ -57,5 +59,11 @@ executable llama2
     -O2
     -threaded
     -haddock
+  default-extensions:
+    BangPatterns
+    InstanceSigs
+    NamedFieldPuns
+    OverloadedStrings
+    RecordWildCards
+    GeneralizedNewtypeDeriving
   default-language: Haskell2010
-
