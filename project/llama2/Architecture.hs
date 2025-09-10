@@ -28,7 +28,7 @@ import Types
       LayerIndex(..), Array3D, MVectorFloat, HeadIndex (..), getRow )
 import Primitives
     (
-      applyMatrixVectorMult, dotProductMV, softmax, rmsNorm, silu )
+      applyMatrixVectorMult, dotProductMV, softmax, rmsNorm, silu, applyRotaryPositionEncoding )
 
 -- Data definitions mirroring architecture boxes
 newtype Embedding = Embedding
@@ -70,12 +70,28 @@ data TransformerDecoder = TransformerDecoder
 class Embeddable e where
   embed :: e -> Token -> TransformerResult TokenVector
 
+class RotaryEncodable r where
+  applyRotary :: r -> StepCount -> HeadIndex -> V.Vector Float -> TransformerResult (V.Vector Float)
+
 instance Embeddable Embedding where
   embed :: Embedding -> Token -> TransformerResult TokenVector
-  embed = getTokenEmbedding
+  embed (Embedding vocabulary) tokenCode = do
+    let
+        rowStart = fromIntegral tokenCode * ncols vocabulary
+        tokenVector = TokenVector $ V.slice rowStart (ncols vocabulary) (items2D vocabulary)
+    return tokenVector
 
-class RotaryEncodable r where
-  applyRotary :: r -> StepCount -> V.Vector Float -> TransformerResult (V.Vector Float)
+instance RotaryEncodable RotaryEncoding where
+  applyRotary :: RotaryEncoding -> StepCount -> HeadIndex -> V.Vector Float -> TransformerResult (V.Vector Float)
+  applyRotary (RotaryEncoding freqCos freqSin) (StepCount step) headIndex input = do
+    network <- ask
+    let
+        cosFrequencies = getRow step freqCos
+        sinFrequencies = getRow step freqSin
+        headDim = headDimension network
+
+    -- Apply rotation per head
+    return $ applyRotaryPositionEncoding headDim headIndex cosFrequencies sinFrequencies input
 
 class AttentionLayer a where
   runAttention :: a -> V.Vector Float -> StepCount -> TransformerResult (V.Vector Float)
@@ -122,12 +138,6 @@ data NetworkConfig = NetworkConfig
 
 -- Runtime type alias
 type TransformerResult a = ReaderT NetworkConfig (StateT AttentionKV IO) a
-
-applyRotations :: HeadIndex -> V.Vector Float -> V.Vector Float -> V.Vector Float -> TransformerResult (V.Vector Float)
-applyRotations headIndex cosFrequencies sinFrequencies input = do
-  network <- ask
-  let headDim = headDimension network
-  applyRotaryPositionEncoding headDim headIndex cosFrequencies sinFrequencies input
 
 -- Attention accumulation
 accumulateAttentionOutput :: LayerIndex -> HeadIndex -> [Float] -> MVectorFloat -> MVectorFloat -> TransformerResult ()
@@ -182,20 +192,26 @@ computeMultiHeadAttention currentStep layerIndex queryOutput keyCache valueCache
     accumulateAttentionOutput layerIndex (HeadIndex headIndex) attentionWeights valueCache headOutputSlice
 
 -- QKV projection
-computeQKV :: TransformerParams -> StepCount -> LayerIndex -> V.Vector Float -> V.Vector Float -> TokenVector -> TransformerResult ()
-computeQKV params currentStep layerIndex freqCosValues freqSinValues (TokenVector inputToken) = do
+computeQKV :: TransformerParams -> StepCount -> LayerIndex -> TokenVector -> TransformerResult ()
+computeQKV params currentStep layerIndex (TokenVector inputToken) = do
   network <- ask
   AttentionKV {queryOutput, keyOutput, valueOutput, keyCache, valueCache} <- gets id
   let headDim = headDimension network
       numHeads = numAttentionHeads network
       LayerIndex layerIdx = layerIndex
       normalizedInput = rmsNorm inputToken (getRow layerIdx (rmsAttWeight params))
+      dec = decoder network
+      rotary = modelRotary dec
+      cosValues = freqCos rotary
+      sinValues = freqSin rotary
 
   liftIO $ do
     normalizedInputMutable <- V.thaw normalizedInput
     applyMatrixVectorMult (getArray2D layerIdx (wq params)) normalizedInputMutable queryOutput
     applyMatrixVectorMult (getArray2D layerIdx (wk params)) normalizedInputMutable keyOutput
     applyMatrixVectorMult (getArray2D layerIdx (wv params)) normalizedInputMutable valueOutput
+  
+  let rotaryEncoding = RotaryEncoding { freqCos = cosValues, freqSin = sinValues }
 
   forM_ [0 .. numHeads - 1] $ \headIndex -> do
       -- Convert mutable queryOutput and keyOutput to immutable vectors
@@ -203,8 +219,9 @@ computeQKV params currentStep layerIndex freqCosValues freqSinValues (TokenVecto
       keyInput <- liftIO $ V.freeze keyOutput
 
       -- Apply rotations to query and key
-      rotatedQuery <- applyRotations (HeadIndex headIndex) freqCosValues freqSinValues queryInput
-      rotatedKey <- applyRotations (HeadIndex headIndex) freqCosValues freqSinValues keyInput
+      rotatedQuery <- applyRotary rotaryEncoding currentStep (HeadIndex headIndex) queryInput
+      rotatedKey   <- applyRotary rotaryEncoding currentStep (HeadIndex headIndex) keyInput
+
 
       -- Write the rotated results back to the mutable vectors
       liftIO $ do
@@ -246,14 +263,6 @@ applyFeedForwardNetwork params (LayerIndex layerIndex) inputToken = do
 
     applyMatrixVectorMult (getArray2D layerIndex (w2 params)) gateOutput feedforwardNetworkOutput
 
--- Embedding helper
-getTokenEmbedding :: Embedding -> Token -> TransformerResult TokenVector
-getTokenEmbedding (Embedding vocabulary) tokenCode = do
-  let
-      rowStart = fromIntegral tokenCode * ncols vocabulary
-      tokenVector = TokenVector $ V.slice rowStart (ncols vocabulary) (items2D vocabulary)
-  return tokenVector
-
 -- classifier logits for a given token vector
 transformerLogits :: V.Vector Float -> TransformerResult (V.Vector Float)
 transformerLogits tokenVec = do
@@ -272,24 +281,3 @@ transformerLogits tokenVec = do
 cacheIndex :: NetworkConfig -> StepCount -> LayerIndex -> HeadIndex -> Int -> Int
 cacheIndex NetworkConfig {numAttentionHeads, seqLen, headDimension} (StepCount stepIndex) (LayerIndex layerIndex) (HeadIndex headIndex) dimensionIndex =
   (((layerIndex * numAttentionHeads + headIndex) * seqLen) + stepIndex) * headDimension + dimensionIndex
-
-applyRotaryPositionEncoding :: Int -> HeadIndex -> V.Vector Float -> V.Vector Float -> V.Vector Float -> TransformerResult (V.Vector Float)
-applyRotaryPositionEncoding headDim (HeadIndex headIndex) cosFrequencies sinFrequencies input = do
-  let baseIndex = headIndex * headDim
-      slice = V.slice baseIndex headDim input
-      
-      -- Process pairs just like the primed version
-      processedPairs = map (\pairIndex ->
-        let realComponent = slice V.! pairIndex
-            imagComponent = slice V.! (pairIndex + 1)
-            cosValue = cosFrequencies V.! (pairIndex `div` 2)
-            sinValue = sinFrequencies V.! (pairIndex `div` 2)
-            rotatedReal = realComponent * cosValue - imagComponent * sinValue
-            rotatedImag = realComponent * sinValue + imagComponent * cosValue
-        in [(pairIndex, rotatedReal), (pairIndex + 1, rotatedImag)]
-        ) [0, 2 .. headDim - 2]
-      
-      updates = concat processedPairs
-      rotated = slice V.// updates
-      result = input V.// zip [baseIndex..baseIndex+headDim-1] (V.toList rotated)
-  return result

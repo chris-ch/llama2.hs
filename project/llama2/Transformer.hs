@@ -8,7 +8,7 @@ import qualified Data.ByteString.Lazy.Char8 as BSC
 import qualified Data.Vector.Unboxed as V
 import GHC.Unicode (isSpace)
 import System.IO (hFlush, stdout)
-import Types (AttentionKV (..), StepCount (..), LayerIndex(..), Token, TokenVector(..), PromptTokens, Vocabulary, getArray2D, getRow)
+import Types (AttentionKV (..), StepCount (..), LayerIndex(..), Token, TokenVector(..), PromptTokens, Vocabulary, getArray2D)
 import Primitives (applyMatrixVectorMult, drawSample, softmax)
 import Architecture (transformerLogits, applyFeedForwardNetwork, computeQKV, computeMultiHeadAttention, TransformerResult, NetworkConfig (..), TransformerParams(..), TransformerDecoder (..), embed)
 --------------------------------------------------------------------------------
@@ -16,15 +16,15 @@ import Architecture (transformerLogits, applyFeedForwardNetwork, computeQKV, com
 --------------------------------------------------------------------------------
 
 -- Layer Token
-createLayerToken :: StepCount -> LayerIndex -> V.Vector Float -> V.Vector Float -> TokenVector -> TransformerResult TokenVector
-createLayerToken currentStep layerIndex freqCosValues freqSinValues inputToken = do
+createLayerToken :: StepCount -> LayerIndex -> TokenVector -> TransformerResult TokenVector
+createLayerToken currentStep layerIndex inputToken = do
   network <- ask
   AttentionKV {queryOutput, keyCache, valueCache, projectedAttentionOutput, feedforwardNetworkOutput, multiHeadOutput} <- gets id
   let model = params network
       LayerIndex layerIdx = layerIndex
       outputProjectionWeights = getArray2D layerIdx (wo model)
 
-  computeQKV model currentStep layerIndex freqCosValues freqSinValues inputToken
+  computeQKV model currentStep layerIndex inputToken
 
   -- Compute multi-head attention directly into concatenatedHeads buffer
   computeMultiHeadAttention currentStep layerIndex queryOutput keyCache valueCache multiHeadOutput
@@ -47,22 +47,15 @@ transformer :: Token -> StepCount -> TransformerResult (V.Vector Float)
 transformer tokenCode stepCount = do
   network <- ask
 
-  -- Getting the token embedding
-  let model = params network
   let
     dec = decoder network
     embeddingLayer = modelEmbedding dec
   tokenVector <- embed embeddingLayer tokenCode
 
-  -- Plucking out the current row of freq_cis_real and freq_cis_imag
-  let StepCount step = stepCount
-      freqCosValues = getRow step (freqCisReal model)
-      freqSinValues = getRow step (freqCisImag model)
-
   -- Forwarding all the layers
   TokenVector finalTokenVector <-
     foldM
-      (\accToken layerIndex -> createLayerToken stepCount (LayerIndex layerIndex) freqCosValues freqSinValues accToken)
+      (\accToken layerIndex -> createLayerToken stepCount (LayerIndex layerIndex) accToken)
       tokenVector
       [0 .. numLayers network - 1]
 

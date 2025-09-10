@@ -5,7 +5,8 @@ module Primitives
     silu,
     dotProductMV,
     softmax,
-    drawSample
+    drawSample,
+    applyRotaryPositionEncoding
   ) where
 
 import Control.Monad (foldM, forM_)
@@ -16,7 +17,8 @@ import Types
   ( 
     Token,
     MVectorFloat,
-    Array2D (..)
+    Array2D (..),
+    HeadIndex (..)
   )
 
 -- Linear algebra helpers
@@ -78,3 +80,24 @@ drawSample randomSeed probabilities = do
       cumulativeDistribution = V.scanl1 (+) probabilities
       selectedIndex = V.length (V.takeWhile (< randomValue) cumulativeDistribution)
   return $ fromIntegral (min selectedIndex (V.length probabilities - 1))
+
+applyRotaryPositionEncoding :: Int -> HeadIndex -> V.Vector Float -> V.Vector Float -> V.Vector Float -> V.Vector Float
+applyRotaryPositionEncoding headDim (HeadIndex headIndex) cosFrequencies sinFrequencies input = let
+  baseIndex = headIndex * headDim
+  slice = V.slice baseIndex headDim input
+
+  -- Process pairs just like the primed version
+  processedPairs = map (\pairIndex ->
+    let realComponent = slice V.! pairIndex
+        imagComponent = slice V.! (pairIndex + 1)
+        cosValue = cosFrequencies V.! (pairIndex `div` 2)
+        sinValue = sinFrequencies V.! (pairIndex `div` 2)
+        rotatedReal = realComponent * cosValue - imagComponent * sinValue
+        rotatedImag = realComponent * sinValue + imagComponent * cosValue
+    in [(pairIndex, rotatedReal), (pairIndex + 1, rotatedImag)]
+    ) [0, 2 .. headDim - 2]
+
+  updates = concat processedPairs
+  rotated = slice V.// updates
+  result = input V.// zip [baseIndex..baseIndex+headDim-1] (V.toList rotated)
+  in result
