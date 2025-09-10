@@ -57,5 +57,11 @@ executable llama2
     -O2
     -threaded
     -haddock
+  default-extensions:
+    BangPatterns
+    InstanceSigs
+    NamedFieldPuns
+    OverloadedStrings
+    RecordWildCards
+    GeneralizedNewtypeDeriving
   default-language: Haskell2010
-

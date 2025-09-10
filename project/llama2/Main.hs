@@ -1,10 +1,3 @@
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE InstanceSigs #-}
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-
 module Main (main) where
 
 import Control.Monad (foldM, forM_, replicateM)
@@ -12,8 +5,8 @@ import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT (runRe
 import Control.Monad.State (StateT, evalStateT, gets)
 import Data.Binary.Get (getInt32le)
 import qualified Data.Binary.Get as BG
-import qualified Data.ByteString.Lazy as BS
-import qualified Data.ByteString.Lazy.Char8 as BSC
+import qualified Data.ByteString.Lazy as BSL
+import qualified Data.ByteString.Lazy.Char8 as BSLC
 import Data.Int (Int32)
 import qualified Data.List as DL
 import Data.Maybe (fromMaybe)
@@ -25,6 +18,9 @@ import qualified Options.Applicative as OA
 import System.IO (hFlush, stdout)
 import qualified System.Random as R
 import Text.Printf (printf)
+import Foreign (Ptr, castPtr, peekElemOff)
+import GHC.IO (unsafePerformIO)
+import Data.ByteString (useAsCString)
 
 --------------------------------------------------------------------------------
 -- Array2D Data Structure and Class
@@ -106,8 +102,8 @@ optionsParser =
 main :: IO ()
 main = do
   Options {..} <- OA.execParser $ OA.info (optionsParser OA.<**> OA.helper) OA.fullDesc
-  modelFileContent <- BS.readFile modelFile
-  tokenizerFileContent <- BS.readFile tokenizerFile
+  modelFileContent <- BSL.readFile modelFile
+  tokenizerFileContent <- BSL.readFile tokenizerFile
   runModel modelFileContent tokenizerFileContent (realToFrac temperature) steps prompt seed
 
 --------------------------------------------------------------------------------
@@ -121,7 +117,7 @@ newtype TokenVector = TokenVector (V.Vector Float) deriving (Show)
 
 type MVectorFloat = MV.MVector (MV.PrimState IO) Float
 
-type Vocabulary = [BS.ByteString]
+type Vocabulary = [BSL.ByteString]
 
 type VocabularyScores = [Float]
 
@@ -178,11 +174,11 @@ data NetworkConfig = NetworkConfig
 
 readVector :: Int -> BG.Get (V.Vector Float)
 readVector count = do
-  byteData <- BG.getLazyByteString (fromIntegral count * 4) -- Read 4 bytes per Float
-  return $ V.unfoldrExactN count parseFloatFromBytes byteData
-  where
-    parseFloatFromBytes :: BS.ByteString -> (Float, BS.ByteString)
-    parseFloatFromBytes bs = (BG.runGet BG.getFloatle (BS.take 4 bs), BS.drop 4 bs)
+  byteData <- BG.getByteString (count * 4)
+  return $! unsafePerformIO $ do
+    useAsCString byteData $ \ptr -> do
+      let floatPtr = castPtr ptr :: Ptr Float
+      V.generateM count (peekElemOff floatPtr)
 
 parseNetworkConfigFile :: BG.Get NetworkConfig
 parseNetworkConfigFile = do
@@ -237,36 +233,36 @@ parseNetworkConfigFile = do
         weighting = weights
       }
 
-initModel :: BS.ByteString -> NetworkConfig
+initModel :: BSL.ByteString -> NetworkConfig
 initModel = BG.runGet parseNetworkConfigFile
 
 --------------------------------------------------------------------------------
 -- Tokenizer
 --------------------------------------------------------------------------------
 
-parseTokens :: BS.ByteString -> Int -> (Vocabulary, VocabularyScores)
+parseTokens :: BSL.ByteString -> Int -> (Vocabulary, VocabularyScores)
 parseTokens fileContent size = (vocab, vocabScores)
   where
     scoresTokens = BG.runGet scoresAndTokens fileContent
     vocabScores = map fst scoresTokens
     vocab = map snd scoresTokens
 
-    scoresAndTokens :: BG.Get [(Float, BS.ByteString)]
+    scoresAndTokens :: BG.Get [(Float, BSL.ByteString)]
     scoresAndTokens = replicateM size readToken
 
-    readToken :: BG.Get (Float, BS.ByteString)
+    readToken :: BG.Get (Float, BSL.ByteString)
     readToken = do
       score <- BG.getFloatle
       tokenSize <- BG.getInt32le
       token <- BG.getLazyByteString (fromIntegral tokenSize)
       return (score, token)
 
-tokenizerInit :: BS.ByteString -> Int -> BS.ByteString -> (PromptTokens, Vocabulary)
+tokenizerInit :: BSL.ByteString -> Int -> BSL.ByteString -> (PromptTokens, Vocabulary)
 tokenizerInit file size prompt = (bpeEncode prompt vocab vocabScores, vocab)
   where
-    (vocab, vocabScores) = parseTokens (BS.drop 4 file) size
+    (vocab, vocabScores) = parseTokens (BSL.drop 4 file) size
 
-strLookup :: BS.ByteString -> Vocabulary -> Int
+strLookup :: BSL.ByteString -> Vocabulary -> Int
 strLookup occurrence = fromMaybe (-1) . DL.elemIndex occurrence
 
 applyBPEMerges :: [Token] -> Vocabulary -> VocabularyScores -> PromptTokens
@@ -281,7 +277,7 @@ applyBPEMerges tokens vocab vocabScores = case findBestPair tokens of
       where
         checkPair :: (Int, (Token, Token)) -> Maybe (Int, Token) -> Maybe (Int, Token)
         checkPair (count, (tokenPrev, tokenNext)) acc =
-          case strLookup ((vocab !! fromIntegral tokenPrev) `BS.append` (vocab !! fromIntegral tokenNext)) vocab of
+          case strLookup ((vocab !! fromIntegral tokenPrev) `BSL.append` (vocab !! fromIntegral tokenNext)) vocab of
             pos | pos /= -1 && vocabScores !! pos > bestScore -> Just (count, fromIntegral pos)
             _ -> acc
 
@@ -292,9 +288,9 @@ applyBPEMerges tokens vocab vocabScores = case findBestPair tokens of
     mergePair count token tokens' =
       take count tokens' ++ [token] ++ drop (count + 2) tokens'
 
-bpeEncode :: BS.ByteString -> Vocabulary -> VocabularyScores -> PromptTokens
+bpeEncode :: BSL.ByteString -> Vocabulary -> VocabularyScores -> PromptTokens
 bpeEncode prompt vocab vocabScores =
-  let tokens = map (\char -> fromMaybe (error "Character not found in vocabulary") (DL.elemIndex (BS.pack [char]) vocab)) (BS.unpack prompt)
+  let tokens = map (\char -> fromMaybe (error "Character not found in vocabulary") (DL.elemIndex (BSL.pack [char]) vocab)) (BSL.unpack prompt)
    in applyBPEMerges (map fromIntegral tokens) vocab vocabScores
 
 --------------------------------------------------------------------------------
@@ -593,7 +589,7 @@ transformer tokenCode stepCount = do
 
   return logits
 
-generateNextToken :: StepCount -> PromptTokens -> Float -> Vocabulary -> Token -> Int -> TransformerResult (BS.ByteString, Token)
+generateNextToken :: StepCount -> PromptTokens -> Float -> Vocabulary -> Token -> Int -> TransformerResult (BSL.ByteString, Token)
 generateNextToken timestep promptTokens temperature vocab tokenCode seedValue = do
   network <- ask
   logits <- transformer tokenCode timestep
@@ -606,15 +602,15 @@ generateNextToken timestep promptTokens temperature vocab tokenCode seedValue = 
           then return $ fromIntegral (V.maxIndex logits)
           else do
             liftIO $ drawSample seedValue $ softmax (V.map (/ temperature) logits) (vocabSize network)
-  let word = vocab !! fromIntegral nextToken :: BS.ByteString
-      firstChar = BSC.head word :: Char
+  let word = vocab !! fromIntegral nextToken :: BSL.ByteString
+      firstChar = BSLC.head word :: Char
       tokenStr =
         if tokenCode == 1 && isSpace firstChar
-          then BSC.tail (vocab !! fromIntegral nextToken)
+          then BSLC.tail (vocab !! fromIntegral nextToken)
           else vocab !! fromIntegral nextToken
   return (tokenStr, nextToken)
 
-generateTokens :: StepCount -> PromptTokens -> Float -> Vocabulary -> Int -> TransformerResult ([BS.ByteString], StepCount)
+generateTokens :: StepCount -> PromptTokens -> Float -> Vocabulary -> Int -> TransformerResult ([BSL.ByteString], StepCount)
 generateTokens maxSteps promptTokens temperature vocab seedValue = do
   network <- ask
   go network (StepCount 0) [] 1
@@ -623,7 +619,7 @@ generateTokens maxSteps promptTokens temperature vocab seedValue = do
       | timestep >= maxSteps || (timestep /= StepCount 0 && token == 1) = return (result, timestep)
       | otherwise = do
           (tokenStr, nextToken) <- generateNextToken timestep promptTokens temperature vocab token seedValue
-          liftIO $ putStr $ BSC.unpack tokenStr
+          liftIO $ putStr $ BSLC.unpack tokenStr
           liftIO $ hFlush stdout
           go network (timestep + StepCount 1) (result ++ [tokenStr]) nextToken
 
@@ -642,13 +638,13 @@ initAttentionKV NetworkConfig {numLayers, numAttentionHeads, seqLen, headDimensi
   multiHeadOutput <- MV.new (numAttentionHeads * headDimension)
   return AttentionKV {keyCache, valueCache, gateOutput, upProjectionOutput, feedforwardNetworkOutput, queryOutput, keyOutput, valueOutput, projectedAttentionOutput, multiHeadOutput}
 
-runModel :: BS.ByteString -> BS.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
+runModel :: BSL.ByteString -> BSL.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
 runModel modelFileContent tokenizerFileContent temperature steps prompt seed = do
   currentTime <- getPOSIXTime
   let seedValue = fromMaybe (round currentTime) seed
       config = initModel modelFileContent
       prompt' = fromMaybe "" prompt
-      (promptTokens, vocab) = tokenizerInit tokenizerFileContent (vocabSize config) (BSC.pack prompt')
+      (promptTokens, vocab) = tokenizerInit tokenizerFileContent (vocabSize config) (BSLC.pack prompt')
   attentionKV <- initAttentionKV config
   putStrLn "<s>"
   startTime <- getPOSIXTime
