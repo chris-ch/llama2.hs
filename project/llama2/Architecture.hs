@@ -134,18 +134,17 @@ instance LayerComp TransformerLayer where
   runLayerComp TransformerLayer {layerIndex} stepCount tokenVec = do
     network <- ask
     let model = params network
-        li = layerIndex
-        LayerIndex li' = li
+        LayerIndex li' = layerIndex
         freqCosValues = getRow (let StepCount s = stepCount in s) (freqCisReal model)
         freqSinValues = getRow (let StepCount s = stepCount in s) (freqCisImag model)
 
     -- QKV + cache update
-    computeQKV model stepCount li freqCosValues freqSinValues tokenVec
+    computeQKV model stepCount layerIndex freqCosValues freqSinValues tokenVec
 
     -- Run multihead attention
     AttentionKV {multiHeadOutput, projectedAttentionOutput, keyCache = kc, valueCache = vc} <- gets id
 
-    computeMultiHeadAttention stepCount li multiHeadOutput kc vc multiHeadOutput
+    computeMultiHeadAttention stepCount layerIndex multiHeadOutput kc vc multiHeadOutput
 
     -- Output projection W_o
     liftIO $ applyMatrixVectorMult (getArray2D li' (wo model)) multiHeadOutput projectedAttentionOutput
@@ -155,7 +154,7 @@ instance LayerComp TransformerLayer where
         tokenAfterAttention = V.zipWith (+) token attentionDelta
 
     -- FFN
-    applyFeedForwardNetwork model li tokenAfterAttention
+    applyFeedForwardNetwork model layerIndex tokenAfterAttention
     st <- gets id
     ffnOut <- liftIO $ V.freeze (feedforwardNetworkOutput st)
     return $ TokenVector $ V.zipWith (+) tokenAfterAttention ffnOut
@@ -251,19 +250,19 @@ computeMultiHeadAttention currentStep layerIndex queryOutput keyCache valueCache
 
 -- QKV projection
 computeQKV :: TransformerParams -> StepCount -> LayerIndex -> V.Vector Float -> V.Vector Float -> TokenVector -> TransformerResult ()
-computeQKV weights currentStep layerIndex freqCosValues freqSinValues (TokenVector inputToken) = do
+computeQKV params currentStep layerIndex freqCosValues freqSinValues (TokenVector inputToken) = do
   network <- ask
   AttentionKV {queryOutput, keyOutput, valueOutput, keyCache, valueCache} <- gets id
   let headDim = headDimension network
       numHeads = numAttentionHeads network
       LayerIndex layerIdx = layerIndex
-      normalizedInput = rmsNorm inputToken (getRow layerIdx (rmsAttWeight weights))
+      normalizedInput = rmsNorm inputToken (getRow layerIdx (rmsAttWeight params))
 
   liftIO $ do
     normalizedInputMutable <- V.thaw normalizedInput
-    applyMatrixVectorMult (getArray2D layerIdx (wq weights)) normalizedInputMutable queryOutput
-    applyMatrixVectorMult (getArray2D layerIdx (wk weights)) normalizedInputMutable keyOutput
-    applyMatrixVectorMult (getArray2D layerIdx (wv weights)) normalizedInputMutable valueOutput
+    applyMatrixVectorMult (getArray2D layerIdx (wq params)) normalizedInputMutable queryOutput
+    applyMatrixVectorMult (getArray2D layerIdx (wk params)) normalizedInputMutable keyOutput
+    applyMatrixVectorMult (getArray2D layerIdx (wv params)) normalizedInputMutable valueOutput
 
   applyRotations freqCosValues freqSinValues queryOutput
   applyRotations freqCosValues freqSinValues keyOutput
@@ -276,27 +275,27 @@ computeQKV weights currentStep layerIndex freqCosValues freqSinValues (TokenVect
 
 -- FFN
 applyFeedForwardNetwork :: TransformerParams -> LayerIndex -> V.Vector Float -> TransformerResult ()
-applyFeedForwardNetwork weights (LayerIndex layerIndex) inputToken = do
+applyFeedForwardNetwork params (LayerIndex layerIndex) inputToken = do
   network <- ask
   AttentionKV {gateOutput, upProjectionOutput, feedforwardNetworkOutput} <- gets id
   let hiddenFFNDim = hiddenDim network
-      rmsFFNWeights = getRow layerIndex $ rmsFfnWeight weights
+      rmsFFNWeights = getRow layerIndex $ rmsFfnWeight params
       normalizedInput = rmsNorm inputToken rmsFFNWeights
 
   liftIO $ do
     normalizedInputMutable <- V.thaw normalizedInput
 
-    applyMatrixVectorMult (getArray2D layerIndex (w1 weights)) normalizedInputMutable gateOutput
+    applyMatrixVectorMult (getArray2D layerIndex (w1 params)) normalizedInputMutable gateOutput
 
     forM_ [0 .. hiddenFFNDim - 1] $ \i -> MV.unsafeModify gateOutput silu i
 
-    applyMatrixVectorMult (getArray2D layerIndex (w3 weights)) normalizedInputMutable upProjectionOutput
+    applyMatrixVectorMult (getArray2D layerIndex (w3 params)) normalizedInputMutable upProjectionOutput
 
     forM_ [0 .. hiddenFFNDim - 1] $ \i -> do
       upValue <- MV.unsafeRead upProjectionOutput i
       MV.unsafeModify gateOutput (* upValue) i
 
-    applyMatrixVectorMult (getArray2D layerIndex (w2 weights)) gateOutput feedforwardNetworkOutput
+    applyMatrixVectorMult (getArray2D layerIndex (w2 params)) gateOutput feedforwardNetworkOutput
 
 -- Embedding helper
 getTokenEmbedding :: Token -> TransformerResult TokenVector
@@ -312,9 +311,9 @@ getTokenEmbedding tokenCode = do
 transformerLogits :: V.Vector Float -> TransformerResult (V.Vector Float)
 transformerLogits tokenVec = do
   network <- ask
-  let weights = params network
-      vocab = tokenEmbeddingTable weights
-      tokenWithRms = rmsNorm tokenVec (rmsFinalWeight weights)
+  let model = params network
+      vocab = tokenEmbeddingTable model
+      tokenWithRms = rmsNorm tokenVec (rmsFinalWeight model)
       logits = V.generate (nrows vocab) $ \row ->
         let start = row * ncols vocab
             end = start + ncols vocab
