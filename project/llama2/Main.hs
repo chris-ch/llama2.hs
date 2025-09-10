@@ -56,7 +56,7 @@ instance Array2DOps Array2D where
 
   readArray2D :: Int -> Int -> BG.Get Array2D
   readArray2D rows cols = do
-    vec <- readVector (rows * cols) >>= \v -> v `deepseq` return v
+    vec <- readVector (rows * cols)
     return $ Array2D {items2D = vec, nrows = rows, ncols = cols}
 
 class Array3DOps a where
