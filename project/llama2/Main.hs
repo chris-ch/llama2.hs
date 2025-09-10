@@ -14,8 +14,9 @@ import qualified Data.Vector.Unboxed.Mutable as MV
 import qualified Options.Applicative as OA
 import Text.Printf (printf)
 import Transformer (generateTokens)
-import Types (AttentionKV (..), PromptTokens, StepCount (..), Token, Vocabulary, VocabularyScores, readArray2D, readArray3D, readVector)
-import Architecture (NetworkConfig (..), TransformerParams (..))
+import Types (AttentionKV (..), PromptTokens, StepCount (..), Token, Vocabulary, VocabularyScores, readArray2D, readArray3D, readVector, getArray2D, LayerIndex (..), getRow)
+import Architecture (NetworkConfig (..), TransformerParams (..), Embedding (..), RotaryEncoding (..), TransformerLayer (..), MultiHeadAttention (..), FeedForward (..), TransformerArchitecture (..))
+
 --------------------------------------------------------------------------------
 -- Options
 --------------------------------------------------------------------------------
@@ -50,7 +51,6 @@ main = do
 --------------------------------------------------------------------------------
 -- Binary Parsing
 --------------------------------------------------------------------------------
-
 parseNetworkConfigFile :: BG.Get NetworkConfig
 parseNetworkConfigFile = do
   modelDim' <- fromIntegral <$> getInt32le
@@ -91,6 +91,40 @@ parseNetworkConfigFile = do
             freqCisReal = freqCisReal',
             freqCisImag = freqCisImag'
           }
+      -- Construct the Embedding
+      embedding = Embedding
+        { embMatrix = tokenEmbeddingTable'
+        }
+      -- Construct the RotaryEncoding
+      rotary = RotaryEncoding
+        { freqCos = freqCisReal',
+          freqSin = freqCisImag'
+        }
+      -- Construct the list of TransformerLayers
+      layers = [ TransformerLayer
+                 { layerIndex = LayerIndex i,
+                   layerMha = MultiHeadAttention
+                     { m_wq = getArray2D i wq',
+                       m_wk = getArray2D i wk',
+                       m_wv = getArray2D i wv',
+                       m_wo = getArray2D i wo',
+                       m_rmsAtt = getRow i rmsAttWeight'
+                     },
+                   layerFfn = FeedForward
+                     { f_w1 = getArray2D i w1',
+                       f_w2 = getArray2D i w2',
+                       f_w3 = getArray2D i w3',
+                       f_rmsFfn = getRow i rmsFfnWeight'
+                     }
+                 }
+               | i <- [0 .. nLayers' - 1]
+               ]
+      -- Construct the TransformerArchitecture
+      architecture = TransformerArchitecture
+        { modelEmbedding = embedding,
+          modelRotary = rotary,
+          modelLayers = layers
+        }
   return $
     NetworkConfig
       { modelDim = modelDim',
@@ -101,7 +135,8 @@ parseNetworkConfigFile = do
         vocabSize = abs vocabSize',
         seqLen = seqLen',
         headDimension = headDim,
-        params = model
+        params = model,
+        architecture = architecture
       }
 
 initModel :: BS.ByteString -> NetworkConfig

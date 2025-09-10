@@ -25,13 +25,12 @@ import qualified Data.Vector.Unboxed.Mutable as MV
 
 import Types
     ( getArray2D,
-      getRow,
       Array2D(items2D, ncols, nrows),
       AttentionKV(..),
       Token,
       TokenVector(..),
       StepCount(..),
-      LayerIndex(..), Array3D, MVectorFloat, HeadIndex (..) )
+      LayerIndex(..), Array3D, MVectorFloat, HeadIndex (..), getRow )
 import Primitives
     (
       applyMatrixVectorMult, dotProductMV, softmax, rmsNorm, silu )
@@ -39,39 +38,39 @@ import Primitives
 -- Data definitions mirroring architecture boxes
 newtype Embedding = Embedding
   { embMatrix :: Array2D
-  }
+  } deriving (Show)
 
 data RotaryEncoding = RotaryEncoding
   { freqCos :: Array2D,
     freqSin :: Array2D
-  }
+  } deriving (Show)
 
 data MultiHeadAttention = MultiHeadAttention
   { m_wq :: Array2D,
     m_wk :: Array2D,
     m_wv :: Array2D,
     m_wo :: Array2D,
-    m_rmsAtt :: Array2D -- kept as placeholder; actual rms is per-row
-  }
+    m_rmsAtt :: V.Vector Float
+  } deriving (Show)
 
 data FeedForward = FeedForward
   { f_w1 :: Array2D,
     f_w2 :: Array2D,
     f_w3 :: Array2D,
-    f_rmsFfn :: Array2D
-  }
+    f_rmsFfn :: V.Vector Float
+  } deriving (Show)
 
 data TransformerLayer = TransformerLayer
   { layerIndex :: LayerIndex,
     layerMha :: MultiHeadAttention,
     layerFfn :: FeedForward
-  }
+  } deriving (Show)
 
 data TransformerArchitecture = TransformerArchitecture
   { modelEmbedding :: Embedding,
     modelRotary :: RotaryEncoding,
     modelLayers :: [TransformerLayer]
-  }
+  } deriving (Show)
 
 data TransformerParams = TransformerParams
   { tokenEmbeddingTable :: Array2D,
@@ -182,7 +181,8 @@ data NetworkConfig = NetworkConfig
     vocabSize :: Int,
     seqLen :: Int,
     headDimension :: Int,
-    params :: TransformerParams
+    params :: TransformerParams,
+    architecture :: TransformerArchitecture
   }
   deriving (Show)
 
