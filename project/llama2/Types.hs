@@ -23,9 +23,12 @@ where
 
 import qualified Data.Binary.Get as BG
 import qualified Data.ByteString.Lazy as BS
-import Data.Int (Int32)
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as MV
+import qualified Foreign as F
+import Data.ByteString (useAsCString)
+import GHC.IO (unsafePerformIO)
+import Data.Int (Int32)
 
 --------------------------------------------------------------------------------
 -- Types
@@ -147,11 +150,8 @@ instance Array3DOps Array3D where
 
 readVector :: Int -> BG.Get (V.Vector Float)
 readVector count = do
-  byteData <- BG.getLazyByteString (fromIntegral count * 4) -- Read 4 bytes per Float
-  return $ V.unfoldrN count parseFloatFromBytes byteData
-  where
-    parseFloatFromBytes :: BS.ByteString -> Maybe (Float, BS.ByteString)
-    parseFloatFromBytes bs =
-      if BS.null bs
-        then Nothing
-        else Just (BG.runGet BG.getFloatle (BS.take 4 bs), BS.drop 4 bs)
+  byteData <- BG.getByteString (count * 4)
+  return $! unsafePerformIO $ do
+    useAsCString byteData $ \ptr -> do
+      let floatPtr = F.castPtr ptr :: F.Ptr Float
+      V.generateM count (F.peekElemOff floatPtr)
