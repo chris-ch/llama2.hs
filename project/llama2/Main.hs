@@ -14,8 +14,8 @@ import qualified Data.Vector.Unboxed.Mutable as MV
 import qualified Options.Applicative as OA
 import Text.Printf (printf)
 import Transformer (generateTokens)
-import Types (AttentionKV (..), PromptTokens, StepCount (..), Token, Vocabulary, VocabularyScores, readArray2D, readArray3D, readVector, getArray2D, LayerIndex (..), getRow)
-import Architecture (NetworkConfig (..), TransformerParams (..), Embedding (..), RotaryEncoding (..), TransformerLayer (..), MultiHeadAttention (..), FeedForward (..), TransformerArchitecture (..))
+import Types (AttentionKV (..), PromptTokens, StepCount (..), Token, Vocabulary, VocabularyScores, readArray2D, readArray3D, readVector, getArray2D, getRow)
+import Architecture (NetworkConfig (..), TransformerParams (..), Embedding (..), RotaryEncoding (..), TransformerLayer (..), MultiHeadAttention (..), FeedForwardNetwork (..), TransformerDecoder (..))
 
 --------------------------------------------------------------------------------
 -- Options
@@ -93,7 +93,7 @@ parseNetworkConfigFile = do
           }
       -- Construct the Embedding
       embedding = Embedding
-        { embMatrix = tokenEmbeddingTable'
+        { vocabulary = tokenEmbeddingTable'
         }
       -- Construct the RotaryEncoding
       rotary = RotaryEncoding
@@ -102,25 +102,25 @@ parseNetworkConfigFile = do
         }
       -- Construct the list of TransformerLayers
       layers = [ TransformerLayer
-                 { layerIndex = LayerIndex i,
-                   layerMha = MultiHeadAttention
-                     { m_wq = getArray2D i wq',
-                       m_wk = getArray2D i wk',
-                       m_wv = getArray2D i wv',
-                       m_wo = getArray2D i wo',
-                       m_rmsAtt = getRow i rmsAttWeight'
+                 {
+                   multiHeadAttention = MultiHeadAttention
+                     { mWq = getArray2D i wq',
+                       mWk = getArray2D i wk',
+                       mWv = getArray2D i wv',
+                       mWo = getArray2D i wo',
+                       mRMSAtt = getRow i rmsAttWeight'
                      },
-                   layerFfn = FeedForward
-                     { f_w1 = getArray2D i w1',
-                       f_w2 = getArray2D i w2',
-                       f_w3 = getArray2D i w3',
-                       f_rmsFfn = getRow i rmsFfnWeight'
+                   feedforwardNetwork = FeedForwardNetwork
+                     { fW1 = getArray2D i w1',
+                       fW2 = getArray2D i w2',
+                       fW3 = getArray2D i w3',
+                       fRMSFfn = getRow i rmsFfnWeight'
                      }
                  }
                | i <- [0 .. nLayers' - 1]
                ]
       -- Construct the TransformerArchitecture
-      architecture = TransformerArchitecture
+      decoder = TransformerDecoder
         { modelEmbedding = embedding,
           modelRotary = rotary,
           modelLayers = layers
@@ -136,7 +136,7 @@ parseNetworkConfigFile = do
         seqLen = seqLen',
         headDimension = headDim,
         params = model,
-        architecture = architecture
+        decoder = decoder
       }
 
 initModel :: BS.ByteString -> NetworkConfig

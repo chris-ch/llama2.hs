@@ -10,7 +10,7 @@ import GHC.Unicode (isSpace)
 import System.IO (hFlush, stdout)
 import Types (AttentionKV (..), StepCount (..), LayerIndex(..), Token, TokenVector(..), PromptTokens, Vocabulary, getArray2D, getRow)
 import Primitives (applyMatrixVectorMult, drawSample, softmax)
-import Architecture (transformerLogits, getTokenEmbedding, applyFeedForwardNetwork, computeQKV, computeMultiHeadAttention, TransformerResult, NetworkConfig (..), TransformerParams(..))
+import Architecture (transformerLogits, applyFeedForwardNetwork, computeQKV, computeMultiHeadAttention, TransformerResult, NetworkConfig (..), TransformerParams(..), TransformerDecoder (..), embed)
 --------------------------------------------------------------------------------
 -- Transformer runtime
 --------------------------------------------------------------------------------
@@ -49,8 +49,10 @@ transformer tokenCode stepCount = do
 
   -- Getting the token embedding
   let model = params network
-  
-  tokenVector <- getTokenEmbedding tokenCode
+  let
+    dec = decoder network
+    embeddingLayer = modelEmbedding dec
+  tokenVector <- embed embeddingLayer tokenCode
 
   -- Plucking out the current row of freq_cis_real and freq_cis_imag
   let StepCount step = stepCount
