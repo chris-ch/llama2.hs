@@ -254,8 +254,8 @@ computeScores network layerIndex headIndex (StepCount step) headDim kVec qHead =
 computeQKV :: TransformerParams -> StepCount -> LayerIndex -> TokenVector -> TransformerResult (V.Vector Float, V.Vector Float, V.Vector Float)
 computeQKV params currentStep layerIndex (TokenVector inputToken) = do
   network <- ask
-  AttentionKV {queryOutput, keyOutput, valueOutput} <- gets id
   let 
+      dim = modelDim network
       numHeads = numAttentionHeads network
       LayerIndex layerIdx = layerIndex
       normalizedInput = rmsNorm inputToken (getRow layerIdx (rmsAttWeight params))
@@ -264,19 +264,20 @@ computeQKV params currentStep layerIndex (TokenVector inputToken) = do
       cosValues = freqCos rotary
       sinValues = freqSin rotary
 
-  liftIO $ do
-    -- Use matrixVectorMult and copy results to mutable buffers
-    let queryVec = matrixVectorMult (getArray2D layerIdx (wq params)) normalizedInput
-        keyVec = matrixVectorMult (getArray2D layerIdx (wk params)) normalizedInput
-        valueVec = matrixVectorMult (getArray2D layerIdx (wv params)) normalizedInput
+  -- Use matrixVectorMult and copy results to mutable buffers
+  let queryVec = matrixVectorMult (getArray2D layerIdx (wq params)) normalizedInput
+      keyVec = matrixVectorMult (getArray2D layerIdx (wk params)) normalizedInput
+      valueVec = matrixVectorMult (getArray2D layerIdx (wv params)) normalizedInput
     
-    queryMutable <- V.thaw queryVec
-    keyMutable <- V.thaw keyVec  
-    valueMutable <- V.thaw valueVec
-    
-    MV.copy queryOutput queryMutable
-    MV.copy keyOutput keyMutable
-    MV.copy valueOutput valueMutable
+  queryMutable <- V.thaw queryVec
+  keyMutable <- V.thaw keyVec  
+  valueMutable <- V.thaw valueVec
+  queryOutput <- MV.new dim
+  keyOutput <- MV.new dim
+  valueOutput <- MV.new dim
+  MV.copy queryOutput queryMutable
+  MV.copy keyOutput keyMutable
+  MV.copy valueOutput valueMutable
     
   let rotaryEncoding = RotaryEncoding { freqCos = cosValues, freqSin = sinValues }
 

@@ -57,9 +57,6 @@ data AttentionKV = AttentionKV
     gateOutput :: MVectorFloat,
     upProjectionOutput :: MVectorFloat,
     feedforwardNetworkOutput :: MVectorFloat,
-    queryOutput :: MVectorFloat,
-    keyOutput :: MVectorFloat,
-    valueOutput :: MVectorFloat,
     projectedAttentionOutput :: MVectorFloat
   }
 
