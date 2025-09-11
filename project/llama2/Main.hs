@@ -212,8 +212,7 @@ initAttentionKV NetworkConfig {numLayers, numAttentionHeads, seqLen, headDimensi
   keyOutput <- MV.new modelDim
   valueOutput <- MV.new modelDim
   projectedAttentionOutput <- MV.new modelDim
-  multiHeadOutput <- MV.new (numAttentionHeads * headDimension)
-  return AttentionKV {keyCache, valueCache, gateOutput, upProjectionOutput, feedforwardNetworkOutput, queryOutput, keyOutput, valueOutput, projectedAttentionOutput, multiHeadOutput}
+  return AttentionKV {keyCache, valueCache, gateOutput, upProjectionOutput, feedforwardNetworkOutput, queryOutput, keyOutput, valueOutput, projectedAttentionOutput}
 
 runModel :: BS.ByteString -> BS.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
 runModel modelFileContent tokenizerFileContent temperature steps prompt seed = do

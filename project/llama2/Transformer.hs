@@ -6,11 +6,10 @@ import Control.Monad.State (gets)
 import qualified Data.ByteString.Lazy as BS
 import qualified Data.ByteString.Lazy.Char8 as BSC
 import qualified Data.Vector.Unboxed as V
-import qualified Data.Vector.Unboxed.Mutable as MV
 import GHC.Unicode (isSpace)
 import System.IO (hFlush, stdout)
 import Types (AttentionKV (..), StepCount (..), LayerIndex(..), Token, TokenVector(..), PromptTokens, Vocabulary, getArray2D)
-import Primitives (applyMatrixVectorMult, drawSample, softmax)
+import Primitives (drawSample, softmax, matrixVectorMult)
 import Architecture (transformerLogits, computeQKV,
  TransformerResult, NetworkConfig (..), TransformerParams(..), TransformerDecoder (..), embed, TransformerLayer (..), runFeedForward, runAttention)
 --------------------------------------------------------------------------------
@@ -18,10 +17,11 @@ import Architecture (transformerLogits, computeQKV,
 --------------------------------------------------------------------------------
 
 -- Layer Token
+
 createLayerToken :: StepCount -> LayerIndex -> TokenVector -> TransformerResult TokenVector
 createLayerToken currentStep layerIndex inputToken = do
   network <- ask
-  AttentionKV {queryOutput, projectedAttentionOutput, multiHeadOutput} <- gets id
+  AttentionKV {queryOutput} <- gets id
   let model = params network
       LayerIndex layerIdx = layerIndex
       outputProjectionWeights = getArray2D layerIdx (wo model)
@@ -36,21 +36,15 @@ createLayerToken currentStep layerIndex inputToken = do
   -- Compute multi-head attention and copy it into buffer
   queryOutFrozen <- liftIO $ V.freeze queryOutput
   multiHeadOut <- runAttention mha layerIndex queryOutFrozen currentStep
-  multiHeadOutMutable <- V.thaw multiHeadOut
-  MV.copy multiHeadOutput multiHeadOutMutable
-
-  -- Apply output projection in-place
-  liftIO $ applyMatrixVectorMult outputProjectionWeights multiHeadOutput projectedAttentionOutput
-
-  -- Convert mutable output vector back to immutable
-  attentionDelta <- liftIO $ V.freeze projectedAttentionOutput
+  let attentionDelta = matrixVectorMult outputProjectionWeights multiHeadOut
+  
   let TokenVector tokenVector = inputToken
       tokenAfterAttention = V.zipWith (+) tokenVector attentionDelta
 
   -- Apply FFN
   ffnOut <- runFeedForward ffn tokenAfterAttention
   return $ TokenVector $ V.zipWith (+) tokenAfterAttention ffnOut
-
+  
 -- Transformer step
 transformer :: Token -> StepCount -> TransformerResult (V.Vector Float)
 transformer tokenCode stepCount = do

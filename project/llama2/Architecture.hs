@@ -29,7 +29,7 @@ import Types
       LayerIndex(..), Array3D, MVectorFloat, HeadIndex (..), getRow )
 import Primitives
     (
-      applyMatrixVectorMult, softmax, rmsNorm, sigmoidLinearUnit, applyRotaryPositionEncoding, matrixVectorMult )
+      softmax, rmsNorm, sigmoidLinearUnit, applyRotaryPositionEncoding, matrixVectorMult )
 import Data.List (foldl')
 
 -- Data definitions mirroring architecture boxes
@@ -273,11 +273,19 @@ computeQKV params currentStep layerIndex (TokenVector inputToken) = do
       sinValues = freqSin rotary
 
   liftIO $ do
-    normalizedInputMutable <- V.thaw normalizedInput
-    applyMatrixVectorMult (getArray2D layerIdx (wq params)) normalizedInputMutable queryOutput
-    applyMatrixVectorMult (getArray2D layerIdx (wk params)) normalizedInputMutable keyOutput
-    applyMatrixVectorMult (getArray2D layerIdx (wv params)) normalizedInputMutable valueOutput
-  
+    -- Use matrixVectorMult and copy results to mutable buffers
+    let queryVec = matrixVectorMult (getArray2D layerIdx (wq params)) normalizedInput
+        keyVec = matrixVectorMult (getArray2D layerIdx (wk params)) normalizedInput
+        valueVec = matrixVectorMult (getArray2D layerIdx (wv params)) normalizedInput
+    
+    queryMutable <- V.thaw queryVec
+    keyMutable <- V.thaw keyVec  
+    valueMutable <- V.thaw valueVec
+    
+    MV.copy queryOutput queryMutable
+    MV.copy keyOutput keyMutable
+    MV.copy valueOutput valueMutable
+    
   let rotaryEncoding = RotaryEncoding { freqCos = cosValues, freqSin = sinValues }
 
   forM_ [0 .. numHeads - 1] $ \headIndex -> do

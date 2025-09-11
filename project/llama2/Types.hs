@@ -60,8 +60,7 @@ data AttentionKV = AttentionKV
     queryOutput :: MVectorFloat,
     keyOutput :: MVectorFloat,
     valueOutput :: MVectorFloat,
-    projectedAttentionOutput :: MVectorFloat,
-    multiHeadOutput :: MVectorFloat
+    projectedAttentionOutput :: MVectorFloat
   }
 
 --------------------------------------------------------------------------------
