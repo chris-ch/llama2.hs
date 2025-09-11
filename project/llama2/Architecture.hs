@@ -6,9 +6,9 @@ module Architecture
     TransformerLayer (..),
     TransformerDecoder (..),
     TransformerParams(..),
-    transformerLogits, computeQKV, computeMultiHeadAttention, TransformerResult
+    transformerLogits, computeQKV, TransformerResult
     , NetworkConfig (..)
-    , embed, runFeedForward
+    , embed, runFeedForward, runAttention
   ) where
 
 import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT)
@@ -28,7 +28,8 @@ import Types
       LayerIndex(..), Array3D, MVectorFloat, HeadIndex (..), getRow )
 import Primitives
     (
-      applyMatrixVectorMult, dotProductMV, softmax, rmsNorm, sigmoidLinearUnit, applyRotaryPositionEncoding, matrixVectorMult )
+      applyMatrixVectorMult, softmax, rmsNorm, sigmoidLinearUnit, applyRotaryPositionEncoding, matrixVectorMult )
+import Data.List (foldl')
 
 -- Data definitions mirroring architecture boxes
 newtype Embedding = Embedding
@@ -76,6 +77,23 @@ class RotaryEncodable r where
 class FeedForwardLayer f where
   runFeedForward :: f -> V.Vector Float -> TransformerResult (V.Vector Float)
 
+class AttentionLayer a where
+  runAttention :: a -> LayerIndex -> V.Vector Float -> StepCount -> TransformerResult (V.Vector Float)
+
+instance AttentionLayer MultiHeadAttention where
+  runAttention :: MultiHeadAttention -> LayerIndex -> V.Vector Float -> StepCount -> TransformerResult (V.Vector Float)
+  runAttention mha layerIndex inputToken currentStep = do
+    network <- ask
+    let numHeads = numAttentionHeads network
+        headDim  = headDimension network
+        
+    -- build per-head query vectors
+    let headsQ = [ V.slice (i * headDim) headDim inputToken | i <- [0 .. numHeads - 1] ]
+
+    headOutputs <- mapM (\i -> headAttention layerIndex (HeadIndex i) currentStep (headsQ !! i)) [0 .. numHeads - 1]
+    let concatenated = V.concat headOutputs
+    return concatenated
+
 instance Embeddable Embedding where
   embed :: Embedding -> Token -> TransformerResult TokenVector
   embed (Embedding vocabulary) tokenCode = do
@@ -110,9 +128,6 @@ instance FeedForwardLayer FeedForwardNetwork where
       gateOutput = V.map sigmoidLinearUnit gateOutput'
       feedforwardNetworkOutput' = matrixVectorMult w2 (V.zipWith (*) gateOutput upProjectionOutput')
     return feedforwardNetworkOutput' 
-
-class AttentionLayer a where
-  runAttention :: a -> V.Vector Float -> StepCount -> TransformerResult (V.Vector Float)
 
 class TransformerBlock l where
   runBlock :: l -> V.Vector Float -> StepCount -> TransformerResult (V.Vector Float)
@@ -154,36 +169,59 @@ data NetworkConfig = NetworkConfig
 -- Runtime type alias
 type TransformerResult a = ReaderT NetworkConfig (StateT AttentionKV IO) a
 
--- Attention accumulation
-accumulateAttentionOutput :: LayerIndex -> HeadIndex -> [Float] -> MVectorFloat -> MVectorFloat -> TransformerResult ()
-accumulateAttentionOutput layerIndex headIndex attentionScores valueCache outputBuffer = do
+headAttention
+  :: LayerIndex
+  -> HeadIndex
+  -> StepCount
+  -> V.Vector Float
+  -> TransformerResult (V.Vector Float)
+headAttention layerIndex (HeadIndex hIdx) currentStep headQuery = do
   network <- ask
-  let attentionHeadDim = headDimension network
-  MV.set outputBuffer 0.0
-  let sequenceLength = length attentionScores
-  forM_ [0 .. sequenceLength - 1] $ \positionIndex -> do
-    let valueCacheOffset = cacheIndex network (StepCount positionIndex) layerIndex headIndex 0
-        valueSlice = MV.slice valueCacheOffset attentionHeadDim valueCache
-        attentionWeight = attentionScores !! positionIndex
-    forM_ [0 .. attentionHeadDim - 1] $ \dimIndex -> do
-      valueComponent <- MV.read valueSlice dimIndex
-      MV.modify outputBuffer (+ (attentionWeight * valueComponent)) dimIndex
+  kCache  <- gets keyCache
+  vCache  <- gets valueCache
 
--- compute scores
-computeScores :: LayerIndex -> HeadIndex -> MVectorFloat -> MVectorFloat -> StepCount -> TransformerResult (V.Vector Float)
-computeScores layerIndex headIndex queryBuffer keyCache currentStep = do
-  network <- ask
-  let attentionHeadDim = headDimension network
-      scalingFactor = sqrt (fromIntegral attentionHeadDim)
-      StepCount step = currentStep
+  -- freeze caches once
+  kVec <- liftIO $ V.unsafeFreeze kCache
+  vVec <- liftIO $ V.unsafeFreeze vCache
+
+  let headDim = headDimension network
+
+  -- compute scores (sequenceLength = step + 1)
+  let rawScores = computeScores network layerIndex (HeadIndex hIdx) currentStep headDim kVec headQuery
+      softValues = softmax rawScores (V.length rawScores)
+      sequenceLength = V.length softValues   -- should be step + 1
+      headScores = V.toList softValues
+
+      zero = V.replicate headDim 0.0
+      addScaled acc pos =
+        let valueCacheOffset = cacheIndex network (StepCount pos) layerIndex (HeadIndex hIdx) 0
+            vSlice = V.slice valueCacheOffset headDim vVec
+            score  = headScores !! pos
+            scaled = V.map (* score) vSlice
+        in V.zipWith (+) acc scaled
+
+  -- IMPORTANT: iterate over 0 .. sequenceLength-1 (inclusive last position)
+  return $ foldl' addScaled zero [0 .. sequenceLength - 1]
+
+-- computeScores' : uses cacheIndex, same semantics as the original computeScores
+computeScores
+  :: NetworkConfig                 -- need the network to compute cacheIndex
+  -> LayerIndex
+  -> HeadIndex
+  -> StepCount
+  -> Int                     -- headDim
+  -> V.Vector Float          -- frozen key cache
+  -> V.Vector Float          -- query vector for this head
+  -> V.Vector Float          -- raw scores (length = step + 1)
+computeScores network layerIndex headIndex (StepCount step) headDim kVec qHead =
+  let scaling = sqrt (fromIntegral headDim)
       sequenceLength = step + 1
-  V.generateM sequenceLength $ \positionIndex -> do
-    let keyCacheOffset = cacheIndex network (StepCount positionIndex) layerIndex headIndex 0
-        keySlice = MV.slice keyCacheOffset attentionHeadDim keyCache
-        HeadIndex hIndex = headIndex
-        querySlice = MV.slice (hIndex * attentionHeadDim) attentionHeadDim queryBuffer
-    dotProduct <- liftIO $ dotProductMV querySlice keySlice
-    return $ dotProduct / scalingFactor
+      scoreForPos pos =
+        let keyCacheOffset = cacheIndex network (StepCount pos) layerIndex headIndex 0
+            kSlice         = V.slice keyCacheOffset headDim kVec
+            dotProd        = V.sum (V.zipWith (*) qHead kSlice)
+        in dotProd / scaling
+  in V.generate sequenceLength scoreForPos
 
 -- Multi-head
 updateCacheWithHead :: LayerIndex -> HeadIndex -> StepCount -> MVectorFloat -> MVectorFloat -> TransformerResult ()
@@ -192,19 +230,6 @@ updateCacheWithHead layerIndex headIndex stepIndex headSlice cache = do
   let headDim = headDimension network
       cacheOffset = cacheIndex network stepIndex layerIndex headIndex 0
   MV.copy (MV.slice cacheOffset headDim cache) headSlice
-
-computeMultiHeadAttention :: StepCount -> LayerIndex -> MVectorFloat -> MVectorFloat -> MVectorFloat -> MVectorFloat -> TransformerResult ()
-computeMultiHeadAttention currentStep layerIndex queryOutput keyCache valueCache multiHeadOutput = do
-  network <- ask
-  let attentionHeadDim = headDimension network
-      numHeads = numAttentionHeads network
-  forM_ [0 .. numHeads - 1] $ \headIndex -> do
-    rawAttentionScores <- computeScores layerIndex (HeadIndex headIndex) queryOutput keyCache currentStep
-    let normalizedScores = softmax rawAttentionScores (V.length rawAttentionScores)
-        attentionWeights = V.toList normalizedScores
-        outputOffset = headIndex * attentionHeadDim
-        headOutputSlice = MV.slice outputOffset attentionHeadDim multiHeadOutput
-    accumulateAttentionOutput layerIndex (HeadIndex headIndex) attentionWeights valueCache headOutputSlice
 
 -- QKV projection
 computeQKV :: TransformerParams -> StepCount -> LayerIndex -> TokenVector -> TransformerResult ()

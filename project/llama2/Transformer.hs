@@ -6,12 +6,13 @@ import Control.Monad.State (gets)
 import qualified Data.ByteString.Lazy as BS
 import qualified Data.ByteString.Lazy.Char8 as BSC
 import qualified Data.Vector.Unboxed as V
+import qualified Data.Vector.Unboxed.Mutable as MV
 import GHC.Unicode (isSpace)
 import System.IO (hFlush, stdout)
 import Types (AttentionKV (..), StepCount (..), LayerIndex(..), Token, TokenVector(..), PromptTokens, Vocabulary, getArray2D)
 import Primitives (applyMatrixVectorMult, drawSample, softmax)
-import Architecture (transformerLogits, computeQKV, computeMultiHeadAttention,
- TransformerResult, NetworkConfig (..), TransformerParams(..), TransformerDecoder (..), embed, TransformerLayer (..), runFeedForward)
+import Architecture (transformerLogits, computeQKV,
+ TransformerResult, NetworkConfig (..), TransformerParams(..), TransformerDecoder (..), embed, TransformerLayer (..), runFeedForward, runAttention)
 --------------------------------------------------------------------------------
 -- Transformer runtime
 --------------------------------------------------------------------------------
@@ -20,19 +21,23 @@ import Architecture (transformerLogits, computeQKV, computeMultiHeadAttention,
 createLayerToken :: StepCount -> LayerIndex -> TokenVector -> TransformerResult TokenVector
 createLayerToken currentStep layerIndex inputToken = do
   network <- ask
-  AttentionKV {queryOutput, keyCache, valueCache, projectedAttentionOutput, multiHeadOutput} <- gets id
+  AttentionKV {queryOutput, projectedAttentionOutput, multiHeadOutput} <- gets id
   let model = params network
       LayerIndex layerIdx = layerIndex
       outputProjectionWeights = getArray2D layerIdx (wo model)
       dec = decoder network
       LayerIndex li = layerIndex
       layer = modelLayers dec !! li
+      mha = multiHeadAttention layer
       ffn = feedforwardNetwork layer
-
+  
   computeQKV model currentStep layerIndex inputToken
 
-  -- Compute multi-head attention directly into concatenatedHeads buffer
-  computeMultiHeadAttention currentStep layerIndex queryOutput keyCache valueCache multiHeadOutput
+  -- Compute multi-head attention and copy it into buffer
+  queryOutFrozen <- liftIO $ V.freeze queryOutput
+  multiHeadOut <- runAttention mha layerIndex queryOutFrozen currentStep
+  multiHeadOutMutable <- V.thaw multiHeadOut
+  MV.copy multiHeadOutput multiHeadOutMutable
 
   -- Apply output projection in-place
   liftIO $ applyMatrixVectorMult outputProjectionWeights multiHeadOutput projectedAttentionOutput

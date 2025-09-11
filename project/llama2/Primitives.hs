@@ -4,13 +4,12 @@ module Primitives
     matrixVectorMult,
     rmsNorm,
     sigmoidLinearUnit,
-    dotProductMV,
     softmax,
     drawSample,
     applyRotaryPositionEncoding
   ) where
 
-import Control.Monad (foldM, forM_)
+import Control.Monad (forM_)
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as MV
 import qualified System.Random as R
@@ -44,19 +43,6 @@ matrixVectorMult (Array2D items rows cols) vec = V.generate rows $ \i ->
       let rowStart = i * cols
           rowElements = V.slice rowStart cols items
       in V.sum $ V.zipWith (*) rowElements vec
-
--- dot product on mutable vectors
-dotProductMV :: MVectorFloat -> MVectorFloat -> IO Float
-dotProductMV vec1 vec2 = do
-  let len = min (MV.length vec1) (MV.length vec2)
-  foldM
-    ( \acc i -> do
-        a <- MV.read vec1 i
-        b <- MV.read vec2 i
-        return $ acc + a * b
-    )
-    0.0
-    [0 .. len - 1]
 
 -- RMS Norm
 rmsNorm :: V.Vector Float -> V.Vector Float -> V.Vector Float
