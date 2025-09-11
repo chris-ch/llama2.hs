@@ -14,9 +14,8 @@ module Architecture
 
 import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT)
 import Control.Monad.State (StateT, gets)
-import Control.Monad ( forM_ )
+import Control.Monad ( foldM)
 import qualified Data.Vector.Unboxed as V
-import qualified Data.Vector.Unboxed.Mutable as MV
 
 
 import Types
@@ -254,8 +253,7 @@ computeScores network layerIndex headIndex (StepCount step) headDim kVec qHead =
 computeQKV :: TransformerParams -> StepCount -> LayerIndex -> TokenVector -> TransformerResult (V.Vector Float, V.Vector Float, V.Vector Float)
 computeQKV params currentStep layerIndex (TokenVector inputToken) = do
   network <- ask
-  let 
-      dim = modelDim network
+  let
       numHeads = numAttentionHeads network
       LayerIndex layerIdx = layerIndex
       normalizedInput = rmsNorm inputToken (getRow layerIdx (rmsAttWeight params))
@@ -263,44 +261,24 @@ computeQKV params currentStep layerIndex (TokenVector inputToken) = do
       rotary = modelRotary dec
       cosValues = freqCos rotary
       sinValues = freqSin rotary
+      rotaryEncoding = RotaryEncoding { freqCos = cosValues, freqSin = sinValues }
 
-  -- Use matrixVectorMult and copy results to mutable buffers
+  -- Compute initial query, key, and value vectors
   let queryVec = matrixVectorMult (getArray2D layerIdx (wq params)) normalizedInput
       keyVec = matrixVectorMult (getArray2D layerIdx (wk params)) normalizedInput
       valueVec = matrixVectorMult (getArray2D layerIdx (wv params)) normalizedInput
-    
-  queryMutable <- V.thaw queryVec
-  keyMutable <- V.thaw keyVec  
-  valueMutable <- V.thaw valueVec
-  queryOutput <- MV.new dim
-  keyOutput <- MV.new dim
-  valueOutput <- MV.new dim
-  MV.copy queryOutput queryMutable
-  MV.copy keyOutput keyMutable
-  MV.copy valueOutput valueMutable
-    
-  let rotaryEncoding = RotaryEncoding { freqCos = cosValues, freqSin = sinValues }
 
-  forM_ [0 .. numHeads - 1] $ \headIndex -> do
-      -- Convert mutable queryOutput and keyOutput to immutable vectors
-      queryInput <- liftIO $ V.freeze queryOutput
-      keyInput <- liftIO $ V.freeze keyOutput
+  -- Apply rotary encoding to query and key vectors for each head
+  (rotatedQuery, rotatedKey) <- foldM
+    (\(qAcc, kAcc) headIndex -> do
+        let headIdx = HeadIndex headIndex
+        rotatedQ <- applyRotary rotaryEncoding currentStep headIdx qAcc
+        rotatedK <- applyRotary rotaryEncoding currentStep headIdx kAcc
+        return (rotatedQ, rotatedK))
+    (queryVec, keyVec)
+    [0 .. numHeads - 1]
 
-      -- Apply rotations to query and key
-      rotatedQuery <- applyRotary rotaryEncoding currentStep (HeadIndex headIndex) queryInput
-      rotatedKey   <- applyRotary rotaryEncoding currentStep (HeadIndex headIndex) keyInput
-
-      -- Write the rotated results back to the mutable vectors
-      liftIO $ do
-        rotatedQueryMutable <- V.thaw rotatedQuery
-        rotatedKeyMutable <- V.thaw rotatedKey
-        MV.copy queryOutput rotatedQueryMutable
-        MV.copy keyOutput rotatedKeyMutable
-
-  fqo <- V.freeze queryOutput
-  fko <- V.freeze keyOutput
-  fvo <- V.freeze valueOutput
-  return (fqo, fko, fvo)
+  return (rotatedQuery, rotatedKey, valueVec)
 
 -- classifier logits for a given token vector
 transformerLogits :: V.Vector Float -> TransformerResult (V.Vector Float)
