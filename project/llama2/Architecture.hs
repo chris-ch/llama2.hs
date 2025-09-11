@@ -259,7 +259,7 @@ updateCacheWithHead layerIndex headIndex stepIndex headSlice cache = do
   MV.copy (MV.slice cacheOffset headDim cache) headSlice
 
 -- QKV projection
-computeQKV :: TransformerParams -> StepCount -> LayerIndex -> TokenVector -> TransformerResult ()
+computeQKV :: TransformerParams -> StepCount -> LayerIndex -> TokenVector -> TransformerResult (V.Vector Float)
 computeQKV params currentStep layerIndex (TokenVector inputToken) = do
   network <- ask
   AttentionKV {queryOutput, keyOutput, valueOutput, keyCache, valueCache} <- gets id
@@ -312,6 +312,8 @@ computeQKV params currentStep layerIndex (TokenVector inputToken) = do
         valueHeadSlice = MV.slice (headIndex * headDim) headDim valueOutput
     updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep keyHeadSlice keyCache
     updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep valueHeadSlice valueCache
+
+  V.freeze queryOutput
 
 -- classifier logits for a given token vector
 transformerLogits :: V.Vector Float -> TransformerResult (V.Vector Float)

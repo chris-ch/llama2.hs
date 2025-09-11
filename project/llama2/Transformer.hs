@@ -21,7 +21,6 @@ import Architecture (transformerLogits, computeQKV,
 createLayerToken :: StepCount -> LayerIndex -> TokenVector -> TransformerResult TokenVector
 createLayerToken currentStep layerIndex inputToken = do
   network <- ask
-  AttentionKV {queryOutput} <- gets id
   let model = params network
       LayerIndex layerIdx = layerIndex
       outputProjectionWeights = getArray2D layerIdx (wo model)
@@ -31,10 +30,9 @@ createLayerToken currentStep layerIndex inputToken = do
       mha = multiHeadAttention layer
       ffn = feedforwardNetwork layer
   
-  computeQKV model currentStep layerIndex inputToken
+  queryOutFrozen <- computeQKV model currentStep layerIndex inputToken
 
   -- Compute multi-head attention and copy it into buffer
-  queryOutFrozen <- liftIO $ V.freeze queryOutput
   multiHeadOut <- runAttention mha layerIndex queryOutFrozen currentStep
   let attentionDelta = matrixVectorMult outputProjectionWeights multiHeadOut
   
