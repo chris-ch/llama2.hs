@@ -1,6 +1,6 @@
 module Transformer (generateTokens) where
 
-import Control.Monad (foldM)
+import Control.Monad (foldM, forM_)
 import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask))
 import Control.Monad.State (gets)
 import qualified Data.ByteString.Lazy as BS
@@ -8,10 +8,12 @@ import qualified Data.ByteString.Lazy.Char8 as BSC
 import qualified Data.Vector.Unboxed as V
 import GHC.Unicode (isSpace)
 import System.IO (hFlush, stdout)
-import Types (AttentionKV (..), StepCount (..), LayerIndex(..), Token, TokenVector(..), PromptTokens, Vocabulary, getArray2D)
+import qualified Data.Vector.Unboxed.Mutable as MV
+import Types (AttentionKV (..), StepCount (..), LayerIndex(..), Token, TokenVector(..), PromptTokens, Vocabulary, getArray2D, HeadIndex(..), MVectorFloat)
 import Primitives (drawSample, softmax, matrixVectorMult)
-import Architecture (transformerLogits, computeQKV,
- TransformerResult, NetworkConfig (..), TransformerParams(..), TransformerDecoder (..), embed, TransformerLayer (..), runFeedForward, runAttention)
+import Architecture (transformerLogits, computeQKV, TransformerResult, NetworkConfig (..), TransformerParams(..), TransformerDecoder (..), embed, TransformerLayer (..), runFeedForward, runAttention, cacheIndex)
+
+
 --------------------------------------------------------------------------------
 -- Transformer runtime
 --------------------------------------------------------------------------------
@@ -21,6 +23,7 @@ import Architecture (transformerLogits, computeQKV,
 createLayerToken :: StepCount -> LayerIndex -> TokenVector -> TransformerResult TokenVector
 createLayerToken currentStep layerIndex inputToken = do
   network <- ask
+  AttentionKV {keyCache, valueCache} <- gets id
   let model = params network
       LayerIndex layerIdx = layerIndex
       outputProjectionWeights = getArray2D layerIdx (wo model)
@@ -29,8 +32,17 @@ createLayerToken currentStep layerIndex inputToken = do
       layer = modelLayers dec !! li
       mha = multiHeadAttention layer
       ffn = feedforwardNetwork layer
+      numHeads = numAttentionHeads network
+      headDim = headDimension network
   
-  queryOutFrozen <- computeQKV model currentStep layerIndex inputToken
+  (queryOutFrozen, keyOutputFrozen, valueOutputFrozen) <- computeQKV model currentStep layerIndex inputToken
+
+  forM_ [0 .. numHeads - 1] $ \headIndex -> do
+    -- Update cache with slices from keyOutput and valueOutput
+    let keyHeadSlice = V.slice (headIndex * headDim) headDim keyOutputFrozen
+        valueHeadSlice = V.slice (headIndex * headDim) headDim valueOutputFrozen
+    updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep keyHeadSlice keyCache
+    updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep valueHeadSlice valueCache
 
   -- Compute multi-head attention and copy it into buffer
   multiHeadOut <- runAttention mha layerIndex queryOutFrozen currentStep
@@ -43,6 +55,15 @@ createLayerToken currentStep layerIndex inputToken = do
   ffnOut <- runFeedForward ffn tokenAfterAttention
   return $ TokenVector $ V.zipWith (+) tokenAfterAttention ffnOut
   
+-- Multi-head
+updateCacheWithHead :: LayerIndex -> HeadIndex -> StepCount -> V.Vector Float -> MVectorFloat -> TransformerResult ()
+updateCacheWithHead layerIndex headIndex stepIndex headSlice cache = do
+  network <- ask
+  let headDim = headDimension network
+      cacheOffset = cacheIndex network stepIndex layerIndex headIndex 0
+  hsm <- V.thaw headSlice
+  MV.copy (MV.slice cacheOffset headDim cache) hsm
+
 -- Transformer step
 transformer :: Token -> StepCount -> TransformerResult (V.Vector Float)
 transformer tokenCode stepCount = do

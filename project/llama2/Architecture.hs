@@ -9,7 +9,7 @@ module Architecture
     TransformerParams(..),
     transformerLogits, computeQKV, TransformerResult
     , NetworkConfig (..)
-    , embed, runFeedForward, runAttention
+    , embed, runFeedForward, runAttention, cacheIndex
   ) where
 
 import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT)
@@ -26,7 +26,7 @@ import Types
       Token,
       TokenVector(..),
       StepCount(..),
-      LayerIndex(..), Array3D, MVectorFloat, HeadIndex (..), getRow )
+      LayerIndex(..), Array3D, HeadIndex (..), getRow )
 import Primitives
     (
       softmax, rmsNorm, sigmoidLinearUnit, applyRotaryPositionEncoding, matrixVectorMult )
@@ -250,20 +250,12 @@ computeScores network layerIndex headIndex (StepCount step) headDim kVec qHead =
         in dotProd / scaling
   in V.generate sequenceLength scoreForPos
 
--- Multi-head
-updateCacheWithHead :: LayerIndex -> HeadIndex -> StepCount -> MVectorFloat -> MVectorFloat -> TransformerResult ()
-updateCacheWithHead layerIndex headIndex stepIndex headSlice cache = do
-  network <- ask
-  let headDim = headDimension network
-      cacheOffset = cacheIndex network stepIndex layerIndex headIndex 0
-  MV.copy (MV.slice cacheOffset headDim cache) headSlice
-
 -- QKV projection
-computeQKV :: TransformerParams -> StepCount -> LayerIndex -> TokenVector -> TransformerResult (V.Vector Float)
+computeQKV :: TransformerParams -> StepCount -> LayerIndex -> TokenVector -> TransformerResult (V.Vector Float, V.Vector Float, V.Vector Float)
 computeQKV params currentStep layerIndex (TokenVector inputToken) = do
   network <- ask
-  AttentionKV {queryOutput, keyOutput, valueOutput, keyCache, valueCache} <- gets id
-  let headDim = headDimension network
+  AttentionKV {queryOutput, keyOutput, valueOutput} <- gets id
+  let 
       numHeads = numAttentionHeads network
       LayerIndex layerIdx = layerIndex
       normalizedInput = rmsNorm inputToken (getRow layerIdx (rmsAttWeight params))
@@ -304,16 +296,10 @@ computeQKV params currentStep layerIndex (TokenVector inputToken) = do
         MV.copy queryOutput rotatedQueryMutable
         MV.copy keyOutput rotatedKeyMutable
 
-  -- We need all rotations applied before updating cache
-
-  forM_ [0 .. numHeads - 1] $ \headIndex -> do
-    -- Update cache with slices from keyOutput and valueOutput
-    let keyHeadSlice = MV.slice (headIndex * headDim) headDim keyOutput
-        valueHeadSlice = MV.slice (headIndex * headDim) headDim valueOutput
-    updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep keyHeadSlice keyCache
-    updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep valueHeadSlice valueCache
-
-  V.freeze queryOutput
+  fqo <- V.freeze queryOutput
+  fko <- V.freeze keyOutput
+  fvo <- V.freeze valueOutput
+  return (fqo, fko, fvo)
 
 -- classifier logits for a given token vector
 transformerLogits :: V.Vector Float -> TransformerResult (V.Vector Float)
