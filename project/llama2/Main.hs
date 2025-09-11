@@ -108,7 +108,8 @@ parseNetworkConfigFile = do
                        mWk = getArray2D i wk',
                        mWv = getArray2D i wv',
                        mWo = getArray2D i wo',
-                       mRMSAtt = getRow i rmsAttWeight'
+                       mRMSAtt = getRow i rmsAttWeight',
+                       mRotary = rotary
                      },
                    feedforwardNetwork = FeedForwardNetwork
                      { fW1 = getArray2D i w1',
