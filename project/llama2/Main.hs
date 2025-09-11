@@ -14,8 +14,13 @@ import qualified Data.Vector.Unboxed.Mutable as MV
 import qualified Options.Applicative as OA
 import Text.Printf (printf)
 import Transformer (generateTokens)
-import Types (AttentionKV (..), PromptTokens, StepCount (..), Token, Vocabulary, VocabularyScores, readArray2D, readArray3D, readVector, getArray2D, getRow)
-import Architecture (NetworkConfig (..), TransformerParams (..), Embedding (..), RotaryEncoding (..), TransformerLayer (..), MultiHeadAttention (..), FeedForwardNetwork (..), TransformerDecoder (..))
+import Types (AttentionKV (..), PromptTokens, StepCount (..), Token, Vocabulary, VocabularyScores,
+  readArray2D, readArray3D, readVector, getArray2D, getRow, Array2D, Array3D)
+import Architecture (NetworkConfig (..),
+  EmbeddingComponent (..),
+  RotaryEncodingComponent (..), TransformerLayerComponent (..), 
+  MultiHeadAttentionComponent (..), 
+  FeedForwardNetworkComponent (..), TransformerDecoderComponent (..))
 
 --------------------------------------------------------------------------------
 -- Options
@@ -61,49 +66,35 @@ parseNetworkConfigFile = do
   vocabSize' <- fromIntegral <$> getInt32le
   seqLen' <- fromIntegral <$> getInt32le
   tokenEmbeddingTable' <- readArray2D vocabSize' modelDim'
-  rmsAttWeight' <- readArray2D nLayers' modelDim'
-  wq' <- readArray3D nLayers' modelDim' modelDim'
-  wk' <- readArray3D nLayers' modelDim' modelDim'
-  wv' <- readArray3D nLayers' modelDim' modelDim'
-  wo' <- readArray3D nLayers' modelDim' modelDim'
-  rmsFfnWeight' <- readArray2D nLayers' modelDim'
-  w1' <- readArray3D nLayers' hiddenDim' modelDim'
-  w2' <- readArray3D nLayers' modelDim' hiddenDim'
-  w3' <- readArray3D nLayers' hiddenDim' modelDim'
+  rmsAttWeight' <- readArray2D nLayers' modelDim' :: BG.Get Array2D
+  wq' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
+  wk' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
+  wv' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
+  wo' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
+  rmsFfnWeight' <- readArray2D nLayers' modelDim' :: BG.Get Array2D
+  w1' <- readArray3D nLayers' hiddenDim' modelDim' :: BG.Get Array3D
+  w2' <- readArray3D nLayers' modelDim' hiddenDim' :: BG.Get Array3D
+  w3' <- readArray3D nLayers' hiddenDim' modelDim' :: BG.Get Array3D
   rmsFinalWeight' <- readVector modelDim'
   freqCisReal' <- readArray2D seqLen' ((modelDim' `div` numAttentionHeads') `div` 2)
   freqCisImag' <- readArray2D seqLen' ((modelDim' `div` numAttentionHeads') `div` 2)
 
-  let headDim = modelDim' `div` numAttentionHeads'
-      model =
-        TransformerParams
-          { tokenEmbeddingTable = tokenEmbeddingTable',
-            rmsAttWeight = rmsAttWeight',
-            wq = wq',
-            wk = wk',
-            wv = wv',
-            wo = wo',
-            rmsFfnWeight = rmsFfnWeight',
-            w1 = w1',
-            w2 = w2',
-            w3 = w3',
-            rmsFinalWeight = rmsFinalWeight',
-            freqCisReal = freqCisReal',
-            freqCisImag = freqCisImag'
-          }
+  let
+      headDim = modelDim' `div` numAttentionHeads'
       -- Construct the Embedding
-      embedding = Embedding
-        { vocabulary = tokenEmbeddingTable'
+      embedding = EmbeddingComponent
+        { vocabulary = tokenEmbeddingTable',
+          rmsFinalWeight = rmsFinalWeight'
         }
       -- Construct the RotaryEncoding
-      rotary = RotaryEncoding
+      rotary = RotaryEncodingComponent
         { freqCos = freqCisReal',
           freqSin = freqCisImag'
         }
       -- Construct the list of TransformerLayers
-      layers = [ TransformerLayer
+      layers = [ TransformerLayerComponent
                  {
-                   multiHeadAttention = MultiHeadAttention
+                   multiHeadAttention = MultiHeadAttentionComponent
                      { mWq = getArray2D i wq',
                        mWk = getArray2D i wk',
                        mWv = getArray2D i wv',
@@ -111,7 +102,7 @@ parseNetworkConfigFile = do
                        mRMSAtt = getRow i rmsAttWeight',
                        mRotary = rotary
                      },
-                   feedforwardNetwork = FeedForwardNetwork
+                   feedforwardNetwork = FeedForwardNetworkComponent
                      { fW1 = getArray2D i w1',
                        fW2 = getArray2D i w2',
                        fW3 = getArray2D i w3',
@@ -121,7 +112,7 @@ parseNetworkConfigFile = do
                | i <- [0 .. nLayers' - 1]
                ]
       -- Construct the TransformerArchitecture
-      decoder = TransformerDecoder
+      decoder = TransformerDecoderComponent
         { modelEmbedding = embedding,
           modelRotary = rotary,
           modelLayers = layers
@@ -136,7 +127,6 @@ parseNetworkConfigFile = do
         vocabSize = abs vocabSize',
         seqLen = seqLen',
         headDimension = headDim,
-        params = model,
         decoder = decoder
       }
 
