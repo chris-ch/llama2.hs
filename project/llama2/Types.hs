@@ -1,3 +1,4 @@
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module Types
   ( 
     AttentionKV (..),
@@ -8,7 +9,7 @@ module Types
     Vocabulary,
     VocabularyScores,
     PromptTokens,
-    Token,
+    Token(..),
     MVectorFloat,
     Array2D(..),
     Array3D(..),
@@ -47,7 +48,7 @@ type Vocabulary = [BS.ByteString]
 
 type VocabularyScores = [Float]
 
-type Token = Int32
+newtype Token = Token Int32 deriving (Show, Eq, Ord, Num)
 
 type PromptTokens = [Token]
 

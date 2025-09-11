@@ -1,4 +1,3 @@
-{-# LANGUAGE FlexibleContexts #-}
 module Architecture
   ( EmbeddingComponent (..),
     RotaryEncodingComponent (..),
@@ -21,7 +20,7 @@ import Types
     (
       Array2D(items2D, ncols, nrows),
       AttentionKV(..),
-      Token,
+      Token (..),
       TokenVector(..),
       StepCount(..),
       LayerIndex(..), HeadIndex (..), getRow, MVectorFloat )
@@ -30,7 +29,7 @@ import Primitives
       softmax, rmsNorm, sigmoidLinearUnit, applyRotaryPositionEncoding, matrixVectorMult )
 import Data.List (foldl')
 
--- Data definitions mirroring architecture boxes
+-- Data definitions mirroring architectural components (static aspect)
 data EmbeddingComponent = EmbeddingComponent
   { vocabulary :: Array2D,
     rmsFinalWeight :: V.Vector Float
@@ -69,6 +68,7 @@ data TransformerDecoderComponent = TransformerDecoderComponent
     modelLayers :: [TransformerLayerComponent]
   } deriving (Show)
 
+-- Type classes for components behaviour (dynamic aspect)
 class Embedding e where
   embed :: e -> Token -> TransformerResult TokenVector
 
@@ -80,12 +80,12 @@ class FeedForwarding f where
 
 class Attending a where
   runAttention :: a -> LayerIndex -> TokenVector -> StepCount -> TransformerResult TokenVector
-  runAttention' :: a -> LayerIndex -> TokenVector -> StepCount -> TransformerResult TokenVector
   computeQKV :: a -> StepCount -> TokenVector -> TransformerResult (TokenVector, TokenVector, TokenVector)
 
 class TransformerProcessing m where
   runModel :: m -> Token -> StepCount -> TransformerResult TokenVector
 
+-- Instancations for behaviour implementation
 instance TransformerProcessing TransformerDecoderComponent where
   runModel :: TransformerDecoderComponent -> Token -> StepCount -> TransformerResult TokenVector
   runModel dec tokenCode stepCount = do
@@ -125,8 +125,11 @@ instance Attending MultiHeadAttentionComponent where
       updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep keyHeadSlice keyCache
       updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep valueHeadSlice valueCache
 
-    -- Compute multi-head attention and copy it into buffer
-    TokenVector multiHeadOut <- runAttention' mha layerIndex (TokenVector queryOutput) currentStep
+    -- Compute multi-head attention
+    let headsQ = [ V.slice (i * headDim) headDim queryOutput | i <- [0 .. numHeads - 1] ]
+    headOutputs <- mapM (\i -> headAttention layerIndex (HeadIndex i) currentStep (headsQ !! i)) [0 .. numHeads - 1]
+    let multiHeadOut = V.concat headOutputs
+
     let attentionDelta = matrixVectorMult outputProjectionWeights multiHeadOut
 
     let TokenVector tokenVector = inputToken
@@ -135,20 +138,6 @@ instance Attending MultiHeadAttentionComponent where
     -- Apply FFN
     ffnOut <- runFeedForward ffn tokenAfterAttention
     return $ TokenVector $ V.zipWith (+) tokenAfterAttention ffnOut
-
-  runAttention' :: MultiHeadAttentionComponent -> LayerIndex -> TokenVector -> StepCount -> TransformerResult TokenVector
-  runAttention' mha layerIndex inputToken currentStep = do
-    network <- ask
-    let numHeads = numAttentionHeads network
-        headDim  = headDimension network
-        TokenVector token = inputToken
-
-    let headsQ = [ V.slice (i * headDim) headDim token | i <- [0 .. numHeads - 1] ]
-
-    headOutputs <- mapM (\i -> headAttention layerIndex (HeadIndex i) currentStep (headsQ !! i)) [0 .. numHeads - 1]
-    let concatenated = V.concat headOutputs
-
-    return $ TokenVector concatenated
 
   -- QKV projection
   computeQKV :: MultiHeadAttentionComponent -> StepCount -> TokenVector -> TransformerResult (TokenVector, TokenVector, TokenVector)
@@ -176,10 +165,9 @@ instance Attending MultiHeadAttentionComponent where
 
     return (TokenVector rotatedQuery, TokenVector rotatedKey, TokenVector valueVec)
 
-
 instance Embedding EmbeddingComponent where
   embed :: EmbeddingComponent -> Token -> TransformerResult TokenVector
-  embed embedding tokenCode = do
+  embed embedding (Token tokenCode) = do
     let
       vocab = vocabulary embedding
       rowStart = fromIntegral tokenCode * ncols vocab

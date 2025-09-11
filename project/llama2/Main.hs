@@ -14,7 +14,7 @@ import qualified Data.Vector.Unboxed.Mutable as MV
 import qualified Options.Applicative as OA
 import Text.Printf (printf)
 import Transformer (generateTokens)
-import Types (AttentionKV (..), PromptTokens, StepCount (..), Token, Vocabulary, VocabularyScores,
+import Types (AttentionKV (..), PromptTokens, StepCount (..), Token (..), Vocabulary, VocabularyScores,
   readArray2D, readArray3D, readVector, getArray2D, getRow, Array2D, Array3D)
 import Architecture (NetworkConfig (..),
   EmbeddingComponent (..),
@@ -173,7 +173,7 @@ applyBPEMerges tokens vocab vocabScores = case findBestPair tokens of
     findBestPair tokens' = foldr checkPair Nothing (zip [0 ..] (zip tokens' (drop 1 tokens')))
       where
         checkPair :: (Int, (Token, Token)) -> Maybe (Int, Token) -> Maybe (Int, Token)
-        checkPair (count, (tokenPrev, tokenNext)) acc =
+        checkPair (count, (Token tokenPrev, Token tokenNext)) acc =
           case strLookup ((vocab !! fromIntegral tokenPrev) `BS.append` (vocab !! fromIntegral tokenNext)) vocab of
             pos | pos /= -1 && vocabScores !! pos > bestScore -> Just (count, fromIntegral pos)
             _ -> acc

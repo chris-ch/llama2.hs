@@ -6,7 +6,7 @@ import qualified Data.ByteString.Lazy.Char8 as BSC
 import qualified Data.Vector.Unboxed as V
 import GHC.Unicode (isSpace)
 import System.IO (hFlush, stdout)
-import Types (StepCount (..), Token, TokenVector(..), PromptTokens, Vocabulary)
+import Types (StepCount (..), Token (..), TokenVector(..), PromptTokens, Vocabulary)
 import Primitives (drawSample, softmax)
 import Architecture (transformerLogits, TransformerResult, NetworkConfig (..), runModel)
 
@@ -30,7 +30,7 @@ generateNextToken timestep promptTokens temperature vocab tokenCode seedValue = 
   network <- ask
   logits <- transformer tokenCode timestep
   let StepCount step = timestep
-  nextToken <-
+  Token nextToken <-
     if step < length promptTokens
       then return (promptTokens !! step)
       else
@@ -44,7 +44,7 @@ generateNextToken timestep promptTokens temperature vocab tokenCode seedValue = 
         if tokenCode == 1 && isSpace firstChar
           then BSC.tail (vocab !! fromIntegral nextToken)
           else vocab !! fromIntegral nextToken
-  return (tokenStr, nextToken)
+  return (tokenStr, Token nextToken)
 
 generateTokens :: StepCount -> PromptTokens -> Float -> Vocabulary -> Int -> TransformerResult ([BS.ByteString], StepCount)
 generateTokens maxSteps promptTokens temperature vocab seedValue = do
