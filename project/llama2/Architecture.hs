@@ -258,11 +258,8 @@ computeQKV params currentStep layerIndex (TokenVector inputToken) = do
       LayerIndex layerIdx = layerIndex
       normalizedInput = rmsNorm inputToken (getRow layerIdx (rmsAttWeight params))
       dec = decoder network
-      rotary = modelRotary dec
-      cosValues = freqCos rotary
-      sinValues = freqSin rotary
-      rotaryEncoding = RotaryEncoding { freqCos = cosValues, freqSin = sinValues }
-
+      rotaryEncoding = modelRotary dec
+      
   -- Compute initial query, key, and value vectors
   let queryVec = matrixVectorMult (getArray2D layerIdx (wq params)) normalizedInput
       keyVec = matrixVectorMult (getArray2D layerIdx (wk params)) normalizedInput
