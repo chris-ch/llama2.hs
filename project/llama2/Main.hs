@@ -15,12 +15,15 @@ import qualified Options.Applicative as OA
 import Text.Printf (printf)
 import Transformer (generateTokens)
 import Types (AttentionKV (..), PromptTokens, StepCount (..), Token (..), Vocabulary, VocabularyScores,
-  readArray2D, readArray3D, readVector, getArray2D, getRow, Array2D, Array3D)
+  readArray2D, readArray3D, readVector, getArray2D, getRow, Array2D (..), Array3D (..))
 import Architecture (NetworkConfig (..),
   EmbeddingComponent (..),
   RotaryEncodingComponent (..), TransformerLayerComponent (..), 
   MultiHeadAttentionComponent (..), 
-  FeedForwardNetworkComponent (..), TransformerDecoderComponent (..))
+  FeedForwardNetworkComponent (..), TransformerDecoderComponent (..),
+  SingleHeadComponent (..),
+  )
+import qualified Data.Vector.Unboxed as V
 
 --------------------------------------------------------------------------------
 -- Options
@@ -92,25 +95,29 @@ parseNetworkConfigFile = do
           freqSin = freqCisImag'
         }
       -- Construct the list of TransformerLayers
-      layers = [ TransformerLayerComponent
-                 {
-                   multiHeadAttention = MultiHeadAttentionComponent
-                     { mWq = getArray2D i wq',
-                       mWk = getArray2D i wk',
-                       mWv = getArray2D i wv',
-                       mWo = getArray2D i wo',
-                       mRMSAtt = getRow i rmsAttWeight',
-                       mRotary = rotary
-                     },
-                   feedforwardNetwork = FeedForwardNetworkComponent
-                     { fW1 = getArray2D i w1',
-                       fW2 = getArray2D i w2',
-                       fW3 = getArray2D i w3',
-                       fRMSFfn = getRow i rmsFfnWeight'
+      layers = 
+        [ TransformerLayerComponent
+            { multiHeadAttention = MultiHeadAttentionComponent
+                { heads = [ SingleHeadComponent
+                              { wqHead = getHeadArray2D layerIdx headIdx headDim wq'
+                              , wkHead = getHeadArray2D layerIdx headIdx headDim wk'
+                              , wvHead = getHeadArray2D layerIdx headIdx headDim wv'
+                              , rotary = rotary
+                              }
+                          | headIdx <- [0..numAttentionHeads' - 1]
+                          ]
+                , mWo     = getArray2D layerIdx wo'
+                , rmsAtt = getRow layerIdx rmsAttWeight'
+                }, 
+            feedforwardNetwork = FeedForwardNetworkComponent
+                     { fW1 = getArray2D layerIdx w1',
+                       fW2 = getArray2D layerIdx w2',
+                       fW3 = getArray2D layerIdx w3',
+                       fRMSFfn = getRow layerIdx rmsFfnWeight'
                      }
-                 }
-               | i <- [0 .. nLayers' - 1]
-               ]
+            }
+        | layerIdx <- [0..nLayers' - 1]
+        ]
       -- Construct the TransformerArchitecture
       decoder = TransformerDecoderComponent
         { modelEmbedding = embedding,
@@ -128,6 +135,29 @@ parseNetworkConfigFile = do
         headDimension = headDim,
         decoder = decoder
       }
+
+-- | Extract the weight matrix for one head of one layer
+--   layerIdx ∈ [0..sizeX-1]
+--   headIdx  ∈ [0..numHeads-1]
+--   headDim  = rowsPerHead
+getHeadArray2D :: Int      -- ^ layer index
+               -> Int      -- ^ head index
+               -> Int      -- ^ headDim (rows per head)
+               -> Array3D  -- ^ the big 3D tensor (layers × rows × cols)
+               -> Array2D  -- ^ the resulting (headDim × ncols) matrix
+getHeadArray2D layerIdx headIdx headDim (Array3D vec _ sizeY sizeZ) =
+  let
+    -- sizeY is the total number of rows = numHeads * headDim
+    ncols    = sizeZ
+    startRow = headIdx * headDim
+    -- Offset to this layer’s slice:
+    layerOffset = layerIdx * sizeY * sizeZ
+    -- Grab each row belonging to this head:
+    newItems = V.concat
+      [ V.slice (layerOffset + (row * ncols)) ncols vec
+      | row <- [startRow .. startRow + headDim - 1]
+      ]
+  in Array2D { items2D = newItems, nrows = headDim, ncols = ncols }
 
 initModel :: BS.ByteString -> NetworkConfig
 initModel = BG.runGet parseNetworkConfigFile

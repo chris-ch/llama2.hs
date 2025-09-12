@@ -5,6 +5,7 @@ module Architecture
     FeedForwardNetworkComponent (..),
     TransformerLayerComponent (..),
     TransformerDecoderComponent (..),
+    SingleHeadComponent (..),
     transformerLogits, TransformerResult
     , NetworkConfig (..)
     , embed, runModel
@@ -12,7 +13,7 @@ module Architecture
 
 import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT)
 import Control.Monad.State (StateT, gets)
-import Control.Monad ( foldM, foldM, forM_)
+import Control.Monad ( foldM, foldM, forM_, forM)
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as MV
 
@@ -26,7 +27,7 @@ import Types
       LayerIndex(..), HeadIndex (..), getRow, MVectorFloat )
 import Primitives
     (
-      softmax, rmsNorm, sigmoidLinearUnit, applyRotaryPositionEncoding, matrixVectorMult )
+      softmax, rmsNorm, sigmoidLinearUnit, matrixVectorMult )
 import Data.List (foldl')
 
 -- Data definitions mirroring architectural components (static aspect)
@@ -40,13 +41,17 @@ data RotaryEncodingComponent = RotaryEncodingComponent
     freqSin :: Array2D
   } deriving (Show)
 
+data SingleHeadComponent = SingleHeadComponent
+  { wqHead :: Array2D    -- size headDim x modelDim
+  , wkHead :: Array2D
+  , wvHead :: Array2D
+  , rotary :: RotaryEncodingComponent
+  } deriving (Show)
+
 data MultiHeadAttentionComponent = MultiHeadAttentionComponent
-  { mWq     :: Array2D            -- Q projection
-  , mWk     :: Array2D            -- K projection
-  , mWv     :: Array2D            -- V projection
-  , mWo     :: Array2D            -- Output projection
-  , mRMSAtt :: V.Vector Float     -- RMS normalization for input
-  , mRotary  :: RotaryEncodingComponent     -- Rotary embeddings for attention
+  { heads    :: [SingleHeadComponent]
+  , mWo      :: Array2D         -- Output projection matrix
+  , rmsAtt   :: V.Vector Float  -- RMSNorm before QKV projection
   } deriving (Show)
 
 data FeedForwardNetworkComponent = FeedForwardNetworkComponent
@@ -67,164 +72,169 @@ data TransformerDecoderComponent = TransformerDecoderComponent
     modelLayers :: [TransformerLayerComponent]
   } deriving (Show)
 
--- Type classes for components behaviour (dynamic aspect)
-class Embedding e where
-  embed :: e -> Token -> TransformerResult TokenVector
+runModel :: TransformerDecoderComponent -> Token -> StepCount -> TransformerResult TokenVector
+runModel dec tokenCode stepCount = do
+  let
+    embeddingLayer = modelEmbedding dec
+    layers = modelLayers dec
+  tokenVector <- embed embeddingLayer tokenCode
+  foldM
+      (\accToken layerIndex -> do
+        let layer = layers !! layerIndex
+        let mha = multiHeadAttention layer
+        runAttention mha (LayerIndex layerIndex) accToken stepCount
+      )
+      tokenVector
+      [0 .. length layers - 1]
 
-class RotaryEncoding r where
-  applyRotary :: r -> StepCount -> HeadIndex -> V.Vector Float -> TransformerResult (V.Vector Float)
+runAttention :: MultiHeadAttentionComponent -> LayerIndex -> TokenVector -> StepCount -> TransformerResult TokenVector
+runAttention mha layerIndex inputToken currentStep = do
+  network <- ask
+  let dec = decoder network
+      LayerIndex li = layerIndex
+      layer = modelLayers dec !! li
+      ffn = feedforwardNetwork layer
+      outputProjectionWeights = mWo mha
+      numHeads = numAttentionHeads network
 
-class FeedForwarding f where
-  runFeedForward :: f -> V.Vector Float -> TransformerResult (V.Vector Float)
+  (TokenVector queryOutput, TokenVector keyOutput, TokenVector valueOutput) <- computeQKV mha currentStep inputToken
 
-class Attending a where
-  runAttention :: a -> LayerIndex -> TokenVector -> StepCount -> TransformerResult TokenVector
-  computeQKV :: a -> StepCount -> TokenVector -> TransformerResult (TokenVector, TokenVector, TokenVector)
-  applyRotaryToQK :: a -> LayerIndex -> TokenVector -> TokenVector -> StepCount -> TransformerResult ()
-  attentionHeads :: a -> LayerIndex -> TokenVector -> StepCount -> TransformerResult [TokenVector]
-  combineHeads :: a -> [TokenVector] -> TransformerResult (V.Vector Float)
+  forM_ [0 .. numHeads - 1] $ \headIndex -> do
+    applyRotaryToQK layerIndex (HeadIndex headIndex) (TokenVector keyOutput) (TokenVector valueOutput) currentStep
 
-class TransformerProcessing m where
-  runModel :: m -> Token -> StepCount -> TransformerResult TokenVector
+  headOutputs <- mapM (\i -> attentionHeads layerIndex (HeadIndex i) (TokenVector queryOutput) currentStep) [0 .. numHeads - 1]
 
--- Instancations for behaviour implementation
-instance TransformerProcessing TransformerDecoderComponent where
-  runModel :: TransformerDecoderComponent -> Token -> StepCount -> TransformerResult TokenVector
-  runModel dec tokenCode stepCount = do
-    let
-      embeddingLayer = modelEmbedding dec
-      layers = modelLayers dec
-    tokenVector <- embed embeddingLayer tokenCode
-    foldM
-        (\accToken layerIndex -> do
-          let layer = layers !! layerIndex
-          let mha = multiHeadAttention layer
-          runAttention mha (LayerIndex layerIndex) accToken stepCount
-        )
-        tokenVector
-        [0 .. length layers - 1]
+  multiHeadOut <- combineHeads headOutputs
 
-instance Attending MultiHeadAttentionComponent where
+  let attentionDelta = matrixVectorMult outputProjectionWeights multiHeadOut
 
-  runAttention :: MultiHeadAttentionComponent -> LayerIndex -> TokenVector -> StepCount -> TransformerResult TokenVector
-  runAttention mha layerIndex inputToken currentStep = do
-    network <- ask
-    let dec = decoder network
-        LayerIndex li = layerIndex
-        layer = modelLayers dec !! li
-        ffn = feedforwardNetwork layer
-        outputProjectionWeights = mWo mha
+  let TokenVector tokenVector = inputToken
+      tokenAfterAttention = V.zipWith (+) tokenVector attentionDelta
 
-    (TokenVector queryOutput, TokenVector keyOutput, TokenVector valueOutput) <- computeQKV mha currentStep inputToken
+  -- Apply FFN
+  ffnOut <- runFeedForward ffn tokenAfterAttention
+  return $ TokenVector $ V.zipWith (+) tokenAfterAttention ffnOut
 
-    applyRotaryToQK mha layerIndex (TokenVector keyOutput) (TokenVector valueOutput) currentStep
+-- QKV projection
+computeQKV :: MultiHeadAttentionComponent
+  -> StepCount
+  -> TokenVector
+  -> TransformerResult (TokenVector, TokenVector, TokenVector)
+computeQKV mha step (TokenVector inputToken) = do
+  let rmsWeights = rmsAtt mha
+      normalizedInput = rmsNorm inputToken rmsWeights
+  qHeads <- forM (heads mha) $ \headComp -> do
+    (q,k,v) <- runSingleHeadQKV headComp normalizedInput
+    (q',k') <- applyRotaryToHead headComp step (q,k)
+    return (q',k',v)
 
-    headOutputs <- attentionHeads mha layerIndex (TokenVector queryOutput) currentStep
+  -- split out q, k, v from list of tuples
+  let (qList, kList, vList) = unzip3 qHeads
+  return (TokenVector (V.concat qList),
+          TokenVector (V.concat kList),
+          TokenVector (V.concat vList))
 
-    multiHeadOut <- combineHeads mha headOutputs
+applyRotaryToQK :: LayerIndex -> HeadIndex -> TokenVector -> TokenVector -> StepCount -> TransformerResult ()
+applyRotaryToQK layerIndex (HeadIndex headIndex) (TokenVector keyOutput) (TokenVector valueOutput) currentStep = do
+  network <- ask
+  AttentionKV {keyCache, valueCache} <- gets id
+  let
+      headDim = headDimension network
+      
+  -- Update cache with slices from keyOutput and valueOutput
+  let keyHeadSlice = V.slice (headIndex * headDim) headDim keyOutput
+      valueHeadSlice = V.slice (headIndex * headDim) headDim valueOutput
+  updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep keyHeadSlice keyCache
+  updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep valueHeadSlice valueCache
 
-    let attentionDelta = matrixVectorMult outputProjectionWeights multiHeadOut
+attentionHeads :: LayerIndex -> HeadIndex -> TokenVector -> StepCount -> TransformerResult TokenVector
+attentionHeads layerIndex (HeadIndex headIndex) (TokenVector queryOutput) currentStep = do
+  network <- ask
+  let
+      numHeads = numAttentionHeads network
+      headDim = headDimension network
 
-    let TokenVector tokenVector = inputToken
-        tokenAfterAttention = V.zipWith (+) tokenVector attentionDelta
+  -- Compute multi-head attention
+  let headsQ = [ V.slice (i * headDim) headDim queryOutput | i <- [0 .. numHeads - 1] ]
+  headAttention layerIndex (HeadIndex headIndex) currentStep (headsQ !! headIndex)
 
-    -- Apply FFN
-    ffnOut <- runFeedForward ffn tokenAfterAttention
-    return $ TokenVector $ V.zipWith (+) tokenAfterAttention ffnOut
+combineHeads :: [TokenVector] -> TransformerResult (V.Vector Float)
+combineHeads headOutputs =  do
+  return $ V.concat headOutputsVecs where
+      headOutputsVecs = [v | TokenVector v <- headOutputs]
 
-  -- QKV projection
-  computeQKV :: MultiHeadAttentionComponent -> StepCount -> TokenVector -> TransformerResult (TokenVector, TokenVector, TokenVector)
-  computeQKV mha currentStep (TokenVector inputToken) = do
-    network <- ask
-    let
-        numHeads = numAttentionHeads network
-        normalizedInput = rmsNorm inputToken (mRMSAtt mha)
-        rotaryEncoding = mRotary mha
+runSingleHeadQKV :: SingleHeadComponent
+  -> V.Vector Float  -- normalized input (modelDim)
+  -> TransformerResult (V.Vector Float, V.Vector Float, V.Vector Float)
+runSingleHeadQKV headComp normalizedInput = do
+  let q = matrixVectorMult (wqHead headComp) normalizedInput
+      k = matrixVectorMult (wkHead headComp) normalizedInput
+      v = matrixVectorMult (wvHead headComp) normalizedInput
+  return (q, k, v)
 
-    -- Compute initial query, key, and value vectors (unchanged from original)
-    let queryVec = matrixVectorMult (mWq mha) normalizedInput
-        keyVec = matrixVectorMult (mWk mha) normalizedInput
-        valueVec = matrixVectorMult (mWv mha) normalizedInput
+applyRotaryToHead :: SingleHeadComponent
+  -> StepCount
+  -> (V.Vector Float, V.Vector Float)
+  -> TransformerResult (V.Vector Float, V.Vector Float)
+applyRotaryToHead headComp step (q, k) = do
+  let rot = rotary headComp
+  q' <- applyRotary rot step (HeadIndex 0) q
+  k' <- applyRotary rot step (HeadIndex 0) k
+  return (q',k')
 
-    -- Keep the original rotary encoding logic exactly as it was
-    (rotatedQuery, rotatedKey) <- foldM
-      (\(qAcc, kAcc) headIndex -> do
-          let headIdx = HeadIndex headIndex
-          rotatedQ <- applyRotary rotaryEncoding currentStep headIdx qAcc
-          rotatedK <- applyRotary rotaryEncoding currentStep headIdx kAcc
-          return (rotatedQ, rotatedK))
-      (queryVec, keyVec)
-      [0 .. numHeads - 1]
+embed :: EmbeddingComponent -> Token -> TransformerResult TokenVector
+embed embedding (Token tokenCode) = do
+  let
+    vocab = vocabulary embedding
+    rowStart = fromIntegral tokenCode * ncols vocab
+    tokenVector = TokenVector $ V.slice rowStart (ncols vocab) (items2D vocab)
+  return tokenVector
 
-    return (TokenVector rotatedQuery, TokenVector rotatedKey, TokenVector valueVec)
+applyRotary :: RotaryEncodingComponent -> StepCount -> HeadIndex -> V.Vector Float -> TransformerResult (V.Vector Float)
+applyRotary (RotaryEncodingComponent freqCos freqSin) (StepCount step) headIndex input = do
+  network <- ask
+  let
+      cosFrequencies = getRow step freqCos
+      sinFrequencies = getRow step freqSin
+      headDim = headDimension network
 
-  applyRotaryToQK :: MultiHeadAttentionComponent -> LayerIndex -> TokenVector -> TokenVector -> StepCount -> TransformerResult ()
-  applyRotaryToQK mha layerIndex (TokenVector keyOutput) (TokenVector valueOutput) currentStep = do
-    network <- ask
-    AttentionKV {keyCache, valueCache} <- gets id
-    let
-        numHeads = numAttentionHeads network
-        headDim = headDimension network
+  -- Apply rotation per head
+  return $ applyRotaryPositionEncoding headDim headIndex cosFrequencies sinFrequencies input
 
-    forM_ [0 .. numHeads - 1] $ \headIndex -> do
-      -- Update cache with slices from keyOutput and valueOutput
-      let keyHeadSlice = V.slice (headIndex * headDim) headDim keyOutput
-          valueHeadSlice = V.slice (headIndex * headDim) headDim valueOutput
-      updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep keyHeadSlice keyCache
-      updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep valueHeadSlice valueCache
+applyRotaryPositionEncoding :: Int -> HeadIndex -> V.Vector Float -> V.Vector Float -> V.Vector Float -> V.Vector Float
+applyRotaryPositionEncoding headDim (HeadIndex headIndex) cosFrequencies sinFrequencies input = let
+  baseIndex = headIndex * headDim
+  slice = V.slice baseIndex headDim input
 
-  attentionHeads :: MultiHeadAttentionComponent -> LayerIndex -> TokenVector -> StepCount -> TransformerResult [TokenVector]
-  attentionHeads mha layerIndex (TokenVector queryOutput) currentStep = do
-    network <- ask
-    let
-        numHeads = numAttentionHeads network
-        headDim = headDimension network
+  -- Process pairs just like the primed version
+  processedPairs = map (\pairIndex ->
+    let realComponent = slice V.! pairIndex
+        imagComponent = slice V.! (pairIndex + 1)
+        cosValue = cosFrequencies V.! (pairIndex `div` 2)
+        sinValue = sinFrequencies V.! (pairIndex `div` 2)
+        rotatedReal = realComponent * cosValue - imagComponent * sinValue
+        rotatedImag = realComponent * sinValue + imagComponent * cosValue
+    in [(pairIndex, rotatedReal), (pairIndex + 1, rotatedImag)]
+    ) [0, 2 .. headDim - 2]
 
-    -- Compute multi-head attention
-    let headsQ = [ V.slice (i * headDim) headDim queryOutput | i <- [0 .. numHeads - 1] ]
-    mapM (\i -> headAttention layerIndex (HeadIndex i) currentStep (headsQ !! i)) [0 .. numHeads - 1]
+  updates = concat processedPairs
+  rotated = slice V.// updates
+  result = input V.// zip [baseIndex..baseIndex+headDim-1] (V.toList rotated)
+  in result
 
-  combineHeads :: MultiHeadAttentionComponent -> [TokenVector] -> TransformerResult (V.Vector Float)
-  combineHeads mha headOutputs =  do
-    return $ V.concat headOutputsVecs where
-        headOutputsVecs = [v | TokenVector v <- headOutputs]  
-
-
-instance Embedding EmbeddingComponent where
-  embed :: EmbeddingComponent -> Token -> TransformerResult TokenVector
-  embed embedding (Token tokenCode) = do
-    let
-      vocab = vocabulary embedding
-      rowStart = fromIntegral tokenCode * ncols vocab
-      tokenVector = TokenVector $ V.slice rowStart (ncols vocab) (items2D vocab)
-    return tokenVector
-
-instance RotaryEncoding RotaryEncodingComponent where
-  applyRotary :: RotaryEncodingComponent -> StepCount -> HeadIndex -> V.Vector Float -> TransformerResult (V.Vector Float)
-  applyRotary (RotaryEncodingComponent freqCos freqSin) (StepCount step) headIndex input = do
-    network <- ask
-    let
-        cosFrequencies = getRow step freqCos
-        sinFrequencies = getRow step freqSin
-        headDim = headDimension network
-
-    -- Apply rotation per head
-    return $ applyRotaryPositionEncoding headDim headIndex cosFrequencies sinFrequencies input
-
-instance FeedForwarding FeedForwardNetworkComponent where
-  runFeedForward :: FeedForwardNetworkComponent -> V.Vector Float -> TransformerResult (V.Vector Float)
-  runFeedForward ffn inputToken = do
-    let
-      rmsFfnWeights = fRMSFfn ffn
-      w1 = fW1 ffn
-      w2 = fW2 ffn
-      w3 = fW3 ffn
-      normalizedInput = rmsNorm inputToken rmsFfnWeights
-      gateOutput' = matrixVectorMult w1 normalizedInput
-      upProjectionOutput' = matrixVectorMult w3 normalizedInput
-      gateOutput = V.map sigmoidLinearUnit gateOutput'
-      feedforwardNetworkOutput' = matrixVectorMult w2 (V.zipWith (*) gateOutput upProjectionOutput')
-    return feedforwardNetworkOutput'
+runFeedForward :: FeedForwardNetworkComponent -> V.Vector Float -> TransformerResult (V.Vector Float)
+runFeedForward ffn inputToken = do
+  let
+    rmsFfnWeights = fRMSFfn ffn
+    w1 = fW1 ffn
+    w2 = fW2 ffn
+    w3 = fW3 ffn
+    normalizedInput = rmsNorm inputToken rmsFfnWeights
+    gateOutput' = matrixVectorMult w1 normalizedInput
+    upProjectionOutput' = matrixVectorMult w3 normalizedInput
+    gateOutput = V.map sigmoidLinearUnit gateOutput'
+    feedforwardNetworkOutput' = matrixVectorMult w2 (V.zipWith (*) gateOutput upProjectionOutput')
+  return feedforwardNetworkOutput'
 
 data NetworkConfig = NetworkConfig
   { modelDim :: Int,
