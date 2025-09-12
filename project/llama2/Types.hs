@@ -1,10 +1,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module Types
   ( 
-    AttentionKV (..),
     StepCount (..),
-    LayerIndex(..),
-    HeadIndex(..),
     TokenVector(..),
     Vocabulary,
     VocabularyScores,
@@ -52,10 +49,6 @@ newtype Token = Token Int32 deriving (Show, Eq, Ord, Num)
 
 type PromptTokens = [Token]
 
-data AttentionKV = AttentionKV
-  { keyCache :: MVectorFloat,
-    valueCache :: MVectorFloat
-  }
 
 --------------------------------------------------------------------------------
 -- Array2D Data Structure and Class

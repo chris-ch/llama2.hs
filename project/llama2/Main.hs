@@ -14,14 +14,14 @@ import qualified Data.Vector.Unboxed.Mutable as MV
 import qualified Options.Applicative as OA
 import Text.Printf (printf)
 import Transformer (generateTokens)
-import Types (AttentionKV (..), PromptTokens, StepCount (..), Token (..), Vocabulary, VocabularyScores,
+import Types (PromptTokens, StepCount (..), Token (..), Vocabulary, VocabularyScores,
   readArray2D, readArray3D, readVector, getArray2D, getRow, Array2D (..), Array3D (..))
 import Architecture (NetworkConfig (..),
   EmbeddingComponent (..),
-  RotaryEncodingComponent (..), TransformerLayerComponent (..), 
-  MultiHeadAttentionComponent (..), 
+  RotaryEncodingComponent (..), TransformerLayerComponent (..),
+  MultiHeadAttentionComponent (..),
   FeedForwardNetworkComponent (..), TransformerDecoderComponent (..),
-  SingleHeadComponent (..),
+  SingleHeadComponent (..), DecoderCache (..), LayerAttentionCache (..), HeadCache (..),
   )
 import qualified Data.Vector.Unboxed as V
 
@@ -159,6 +159,18 @@ getHeadArray2D layerIdx headIdx headDim (Array3D vec _ sizeY sizeZ) =
       ]
   in Array2D { items2D = newItems, nrows = headDim, ncols = ncols }
 
+initDecoderCaches :: NetworkConfig -> IO DecoderCache
+initDecoderCaches NetworkConfig{numLayers, seqLen, headDimension, decoder} = do
+  let numHeads = length (heads (multiHeadAttention (head (modelLayers decoder))))
+      cacheSize = seqLen * headDimension
+  layerCachesList <- replicateM numLayers $ do
+    headCachesList <- replicateM numHeads $ do
+      kc <- MV.new cacheSize
+      vc <- MV.new cacheSize
+      return $ HeadCache { headKeyCache = kc, headValueCache = vc }
+    return $ LayerAttentionCache { headCaches = headCachesList }
+  return $ DecoderCaches { layerCaches = layerCachesList }
+
 initModel :: BS.ByteString -> NetworkConfig
 initModel = BG.runGet parseNetworkConfigFile
 
@@ -219,13 +231,6 @@ bpeEncode prompt vocab vocabScores =
   let tokens = map (\char -> fromMaybe (error "Character not found in vocabulary") (DL.elemIndex (BS.pack [char]) vocab)) (BS.unpack prompt)
    in applyBPEMerges (map fromIntegral tokens) vocab vocabScores
 
--- Initialize flat attention KV caches (flattened to one MVector each)
-initAttentionKV :: NetworkConfig -> IO AttentionKV
-initAttentionKV NetworkConfig {numLayers, numAttentionHeads, seqLen, headDimension} = do
-  keyCache <- MV.new (numLayers * numAttentionHeads * seqLen * headDimension)
-  valueCache <- MV.new (numLayers * numAttentionHeads * seqLen * headDimension)
-  return AttentionKV {keyCache, valueCache}
-
 runModel :: BS.ByteString -> BS.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
 runModel modelFileContent tokenizerFileContent temperature steps prompt seed = do
   currentTime <- getPOSIXTime
@@ -233,7 +238,7 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
       config = initModel modelFileContent
       prompt' = fromMaybe "" prompt
       (promptTokens, vocab) = tokenizerInit tokenizerFileContent (vocabSize config) (BSC.pack prompt')
-  attentionKV <- initAttentionKV config
+  attentionKV <- initDecoderCaches config
   putStrLn "<s>"
   startTime <- getPOSIXTime
   (_, StepCount countTokens) <- evalStateT (runReaderT (generateTokens (StepCount steps) promptTokens temperature vocab seedValue) config) attentionKV
