@@ -8,13 +8,13 @@ module Architecture
     SingleHeadComponent (..),
     transformerLogits, TransformerResult(..)
     , NetworkConfig (..)
-    , embed, runModel, parseNetworkConfigFile
+    , embed, runModel, parseNetworkConfigFile, initDecoderCaches
     , DecoderCache (..), LayerAttentionCache (..), HeadCache(..), 
   ) where
 
 import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT)
 import Control.Monad.State (StateT, get, put, MonadState)
-import Control.Monad ( forM_, forM)
+import Control.Monad ( forM_, forM, replicateM)
 import qualified Data.Binary.Get as BG
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as MV
@@ -114,7 +114,7 @@ instance Component TransformerResult SingleHeadComponent where
   type State SingleHeadComponent  = HeadCache
 
   initState :: SingleHeadComponent -> TransformerResult (State SingleHeadComponent)
-  initState _ = error "allocate HeadCache here"
+  initState headComponent = undefined
 
   tick :: SingleHeadComponent -> State SingleHeadComponent -> Input SingleHeadComponent -> TransformerResult (State SingleHeadComponent, Output SingleHeadComponent)
   tick headComp hc (inputToken, stepCount, headDim) = do
@@ -122,7 +122,6 @@ instance Component TransformerResult SingleHeadComponent where
         k = matrixVectorMult (wkHead headComp) inputToken
         v = matrixVectorMult (wvHead headComp) inputToken
 
-    -- use your existing applyRotary which returns TransformerResult
     q' <- applyRotary (rotary headComp) stepCount q
     k' <- applyRotary (rotary headComp) stepCount k
 
@@ -428,3 +427,15 @@ getHeadArray2D layerIdx headIdx headDim (Array3D vec _ sizeY sizeZ) =
       | row <- [startRow .. startRow + headDim - 1]
       ]
   in Array2D { items2D = newItems, nrows = headDim, ncols = ncols }
+
+initDecoderCaches :: NetworkConfig -> IO DecoderCache
+initDecoderCaches NetworkConfig{numLayers, seqLen, headDimension, decoder} = do
+  let numHeads = length (heads (multiHeadAttention (head (modelLayers decoder))))
+      cacheSize = seqLen * headDimension
+  layerCachesList <- replicateM numLayers $ do
+    headCachesList <- replicateM numHeads $ do
+      kc <- MV.new cacheSize
+      vc <- MV.new cacheSize
+      return $ HeadCache { headKeyCache = kc, headValueCache = vc }
+    return $ LayerAttentionCache { headCaches = headCachesList }
+  return $ DecoderCaches { layerCaches = layerCachesList }

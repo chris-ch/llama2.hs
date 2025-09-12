@@ -15,7 +15,7 @@ import Text.Printf (printf)
 import Transformer (generateTokens)
 import Types (PromptTokens, StepCount (..), Token (..), Vocabulary, VocabularyScores)
 import Architecture (NetworkConfig (..), TransformerLayerComponent (..),
-  MultiHeadAttentionComponent (..), TransformerDecoderComponent (..), DecoderCache (..), LayerAttentionCache (..), HeadCache (..), parseNetworkConfigFile, TransformerResult (..),
+  MultiHeadAttentionComponent (..), TransformerDecoderComponent (..), DecoderCache (..), LayerAttentionCache (..), HeadCache (..), parseNetworkConfigFile, TransformerResult (..), initDecoderCaches,
   )
 
 --------------------------------------------------------------------------------
@@ -52,18 +52,6 @@ main = do
 --------------------------------------------------------------------------------
 -- Binary Parsing
 --------------------------------------------------------------------------------
-
-initDecoderCaches :: NetworkConfig -> IO DecoderCache
-initDecoderCaches NetworkConfig{numLayers, seqLen, headDimension, decoder} = do
-  let numHeads = length (heads (multiHeadAttention (head (modelLayers decoder))))
-      cacheSize = seqLen * headDimension
-  layerCachesList <- replicateM numLayers $ do
-    headCachesList <- replicateM numHeads $ do
-      kc <- MV.new cacheSize
-      vc <- MV.new cacheSize
-      return $ HeadCache { headKeyCache = kc, headValueCache = vc }
-    return $ LayerAttentionCache { headCaches = headCachesList }
-  return $ DecoderCaches { layerCaches = layerCachesList }
 
 initModel :: BS.ByteString -> NetworkConfig
 initModel = BG.runGet parseNetworkConfigFile
