@@ -54,11 +54,7 @@ type PromptTokens = [Token]
 
 data AttentionKV = AttentionKV
   { keyCache :: MVectorFloat,
-    valueCache :: MVectorFloat,
-    gateOutput :: MVectorFloat,
-    upProjectionOutput :: MVectorFloat,
-    feedforwardNetworkOutput :: MVectorFloat,
-    projectedAttentionOutput :: MVectorFloat
+    valueCache :: MVectorFloat
   }
 
 --------------------------------------------------------------------------------

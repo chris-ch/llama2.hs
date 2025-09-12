@@ -275,7 +275,7 @@ headAttention layerIndex (HeadIndex hIdx) currentStep headQuery = do
 
       zero = V.replicate headDim 0.0
       addScaled acc pos =
-        let valueCacheOffset = cacheIndex network (StepCount pos) layerIndex (HeadIndex hIdx) 0
+        let valueCacheOffset = cacheIndex network (StepCount pos) layerIndex (HeadIndex hIdx)
             vSlice = V.slice valueCacheOffset headDim vVec
             score  = headScores !! pos
             scaled = V.map (* score) vSlice
@@ -297,7 +297,7 @@ computeScores network layerIndex headIndex (StepCount step) headDim kVec qHead =
   let scaling = sqrt (fromIntegral headDim)
       sequenceLength = step + 1
       scoreForPos pos =
-        let keyCacheOffset = cacheIndex network (StepCount pos) layerIndex headIndex 0
+        let keyCacheOffset = cacheIndex network (StepCount pos) layerIndex headIndex
             kSlice         = V.slice keyCacheOffset headDim kVec
             dotProd        = V.sum (V.zipWith (*) qHead kSlice)
         in dotProd / scaling
@@ -322,11 +322,11 @@ updateCacheWithHead :: LayerIndex -> HeadIndex -> StepCount -> V.Vector Float ->
 updateCacheWithHead layerIndex headIndex stepIndex headSlice cache = do
   network <- ask
   let headDim = headDimension network
-      cacheOffset = cacheIndex network stepIndex layerIndex headIndex 0
+      cacheOffset = cacheIndex network stepIndex layerIndex headIndex
   hsm <- V.thaw headSlice
   MV.copy (MV.slice cacheOffset headDim cache) hsm
 
 -- Cache indexing helper
-cacheIndex :: NetworkConfig -> StepCount -> LayerIndex -> HeadIndex -> Int -> Int
-cacheIndex NetworkConfig {numAttentionHeads, seqLen, headDimension} (StepCount stepIndex) (LayerIndex layerIndex) (HeadIndex headIndex) dimensionIndex =
-  (((layerIndex * numAttentionHeads + headIndex) * seqLen) + stepIndex) * headDimension + dimensionIndex
+cacheIndex :: NetworkConfig -> StepCount -> LayerIndex -> HeadIndex  -> Int
+cacheIndex NetworkConfig {numAttentionHeads, seqLen, headDimension} (StepCount stepIndex) (LayerIndex layerIndex) (HeadIndex headIndex) =
+  (((layerIndex * numAttentionHeads + headIndex) * seqLen) + stepIndex) * headDimension

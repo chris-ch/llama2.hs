@@ -221,14 +221,10 @@ bpeEncode prompt vocab vocabScores =
 
 -- Initialize flat attention KV caches (flattened to one MVector each)
 initAttentionKV :: NetworkConfig -> IO AttentionKV
-initAttentionKV NetworkConfig {numLayers, numAttentionHeads, seqLen, headDimension, hiddenDim, modelDim} = do
+initAttentionKV NetworkConfig {numLayers, numAttentionHeads, seqLen, headDimension} = do
   keyCache <- MV.new (numLayers * numAttentionHeads * seqLen * headDimension)
   valueCache <- MV.new (numLayers * numAttentionHeads * seqLen * headDimension)
-  gateOutput <- MV.new hiddenDim
-  upProjectionOutput <- MV.new hiddenDim
-  feedforwardNetworkOutput <- MV.new modelDim
-  projectedAttentionOutput <- MV.new modelDim
-  return AttentionKV {keyCache, valueCache, gateOutput, upProjectionOutput, feedforwardNetworkOutput, projectedAttentionOutput}
+  return AttentionKV {keyCache, valueCache}
 
 runModel :: BS.ByteString -> BS.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
 runModel modelFileContent tokenizerFileContent temperature steps prompt seed = do
