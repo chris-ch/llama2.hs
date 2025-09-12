@@ -6,31 +6,51 @@ module Architecture
     TransformerLayerComponent (..),
     TransformerDecoderComponent (..),
     SingleHeadComponent (..),
-    transformerLogits, TransformerResult
+    transformerLogits, TransformerResult(..)
     , NetworkConfig (..)
-    , embed, runModel
-    , DecoderCache (..), LayerAttentionCache (..), HeadCache(..)
+    , embed, runModel, parseNetworkConfigFile
+    , DecoderCache (..), LayerAttentionCache (..), HeadCache(..), 
   ) where
 
 import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT)
-import Control.Monad.State (StateT, get, put)
+import Control.Monad.State (StateT, get, put, MonadState)
 import Control.Monad ( forM_, forM)
+import qualified Data.Binary.Get as BG
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as MV
 
 import Types
     (
-      Array2D(items2D, ncols, nrows),
+      Array2D(..),
       Token (..),
       TokenVector(..),
-      StepCount(..), getRow, MVectorFloat )
+      StepCount(..), getRow, MVectorFloat, Array3D (..), readArray2D, readArray3D, readVector, getArray2D )
 import Primitives
     (
       softmax, rmsNorm, sigmoidLinearUnit, matrixVectorMult )
 import Data.List (foldl')
 
 -- Runtime type alias
-type TransformerResult a = ReaderT NetworkConfig (StateT DecoderCache IO) a
+newtype TransformerResult a =
+  TransformerResult
+    { runTransformerResult :: ReaderT NetworkConfig (StateT DecoderCache IO) a
+    }
+  deriving (Functor, Applicative, Monad, MonadIO, MonadReader NetworkConfig, MonadState DecoderCache)
+
+-- | Any hardware-like component
+class Monad m => Component m c where
+  -- The type of input to the component
+  type Input c
+  -- The type of output from the component
+  type Output c
+  -- The type of internal state (registers/memory)
+  type State c
+
+  -- Initialize state once
+  initState :: c -> m (State c)
+
+  -- One simulation “tick”:
+  tick :: c -> State c -> Input c -> m (State c, Output c)
 
 -- Data definitions mirroring architectural components
 data EmbeddingComponent = EmbeddingComponent
@@ -62,6 +82,56 @@ data FeedForwardNetworkComponent = FeedForwardNetworkComponent
     fW3 :: Array2D,
     fRMSFfn :: V.Vector Float
   } deriving (Show)
+
+instance Component TransformerResult FeedForwardNetworkComponent where
+  type Input FeedForwardNetworkComponent = V.Vector Float
+  type Output FeedForwardNetworkComponent = V.Vector Float
+  type State FeedForwardNetworkComponent = ()
+
+  initState :: FeedForwardNetworkComponent -> TransformerResult (State FeedForwardNetworkComponent)
+  initState _ = do
+    return ()
+
+  tick :: FeedForwardNetworkComponent -> State FeedForwardNetworkComponent -> Input FeedForwardNetworkComponent -> TransformerResult (State FeedForwardNetworkComponent, Output FeedForwardNetworkComponent)
+  tick ffn () inputToken = do
+    let
+      -- (this is your runFeedForward logic, purely functional)
+      rmsFfnWeights = fRMSFfn ffn
+      w1 = fW1 ffn
+      w2 = fW2 ffn
+      w3 = fW3 ffn
+      normalizedInput = rmsNorm inputToken rmsFfnWeights
+      gateOutput' = matrixVectorMult w1 normalizedInput
+      upProjectionOutput' = matrixVectorMult w3 normalizedInput
+      gateOutput = V.map sigmoidLinearUnit gateOutput'
+      feedforwardNetworkOutput' =
+        matrixVectorMult w2 (V.zipWith (*) gateOutput upProjectionOutput')
+    return ((), feedforwardNetworkOutput')
+
+instance Component TransformerResult SingleHeadComponent where
+  type Input SingleHeadComponent  = (V.Vector Float, StepCount, Int)
+  type Output SingleHeadComponent = TokenVector
+  type State SingleHeadComponent  = HeadCache
+
+  initState :: SingleHeadComponent -> TransformerResult (State SingleHeadComponent)
+  initState _ = error "allocate HeadCache here"
+
+  tick :: SingleHeadComponent -> State SingleHeadComponent -> Input SingleHeadComponent -> TransformerResult (State SingleHeadComponent, Output SingleHeadComponent)
+  tick headComp hc (inputToken, stepCount, headDim) = do
+    let q = matrixVectorMult (wqHead headComp) inputToken
+        k = matrixVectorMult (wkHead headComp) inputToken
+        v = matrixVectorMult (wvHead headComp) inputToken
+
+    -- use your existing applyRotary which returns TransformerResult
+    q' <- applyRotary (rotary headComp) stepCount q
+    k' <- applyRotary (rotary headComp) stepCount k
+
+    updateCache (headKeyCache hc) stepCount headDim k'
+    updateCache (headValueCache hc) stepCount headDim v
+
+    tokenOut <- headAttentionPerHead hc q' stepCount headDim
+
+    return (hc, tokenOut)
 
 data TransformerLayerComponent = TransformerLayerComponent
   {
@@ -105,8 +175,8 @@ runLayers (layer : restLayers) (layerCaches : restCaches) tv step = do
   (tv', updatedLayerCaches) <- runLayer mha ffn layerCaches tv step
   (tv'', restUpdated) <- runLayers restLayers restCaches tv' step
   return (tv'', updatedLayerCaches : restUpdated)
-runLayers (_ : _) [] _ _ = fail "Mismatch: Non-empty layers but empty caches"
-runLayers [] (_ : _) _ _ = fail "Mismatch: Empty layers but non-empty caches"
+runLayers (_ : _) [] _ _ = liftIO $ fail "Mismatch: Non-empty layers but empty caches"
+runLayers [] (_ : _) _ _ = liftIO $ fail "Mismatch: Empty layers but non-empty caches"
 
 runLayer :: MultiHeadAttentionComponent -> FeedForwardNetworkComponent -> LayerAttentionCache -> TokenVector -> StepCount -> TransformerResult (TokenVector, LayerAttentionCache)
 runLayer mha ffn layerCaches (TokenVector inputToken) step = do
@@ -141,7 +211,9 @@ runLayer mha ffn layerCaches (TokenVector inputToken) step = do
       tokenAfterAttention = V.zipWith (+) inputToken attentionDelta
 
   -- Apply FFN (stateless)
-  ffnOut <- runFeedForward ffn tokenAfterAttention
+  initState ffn
+  (_, ffnOut) <- tick ffn () tokenAfterAttention
+
   let finalToken = V.zipWith (+) tokenAfterAttention ffnOut
 
   return (TokenVector finalToken, layerCaches)  -- Caches modified in-place
@@ -183,20 +255,6 @@ applyRotaryPositionEncoding headDim cosFrequencies sinFrequencies input = let
   result = input V.// zip [0..headDim-1] (V.toList rotated)
   in result
 
-runFeedForward :: FeedForwardNetworkComponent -> V.Vector Float -> TransformerResult (V.Vector Float)
-runFeedForward ffn inputToken = do
-  let
-    rmsFfnWeights = fRMSFfn ffn
-    w1 = fW1 ffn
-    w2 = fW2 ffn
-    w3 = fW3 ffn
-    normalizedInput = rmsNorm inputToken rmsFfnWeights
-    gateOutput' = matrixVectorMult w1 normalizedInput
-    upProjectionOutput' = matrixVectorMult w3 normalizedInput
-    gateOutput = V.map sigmoidLinearUnit gateOutput'
-    feedforwardNetworkOutput' = matrixVectorMult w2 (V.zipWith (*) gateOutput upProjectionOutput')
-  return feedforwardNetworkOutput'
-
 data NetworkConfig = NetworkConfig
   { modelDim :: Int,
     hiddenDim :: Int,
@@ -214,7 +272,7 @@ data NetworkConfig = NetworkConfig
 updateCache :: MVectorFloat -> StepCount -> Int -> V.Vector Float -> TransformerResult ()
 updateCache cache (StepCount step) headDim slice = do
   let offset = step * headDim
-  hsm <- V.thaw slice
+  hsm <- liftIO $ V.thaw slice
   liftIO $ MV.copy (MV.slice offset headDim cache) hsm
 
 -- Per-head attention computation
@@ -270,3 +328,103 @@ transformerLogits dec tokenVec = do
             dot = sum [(items2D vocab V.! i) * (tokenWithRms V.! (i - start)) | i <- [start .. end - 1]]
          in dot
   return logits
+
+parseNetworkConfigFile :: BG.Get NetworkConfig
+parseNetworkConfigFile = do
+  modelDim' <- fromIntegral <$> BG.getInt32le
+  hiddenDim' <- fromIntegral <$> BG.getInt32le
+  nLayers' <- fromIntegral <$> BG.getInt32le
+  numAttentionHeads' <- fromIntegral <$> BG.getInt32le
+  numKeyValueHeads' <- fromIntegral <$> BG.getInt32le
+  vocabSize' <- fromIntegral <$> BG.getInt32le
+  seqLen' <- fromIntegral <$> BG.getInt32le
+  tokenEmbeddingTable' <- readArray2D vocabSize' modelDim'
+  rmsAttWeight' <- readArray2D nLayers' modelDim' :: BG.Get Array2D
+  wq' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
+  wk' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
+  wv' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
+  wo' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
+  rmsFfnWeight' <- readArray2D nLayers' modelDim' :: BG.Get Array2D
+  w1' <- readArray3D nLayers' hiddenDim' modelDim' :: BG.Get Array3D
+  w2' <- readArray3D nLayers' modelDim' hiddenDim' :: BG.Get Array3D
+  w3' <- readArray3D nLayers' hiddenDim' modelDim' :: BG.Get Array3D
+  rmsFinalWeight' <- readVector modelDim'
+  freqCisReal' <- readArray2D seqLen' ((modelDim' `div` numAttentionHeads') `div` 2)
+  freqCisImag' <- readArray2D seqLen' ((modelDim' `div` numAttentionHeads') `div` 2)
+
+  let
+      headDim = modelDim' `div` numAttentionHeads'
+      -- Construct the Embedding
+      embedding = EmbeddingComponent
+              { vocabulary = tokenEmbeddingTable' -- Embedding weights, shape [vocabSize, modelDim]
+              , rmsFinalWeight = rmsFinalWeight' -- Final RMSNorm weights, shape [modelDim]
+              }
+      -- Construct the RotaryEncoding
+      rotary = RotaryEncodingComponent
+              { freqCos = freqCisReal' -- Real part of rotary positional encoding frequencies, shape [seqLen, headDim / 2]
+              , freqSin = freqCisImag' -- Imaginary part of rotary positional encoding frequencies, shape [seqLen, headDim / 2]
+              }
+      -- Construct the list of TransformerLayers
+      layers = 
+        [ TransformerLayerComponent
+            { multiHeadAttention = MultiHeadAttentionComponent
+                { heads = [ SingleHeadComponent
+                              { wqHead = getHeadArray2D layerIdx headIdx headDim wq' -- Query projection weights for a single head, shape [headDim, modelDim]
+                              , wkHead = getHeadArray2D layerIdx headIdx headDim wk' -- Key projection weights for a single head, shape [headDim, modelDim]
+                              , wvHead = getHeadArray2D layerIdx headIdx headDim wv' -- Value projection weights for a single head, shape [headDim, modelDim]
+                              , rotary = rotary -- Rotary encoding component
+                              }
+                          | headIdx <- [0..numAttentionHeads' - 1]
+                          ]
+                , mWo     = getArray2D layerIdx wo' -- Output projection matrix, shape [modelDim, modelDim]
+                , rmsAtt = getRow layerIdx rmsAttWeight' -- RMSNorm weights before QKV projection, shape [modelDim]
+                }, 
+              feedforwardNetwork = FeedForwardNetworkComponent
+                      { fW1 = getArray2D layerIdx w1' -- Feed-forward gate-up projection weights, shape [hiddenDim, modelDim]
+                      , fW2 = getArray2D layerIdx w2' -- Feed-forward down projection weights, shape [modelDim, hiddenDim]
+                      , fW3 = getArray2D layerIdx w3' -- Feed-forward gate-down projection weights, shape [hiddenDim, modelDim]
+                      , fRMSFfn = getRow layerIdx rmsFfnWeight' -- RMSNorm weights for feed-forward, shape [modelDim]
+                      }
+              }
+          | layerIdx <- [0..nLayers' - 1]
+          ]
+      -- Construct the TransformerArchitecture
+      decoder = TransformerDecoderComponent
+              { modelEmbedding = embedding -- Embedding component
+              , modelLayers = layers -- List of transformer layers
+              }
+  return $
+    NetworkConfig
+      { modelDim = modelDim',
+        hiddenDim = hiddenDim',
+        numLayers = nLayers',
+        numAttentionHeads = numAttentionHeads',
+        numKeyValueHeads = numKeyValueHeads',
+        vocabSize = abs vocabSize',
+        seqLen = seqLen',
+        headDimension = headDim,
+        decoder = decoder
+      }
+
+-- | Extract the weight matrix for one head of one layer
+--   layerIdx ∈ [0..sizeX-1]
+--   headIdx  ∈ [0..numHeads-1]
+--   headDim  = rowsPerHead
+getHeadArray2D :: Int      -- ^ layer index
+               -> Int      -- ^ head index
+               -> Int      -- ^ headDim (rows per head)
+               -> Array3D  -- ^ the big 3D tensor (layers × rows × cols)
+               -> Array2D  -- ^ the resulting (headDim × ncols) matrix
+getHeadArray2D layerIdx headIdx headDim (Array3D vec _ sizeY sizeZ) =
+  let
+    -- sizeY is the total number of rows = numHeads * headDim
+    ncols    = sizeZ
+    startRow = headIdx * headDim
+    -- Offset to this layer’s slice:
+    layerOffset = layerIdx * sizeY * sizeZ
+    -- Grab each row belonging to this head:
+    newItems = V.concat
+      [ V.slice (layerOffset + (row * ncols)) ncols vec
+      | row <- [startRow .. startRow + headDim - 1]
+      ]
+  in Array2D { items2D = newItems, nrows = headDim, ncols = ncols }

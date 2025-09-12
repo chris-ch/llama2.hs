@@ -64,9 +64,12 @@ executable llama2
     -haddock
   default-extensions:
     BangPatterns
+    GeneralizedNewtypeDeriving
     InstanceSigs
+    MultiParamTypeClasses
     NamedFieldPuns
     OverloadedStrings
     RecordWildCards
-    GeneralizedNewtypeDeriving
+    TypeFamilies
+    TypeSynonymInstances
   default-language: Haskell2010
