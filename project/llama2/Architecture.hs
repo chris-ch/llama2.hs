@@ -81,6 +81,9 @@ class FeedForwarding f where
 class Attending a where
   runAttention :: a -> LayerIndex -> TokenVector -> StepCount -> TransformerResult TokenVector
   computeQKV :: a -> StepCount -> TokenVector -> TransformerResult (TokenVector, TokenVector, TokenVector)
+  applyRotaryToQK :: a -> LayerIndex -> TokenVector -> TokenVector -> StepCount -> TransformerResult ()
+  attentionHeads :: a -> LayerIndex -> TokenVector -> StepCount -> TransformerResult [TokenVector]
+  combineHeads :: a -> [TokenVector] -> TransformerResult (V.Vector Float)
 
 class TransformerProcessing m where
   runModel :: m -> Token -> StepCount -> TransformerResult TokenVector
@@ -103,32 +106,23 @@ instance TransformerProcessing TransformerDecoderComponent where
         [0 .. length layers - 1]
 
 instance Attending MultiHeadAttentionComponent where
-  
+
   runAttention :: MultiHeadAttentionComponent -> LayerIndex -> TokenVector -> StepCount -> TransformerResult TokenVector
   runAttention mha layerIndex inputToken currentStep = do
     network <- ask
-    AttentionKV {keyCache, valueCache} <- gets id
     let dec = decoder network
         LayerIndex li = layerIndex
         layer = modelLayers dec !! li
         ffn = feedforwardNetwork layer
-        numHeads = numAttentionHeads network
-        headDim = headDimension network
         outputProjectionWeights = mWo mha
 
     (TokenVector queryOutput, TokenVector keyOutput, TokenVector valueOutput) <- computeQKV mha currentStep inputToken
 
-    forM_ [0 .. numHeads - 1] $ \headIndex -> do
-      -- Update cache with slices from keyOutput and valueOutput
-      let keyHeadSlice = V.slice (headIndex * headDim) headDim keyOutput
-          valueHeadSlice = V.slice (headIndex * headDim) headDim valueOutput
-      updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep keyHeadSlice keyCache
-      updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep valueHeadSlice valueCache
+    applyRotaryToQK mha layerIndex (TokenVector keyOutput) (TokenVector valueOutput) currentStep
 
-    -- Compute multi-head attention
-    let headsQ = [ V.slice (i * headDim) headDim queryOutput | i <- [0 .. numHeads - 1] ]
-    headOutputs <- mapM (\i -> headAttention layerIndex (HeadIndex i) currentStep (headsQ !! i)) [0 .. numHeads - 1]
-    let multiHeadOut = V.concat headOutputs
+    headOutputs <- attentionHeads mha layerIndex (TokenVector queryOutput) currentStep
+
+    multiHeadOut <- combineHeads mha headOutputs
 
     let attentionDelta = matrixVectorMult outputProjectionWeights multiHeadOut
 
@@ -164,6 +158,38 @@ instance Attending MultiHeadAttentionComponent where
       [0 .. numHeads - 1]
 
     return (TokenVector rotatedQuery, TokenVector rotatedKey, TokenVector valueVec)
+
+  applyRotaryToQK :: MultiHeadAttentionComponent -> LayerIndex -> TokenVector -> TokenVector -> StepCount -> TransformerResult ()
+  applyRotaryToQK mha layerIndex (TokenVector keyOutput) (TokenVector valueOutput) currentStep = do
+    network <- ask
+    AttentionKV {keyCache, valueCache} <- gets id
+    let
+        numHeads = numAttentionHeads network
+        headDim = headDimension network
+
+    forM_ [0 .. numHeads - 1] $ \headIndex -> do
+      -- Update cache with slices from keyOutput and valueOutput
+      let keyHeadSlice = V.slice (headIndex * headDim) headDim keyOutput
+          valueHeadSlice = V.slice (headIndex * headDim) headDim valueOutput
+      updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep keyHeadSlice keyCache
+      updateCacheWithHead layerIndex (HeadIndex headIndex) currentStep valueHeadSlice valueCache
+
+  attentionHeads :: MultiHeadAttentionComponent -> LayerIndex -> TokenVector -> StepCount -> TransformerResult [TokenVector]
+  attentionHeads mha layerIndex (TokenVector queryOutput) currentStep = do
+    network <- ask
+    let
+        numHeads = numAttentionHeads network
+        headDim = headDimension network
+
+    -- Compute multi-head attention
+    let headsQ = [ V.slice (i * headDim) headDim queryOutput | i <- [0 .. numHeads - 1] ]
+    mapM (\i -> headAttention layerIndex (HeadIndex i) currentStep (headsQ !! i)) [0 .. numHeads - 1]
+
+  combineHeads :: MultiHeadAttentionComponent -> [TokenVector] -> TransformerResult (V.Vector Float)
+  combineHeads mha headOutputs =  do
+    return $ V.concat headOutputsVecs where
+        headOutputsVecs = [v | TokenVector v <- headOutputs]  
+
 
 instance Embedding EmbeddingComponent where
   embed :: EmbeddingComponent -> Token -> TransformerResult TokenVector
@@ -222,7 +248,7 @@ headAttention
   -> HeadIndex
   -> StepCount
   -> V.Vector Float
-  -> TransformerResult (V.Vector Float)
+  -> TransformerResult TokenVector
 headAttention layerIndex (HeadIndex hIdx) currentStep headQuery = do
   network <- ask
   kCache  <- gets keyCache
@@ -248,7 +274,7 @@ headAttention layerIndex (HeadIndex hIdx) currentStep headQuery = do
             scaled = V.map (* score) vSlice
         in V.zipWith (+) acc scaled
 
-  return $ foldl' addScaled zero [0 .. sequenceLength - 1]
+  return $ TokenVector $ foldl' addScaled zero [0 .. sequenceLength - 1]
 
 -- computeScores' : uses cacheIndex, same semantics as the original computeScores
 computeScores

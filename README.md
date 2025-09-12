@@ -45,5 +45,13 @@ From that day on, Lily and Tom became good friends. They would often talk and sh
 
 ## Performance evaluation
 ```shell
-/usr/bin/time -v cabal run -- llama2 --model-file data/stories110M.bin --temperature 0.8 --steps 256 "In that little town"
+/usr/bin/time -v cabal run -- llama2 --model-file data/stories110M.bin --temperature 0.8 --steps 256 --seed 123 "In that little town"
+```
+
+Produces output:
+
+```text
+<s>
+In that little town, there was a humble house. In the house lived a kind man named Tom. Tom had a big potato farm. He loved to grow potatoes and share them with his friends.<0x0A>One day, a little girl named Lily came to Tom's house. She was hungry and asked, "Can I have a potato, please?" Tom smiled and said, "Of course, Lily! I have many potatoes to offer you."<0x0A>Tom gave Lily a big potato from his farm. Lily was very happy and said, "Thank you, Tom!" She went back to her home and ate the potato. It was the best potato she had ever tasted.<0x0A>The next day, Lily came back to Tom's house with a big smile. She had a big bag of coins. "Tom, I want to give you this coins to say thank you for the potato," she said. Tom was very happy and thanked Lily for the coins.<0x0A>From that day on, Lily and Tom became good friends. They would often talk and share potatoes from the humble little house. And they all lived happily ever after.
+<s>
 ```
