@@ -64,7 +64,6 @@ data TransformerLayerComponent = TransformerLayerComponent
 
 data TransformerDecoderComponent = TransformerDecoderComponent
   { modelEmbedding :: EmbeddingComponent,
-    modelRotary :: RotaryEncodingComponent,
     modelLayers :: [TransformerLayerComponent]
   } deriving (Show)
 

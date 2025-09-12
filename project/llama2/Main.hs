@@ -114,7 +114,6 @@ parseNetworkConfigFile = do
       -- Construct the TransformerArchitecture
       decoder = TransformerDecoderComponent
         { modelEmbedding = embedding,
-          modelRotary = rotary,
           modelLayers = layers
         }
   return $
