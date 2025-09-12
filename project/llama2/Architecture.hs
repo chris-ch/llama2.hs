@@ -178,8 +178,8 @@ applyRotaryToHead :: SingleHeadComponent
   -> TransformerResult (V.Vector Float, V.Vector Float)
 applyRotaryToHead headComp step (q, k) = do
   let rot = rotary headComp
-  q' <- applyRotary rot step (HeadIndex 0) q
-  k' <- applyRotary rot step (HeadIndex 0) k
+  q' <- applyRotary rot step q
+  k' <- applyRotary rot step k
   return (q',k')
 
 embed :: EmbeddingComponent -> Token -> TransformerResult TokenVector
@@ -190,8 +190,8 @@ embed embedding (Token tokenCode) = do
     tokenVector = TokenVector $ V.slice rowStart (ncols vocab) (items2D vocab)
   return tokenVector
 
-applyRotary :: RotaryEncodingComponent -> StepCount -> HeadIndex -> V.Vector Float -> TransformerResult (V.Vector Float)
-applyRotary (RotaryEncodingComponent freqCos freqSin) (StepCount step) headIndex input = do
+applyRotary :: RotaryEncodingComponent -> StepCount -> V.Vector Float -> TransformerResult (V.Vector Float)
+applyRotary (RotaryEncodingComponent freqCos freqSin) (StepCount step) input = do
   network <- ask
   let
       cosFrequencies = getRow step freqCos
@@ -199,17 +199,15 @@ applyRotary (RotaryEncodingComponent freqCos freqSin) (StepCount step) headIndex
       headDim = headDimension network
 
   -- Apply rotation per head
-  return $ applyRotaryPositionEncoding headDim headIndex cosFrequencies sinFrequencies input
+  return $ applyRotaryPositionEncoding headDim cosFrequencies sinFrequencies input
 
-applyRotaryPositionEncoding :: Int -> HeadIndex -> V.Vector Float -> V.Vector Float -> V.Vector Float -> V.Vector Float
-applyRotaryPositionEncoding headDim (HeadIndex headIndex) cosFrequencies sinFrequencies input = let
-  baseIndex = headIndex * headDim
-  slice = V.slice baseIndex headDim input
+applyRotaryPositionEncoding :: Int -> V.Vector Float -> V.Vector Float -> V.Vector Float -> V.Vector Float
+applyRotaryPositionEncoding headDim cosFrequencies sinFrequencies input = let
 
   -- Process pairs just like the primed version
   processedPairs = map (\pairIndex ->
-    let realComponent = slice V.! pairIndex
-        imagComponent = slice V.! (pairIndex + 1)
+    let realComponent = input V.! pairIndex
+        imagComponent = input V.! (pairIndex + 1)
         cosValue = cosFrequencies V.! (pairIndex `div` 2)
         sinValue = sinFrequencies V.! (pairIndex `div` 2)
         rotatedReal = realComponent * cosValue - imagComponent * sinValue
@@ -218,8 +216,8 @@ applyRotaryPositionEncoding headDim (HeadIndex headIndex) cosFrequencies sinFreq
     ) [0, 2 .. headDim - 2]
 
   updates = concat processedPairs
-  rotated = slice V.// updates
-  result = input V.// zip [baseIndex..baseIndex+headDim-1] (V.toList rotated)
+  rotated = input V.// updates
+  result = input V.// zip [0..headDim-1] (V.toList rotated)
   in result
 
 runFeedForward :: FeedForwardNetworkComponent -> V.Vector Float -> TransformerResult (V.Vector Float)
