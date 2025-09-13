@@ -14,7 +14,7 @@ module Architecture
 
 import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT)
 import Control.Monad.State (StateT, get, put, MonadState)
-import Control.Monad ( forM_, forM, replicateM)
+import Control.Monad ( forM_, forM)
 import qualified Data.Binary.Get as BG
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as MV
@@ -164,6 +164,20 @@ newtype DecoderCache = DecoderCaches
   { layerCaches :: [LayerAttentionCache]
   }
 
+instance Component TransformerResult RotaryEncodingComponent where
+  type Input RotaryEncodingComponent  = (RotaryEncodingComponent, StepCount, V.Vector Float, V.Vector Float)
+  type Output RotaryEncodingComponent = (V.Vector Float, V.Vector Float)
+  type State RotaryEncodingComponent  = ()
+
+  initState :: RotaryEncodingComponent -> TransformerResult (State RotaryEncodingComponent)
+  initState _ = return ()
+
+  tick :: RotaryEncodingComponent -> State RotaryEncodingComponent -> Input RotaryEncodingComponent -> TransformerResult (State RotaryEncodingComponent, Output RotaryEncodingComponent)
+  tick _ () (rotary, stepCount, q, k) = do
+    q' <- applyRotary rotary stepCount q
+    k' <- applyRotary rotary stepCount k
+    return ((), (q', k'))
+
 runModel :: TransformerDecoderComponent -> Token -> StepCount -> TransformerResult TokenVector
 runModel dec tokenCode stepCount = do
   let embeddingLayer = modelEmbedding dec
@@ -193,10 +207,10 @@ runLayer mha ffn layerCaches (TokenVector inputToken) step = do
       outputProjectionWeights = mWo mha
       headDim = headDimension network
 
-  -- Compute per-head QKV (rotated Q/K)
   qkvList <- forM (heads mha) $ \headComp -> do
     (q, k, v) <- runSingleHeadQKV headComp normalizedInput
-    (q', k') <- applyRotaryToHead headComp step (q, k)
+    let rh = rotary headComp
+    (_, (q', k')) <- tick rh () (rotary headComp, step, q, k)
     return (q', k', v)
 
   let (qList, _, _) = unzip3 qkvList
@@ -312,14 +326,6 @@ runSingleHeadQKV headComp normalizedInput = do
       k = matrixVectorMult (wkHead headComp) normalizedInput
       v = matrixVectorMult (wvHead headComp) normalizedInput
   return (q, k, v)
-
--- Rotary application
-applyRotaryToHead :: SingleHeadComponent -> StepCount -> (V.Vector Float, V.Vector Float) -> TransformerResult (V.Vector Float, V.Vector Float)
-applyRotaryToHead headComp step (q, k) = do
-  let rot = rotary headComp
-  q' <- applyRotary rot step q
-  k' <- applyRotary rot step k
-  return (q', k')
 
 -- classifier logits for a given token vector
 transformerLogits :: TransformerDecoderComponent -> V.Vector Float -> TransformerResult (V.Vector Float)

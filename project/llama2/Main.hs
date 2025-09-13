@@ -9,14 +9,13 @@ import qualified Data.ByteString.Lazy.Char8 as BSC
 import qualified Data.List as DL
 import Data.Maybe (fromMaybe)
 import Data.Time.Clock.POSIX (getPOSIXTime)
-import qualified Data.Vector.Unboxed.Mutable as MV
 import qualified Options.Applicative as OA
 import Text.Printf (printf)
 import Transformer (generateTokens)
 import Types (PromptTokens, StepCount (..), Token (..), Vocabulary, VocabularyScores)
 import Architecture (NetworkConfig (..), TransformerLayerComponent (..),
   MultiHeadAttentionComponent (..), TransformerDecoderComponent (..),
-   DecoderCache (..), LayerAttentionCache (..), HeadCache (..),
+   DecoderCache (..), LayerAttentionCache (..),
     parseNetworkConfigFile, TransformerResult (..), Component(..)
   )
 
