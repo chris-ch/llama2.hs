@@ -5,10 +5,10 @@ module Architecture
     FeedForwardNetworkComponent (..),
     TransformerLayerComponent (..),
     TransformerDecoderComponent (..),
-    SingleHeadComponent (..),
+    SingleHeadComponent (..), Component(..),
     transformerLogits, TransformerResult(..)
     , NetworkConfig (..)
-    , embed, runModel, parseNetworkConfigFile, initDecoderCaches
+    , embed, runModel, parseNetworkConfigFile
     , DecoderCache (..), LayerAttentionCache (..), HeadCache(..), 
   ) where
 
@@ -113,8 +113,16 @@ instance Component TransformerResult SingleHeadComponent where
   type Output SingleHeadComponent = TokenVector
   type State SingleHeadComponent  = HeadCache
 
-  initState :: SingleHeadComponent -> TransformerResult (State SingleHeadComponent)
-  initState headComponent = undefined
+  -- create empty key/value caches per head
+  initState :: SingleHeadComponent -> TransformerResult HeadCache
+  initState _ = do
+    -- get model config
+    network <- ask
+    let cacheSize = seqLen network * headDimension network
+    -- allocate mutable vectors
+    kc <- liftIO $ MV.replicate cacheSize 0.0
+    vc <- liftIO $ MV.replicate cacheSize 0.0
+    return HeadCache { headKeyCache = kc, headValueCache = vc }
 
   tick :: SingleHeadComponent -> State SingleHeadComponent -> Input SingleHeadComponent -> TransformerResult (State SingleHeadComponent, Output SingleHeadComponent)
   tick headComp hc (inputToken, stepCount, headDim) = do
@@ -210,7 +218,6 @@ runLayer mha ffn layerCaches (TokenVector inputToken) step = do
       tokenAfterAttention = V.zipWith (+) inputToken attentionDelta
 
   -- Apply FFN (stateless)
-  initState ffn
   (_, ffnOut) <- tick ffn () tokenAfterAttention
 
   let finalToken = V.zipWith (+) tokenAfterAttention ffnOut
@@ -427,15 +434,3 @@ getHeadArray2D layerIdx headIdx headDim (Array3D vec _ sizeY sizeZ) =
       | row <- [startRow .. startRow + headDim - 1]
       ]
   in Array2D { items2D = newItems, nrows = headDim, ncols = ncols }
-
-initDecoderCaches :: NetworkConfig -> IO DecoderCache
-initDecoderCaches NetworkConfig{numLayers, seqLen, headDimension, decoder} = do
-  let numHeads = length (heads (multiHeadAttention (head (modelLayers decoder))))
-      cacheSize = seqLen * headDimension
-  layerCachesList <- replicateM numLayers $ do
-    headCachesList <- replicateM numHeads $ do
-      kc <- MV.new cacheSize
-      vc <- MV.new cacheSize
-      return $ HeadCache { headKeyCache = kc, headValueCache = vc }
-    return $ LayerAttentionCache { headCaches = headCachesList }
-  return $ DecoderCaches { layerCaches = layerCachesList }

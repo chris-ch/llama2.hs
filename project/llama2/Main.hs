@@ -1,6 +1,6 @@
 module Main (main) where
 
-import Control.Monad (replicateM)
+import Control.Monad (replicateM, forM)
 import Control.Monad.Reader (ReaderT (runReaderT))
 import Control.Monad.State (evalStateT)
 import qualified Data.Binary.Get as BG
@@ -15,7 +15,9 @@ import Text.Printf (printf)
 import Transformer (generateTokens)
 import Types (PromptTokens, StepCount (..), Token (..), Vocabulary, VocabularyScores)
 import Architecture (NetworkConfig (..), TransformerLayerComponent (..),
-  MultiHeadAttentionComponent (..), TransformerDecoderComponent (..), DecoderCache (..), LayerAttentionCache (..), HeadCache (..), parseNetworkConfigFile, TransformerResult (..), initDecoderCaches,
+  MultiHeadAttentionComponent (..), TransformerDecoderComponent (..),
+   DecoderCache (..), LayerAttentionCache (..), HeadCache (..),
+    parseNetworkConfigFile, TransformerResult (..), Component(..)
   )
 
 --------------------------------------------------------------------------------
@@ -121,6 +123,10 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
       prompt' = fromMaybe "" prompt
       (promptTokens, vocab) = tokenizerInit tokenizerFileContent (vocabSize config) (BSC.pack prompt')
   attentionKV <- initDecoderCaches config
+
+  let
+    dec = decoder config
+
   putStrLn "<s>"
   startTime <- getPOSIXTime
   (_, StepCount countTokens) <- evalStateT (runReaderT (runTransformerResult (generateTokens (StepCount steps) promptTokens temperature vocab seedValue)) config) attentionKV
@@ -131,3 +137,19 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
       tokensPerSec = fromIntegral countTokens / fromIntegral duration
   printf "\nduration: %ds - (%.02f tokens/s)\n" duration tokensPerSec
   return ()
+
+initDecoderCaches :: NetworkConfig -> IO DecoderCache
+initDecoderCaches config = do
+  let dec = decoder config
+  -- for each layer:
+  layerCachesList <- forM (modelLayers dec) $ \layer -> do
+    let mha = multiHeadAttention layer
+    -- for each head in that layer:
+      -- call initState inside TransformerResult monad:
+      -- we need to run ReaderT + StateT stack for each head:
+      -- here the state isn’t used yet, so start with empty state
+    headCachesList <- forM (heads mha) $ \headComp -> do
+      let action = initState headComp  -- TransformerResult HeadCache
+      evalStateT (runReaderT (runTransformerResult action) config) (error "no state yet")
+    return $ LayerAttentionCache { headCaches = headCachesList }
+  return $ DecoderCaches { layerCaches = layerCachesList }
