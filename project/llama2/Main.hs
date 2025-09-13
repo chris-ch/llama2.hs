@@ -148,7 +148,8 @@ initDecoderCaches config = do
       -- we need to run ReaderT + StateT stack for each head:
       -- here the state isn’t used yet, so start with empty state
     headCachesList <- forM (heads mha) $ \headComp -> do
-      let action = initState headComp  -- TransformerResult HeadCache
+      let
+        action = initState headComp  -- TransformerResult HeadCache
       evalStateT (runReaderT (runTransformerResult action) config) (error "no state yet")
     return $ LayerAttentionCache { headCaches = headCachesList }
   return $ DecoderCaches { layerCaches = layerCachesList }

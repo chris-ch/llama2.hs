@@ -9,7 +9,7 @@ module Architecture
     transformerLogits, TransformerResult(..)
     , NetworkConfig (..)
     , embed, runModel, parseNetworkConfigFile
-    , DecoderCache (..), LayerAttentionCache (..), HeadCache(..), 
+    , DecoderCache (..), LayerAttentionCache (..), HeadCache(..), NormRMS(..)
   ) where
 
 import Control.Monad.Reader (MonadIO (liftIO), MonadReader (ask), ReaderT)
@@ -53,6 +53,23 @@ class Monad m => Component m c where
   tick :: c -> State c -> Input c -> m (State c, Output c)
 
 -- Data definitions mirroring architectural components
+
+data NormRMS = NormRMS
+
+instance Component TransformerResult NormRMS where
+  type Input NormRMS  = (V.Vector Float, V.Vector Float)
+  type Output NormRMS = V.Vector Float
+  type State NormRMS  = ()
+
+  initState :: NormRMS -> TransformerResult ()
+  initState _ = return ()
+
+  tick :: NormRMS -> State NormRMS -> Input NormRMS -> TransformerResult (State NormRMS, Output NormRMS)
+  tick _ () (inputToken, rmsWeights) = do
+    let
+      normalizedInput = rmsNorm inputToken rmsWeights
+    return ((), normalizedInput)
+    
 data EmbeddingComponent = EmbeddingComponent
   { vocabulary :: Array2D,
     rmsFinalWeight :: V.Vector Float
@@ -62,6 +79,20 @@ data RotaryEncodingComponent = RotaryEncodingComponent
   { freqCos :: Array2D,
     freqSin :: Array2D
   } deriving (Show)
+
+instance Component TransformerResult RotaryEncodingComponent where
+  type Input RotaryEncodingComponent  = (RotaryEncodingComponent, StepCount, V.Vector Float, V.Vector Float)
+  type Output RotaryEncodingComponent = (V.Vector Float, V.Vector Float)
+  type State RotaryEncodingComponent  = ()
+
+  initState :: RotaryEncodingComponent -> TransformerResult ()
+  initState _ = return ()
+
+  tick :: RotaryEncodingComponent -> State RotaryEncodingComponent -> Input RotaryEncodingComponent -> TransformerResult (State RotaryEncodingComponent, Output RotaryEncodingComponent)
+  tick _ () (rotary, stepCount, q, k) = do
+    q' <- applyRotary rotary stepCount q
+    k' <- applyRotary rotary stepCount k
+    return ((), (q', k'))
 
 data SingleHeadComponent = SingleHeadComponent
   { wqHead :: Array2D    -- size headDim x modelDim
@@ -74,7 +105,8 @@ data MultiHeadAttentionComponent = MultiHeadAttentionComponent
   { heads    :: [SingleHeadComponent]
   , mWo      :: Array2D         -- Output projection matrix
   , rmsAtt   :: V.Vector Float  -- RMSNorm before QKV projection
-  } deriving (Show)
+  , nrms     :: NormRMS
+  }
 
 data FeedForwardNetworkComponent = FeedForwardNetworkComponent
   { fW1 :: Array2D,
@@ -88,7 +120,7 @@ instance Component TransformerResult FeedForwardNetworkComponent where
   type Output FeedForwardNetworkComponent = V.Vector Float
   type State FeedForwardNetworkComponent = ()
 
-  initState :: FeedForwardNetworkComponent -> TransformerResult (State FeedForwardNetworkComponent)
+  initState :: FeedForwardNetworkComponent -> TransformerResult ()
   initState _ = do
     return ()
 
@@ -144,12 +176,12 @@ data TransformerLayerComponent = TransformerLayerComponent
   {
     multiHeadAttention :: MultiHeadAttentionComponent,
     feedforwardNetwork :: FeedForwardNetworkComponent
-  } deriving (Show)
+  }
 
 data TransformerDecoderComponent = TransformerDecoderComponent
   { modelEmbedding :: EmbeddingComponent,
     modelLayers :: [TransformerLayerComponent]
-  } deriving (Show)
+  }
 
 data HeadCache = HeadCache
   { headKeyCache   :: MVectorFloat  -- Size: seqLen * headDim
@@ -163,20 +195,6 @@ newtype LayerAttentionCache = LayerAttentionCache
 newtype DecoderCache = DecoderCaches
   { layerCaches :: [LayerAttentionCache]
   }
-
-instance Component TransformerResult RotaryEncodingComponent where
-  type Input RotaryEncodingComponent  = (RotaryEncodingComponent, StepCount, V.Vector Float, V.Vector Float)
-  type Output RotaryEncodingComponent = (V.Vector Float, V.Vector Float)
-  type State RotaryEncodingComponent  = ()
-
-  initState :: RotaryEncodingComponent -> TransformerResult (State RotaryEncodingComponent)
-  initState _ = return ()
-
-  tick :: RotaryEncodingComponent -> State RotaryEncodingComponent -> Input RotaryEncodingComponent -> TransformerResult (State RotaryEncodingComponent, Output RotaryEncodingComponent)
-  tick _ () (rotary, stepCount, q, k) = do
-    q' <- applyRotary rotary stepCount q
-    k' <- applyRotary rotary stepCount k
-    return ((), (q', k'))
 
 runModel :: TransformerDecoderComponent -> Token -> StepCount -> TransformerResult TokenVector
 runModel dec tokenCode stepCount = do
@@ -203,14 +221,17 @@ runLayer :: MultiHeadAttentionComponent -> FeedForwardNetworkComponent -> LayerA
 runLayer mha ffn layerCaches (TokenVector inputToken) step = do
   network <- ask
   let rmsWeights = rmsAtt mha
-      normalizedInput = rmsNorm inputToken rmsWeights
       outputProjectionWeights = mWo mha
       headDim = headDimension network
 
+  let
+      nrmsComp = nrms mha
+  (_, normalizedInput) <- tick nrmsComp () (inputToken, rmsWeights)
+  
   qkvList <- forM (heads mha) $ \headComp -> do
     (q, k, v) <- runSingleHeadQKV headComp normalizedInput
-    let rh = rotary headComp
-    (_, (q', k')) <- tick rh () (rotary headComp, step, q, k)
+    let rec = rotary headComp
+    (_, (q', k')) <- tick rec () (rotary headComp, step, q, k)
     return (q', k', v)
 
   let (qList, _, _) = unzip3 qkvList
@@ -286,7 +307,6 @@ data NetworkConfig = NetworkConfig
     headDimension :: Int,
     decoder :: TransformerDecoderComponent
   }
-  deriving (Show)
 
 -- Per-head cache update
 updateCache :: MVectorFloat -> StepCount -> Int -> V.Vector Float -> TransformerResult ()
@@ -390,6 +410,7 @@ parseNetworkConfigFile = do
                           ]
                 , mWo     = getArray2D layerIdx wo' -- Output projection matrix, shape [modelDim, modelDim]
                 , rmsAtt = getRow layerIdx rmsAttWeight' -- RMSNorm weights before QKV projection, shape [modelDim]
+                , nrms   = NormRMS
                 }, 
               feedforwardNetwork = FeedForwardNetworkComponent
                       { fW1 = getArray2D layerIdx w1' -- Feed-forward gate-up projection weights, shape [hiddenDim, modelDim]
