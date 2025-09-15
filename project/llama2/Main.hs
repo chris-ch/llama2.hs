@@ -29,20 +29,33 @@ newtype Token = Token F.Int32 deriving (Show, Eq, Ord, Num)
 type PromptTokens = [Token]
 
 -- Runtime type alias
-type TransformerResult a = ReaderT ModelConfig (StateT DecoderCache IO) a
+type TransformerResult a = ReaderT TransformerDecoderComponent (StateT DecoderCache IO) a
 
-data ModelConfig = ModelConfig
-  { modelDim :: Int,
-    hiddenDim :: Int,
-    numLayers :: Int,
-    numAttentionHeads :: Int,
-    numKeyValueHeads :: Int,
-    vocabSize :: Int,
-    seqLen :: Int,
-    headDimension :: Int,
-    decoder :: TransformerDecoderComponent
-  }
-  deriving (Show)
+-- model config 110M
+modelDim :: Int
+modelDim       = 768
+hiddenDim :: Int
+hiddenDim      = 2048
+numLayers :: Int
+numLayers      = 12
+numAttentionHeads :: Int
+numAttentionHeads = 12
+vocabSize :: Int
+vocabSize      = 32000
+seqLen :: Int
+seqLen         = 1024
+headDimension :: Int
+headDimension  = 64
+
+-- example model config 110M: 
+-- modelDim = 768
+-- hiddenDim = 2048
+--numLayers = 12
+-- numAttentionHeads = 12
+-- numKeyValueHeads = 12
+-- vocabSize = 32000
+-- seqLen = 1024
+-- headDimension = 64
 
 --------------------------------------------------------------------------------
 -- Data Structure and Class
@@ -194,7 +207,7 @@ optionsParser =
   Options
     <$> OA.optional (OA.option OA.auto (OA.long "seed" <> OA.help "Seed for debugging"))
     <*> OA.strOption (OA.long "tokenizer-file" <> OA.value "./data/tokenizer.bin" <> OA.help "Tokenizer binary file")
-    <*> OA.strOption (OA.long "model-file" <> OA.value "./data/stories15M.bin" <> OA.metavar "MODEL_FILE" <> OA.help "Model binary file")
+    <*> OA.strOption (OA.long "model-file" <> OA.value "./data/stories110M.bin" <> OA.metavar "MODEL_FILE" <> OA.help "Model binary file")
     <*> OA.option OA.auto (OA.long "temperature" <> OA.value 0.0 <> OA.metavar "TEMPERATURE" <> OA.help "Temperature")
     <*> OA.option OA.auto (OA.long "steps" <> OA.value 256 <> OA.metavar "STEPS" <> OA.help "Number of steps")
     <*> OA.optional (OA.strArgument (OA.metavar "PROMPT" <> OA.help "Initial prompt"))
@@ -202,31 +215,31 @@ optionsParser =
 --------------------------------------------------------------------------------
 -- Binary Parsing
 --------------------------------------------------------------------------------
-parseModelConfigFile :: BG.Get ModelConfig
+parseModelConfigFile :: BG.Get TransformerDecoderComponent
 parseModelConfigFile = do
-  modelDim' <- fromIntegral <$> BG.getInt32le
-  hiddenDim' <- fromIntegral <$> BG.getInt32le
-  nLayers' <- fromIntegral <$> BG.getInt32le
-  numAttentionHeads' <- fromIntegral <$> BG.getInt32le
-  numKeyValueHeads' <- fromIntegral <$> BG.getInt32le
-  vocabSize' <- fromIntegral <$> BG.getInt32le
-  seqLen' <- fromIntegral <$> BG.getInt32le
-  tokenEmbeddingTable' <- readArray2D vocabSize' modelDim'
-  rmsAttWeight' <- readArray2D nLayers' modelDim' :: BG.Get Array2D
-  wq' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
-  wk' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
-  wv' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
-  wo' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
-  rmsFfnWeight' <- readArray2D nLayers' modelDim' :: BG.Get Array2D
-  w1' <- readArray3D nLayers' hiddenDim' modelDim' :: BG.Get Array3D
-  w2' <- readArray3D nLayers' modelDim' hiddenDim' :: BG.Get Array3D
-  w3' <- readArray3D nLayers' hiddenDim' modelDim' :: BG.Get Array3D
-  rmsFinalWeight' <- readVector modelDim'
-  freqCisReal' <- readArray2D seqLen' ((modelDim' `div` numAttentionHeads') `div` 2)
-  freqCisImag' <- readArray2D seqLen' ((modelDim' `div` numAttentionHeads') `div` 2)
+  _ <- BG.getInt32le
+  _ <- BG.getInt32le
+  _ <- BG.getInt32le
+  _ <- BG.getInt32le
+  _ <- BG.getInt32le
+  _ <- BG.getInt32le
+  _ <- BG.getInt32le
+  tokenEmbeddingTable' <- readArray2D vocabSize modelDim
+  rmsAttWeight' <- readArray2D numLayers modelDim :: BG.Get Array2D
+  wq' <- readArray3D numLayers modelDim modelDim :: BG.Get Array3D
+  wk' <- readArray3D numLayers modelDim modelDim :: BG.Get Array3D
+  wv' <- readArray3D numLayers modelDim modelDim :: BG.Get Array3D
+  wo' <- readArray3D numLayers modelDim modelDim :: BG.Get Array3D
+  rmsFfnWeight' <- readArray2D numLayers modelDim :: BG.Get Array2D
+  w1' <- readArray3D numLayers hiddenDim modelDim :: BG.Get Array3D
+  w2' <- readArray3D numLayers modelDim hiddenDim :: BG.Get Array3D
+  w3' <- readArray3D numLayers hiddenDim modelDim :: BG.Get Array3D
+  rmsFinalWeight' <- readVector modelDim
+  freqCisReal' <- readArray2D seqLen ((modelDim `div` numAttentionHeads) `div` 2)
+  freqCisImag' <- readArray2D seqLen ((modelDim `div` numAttentionHeads) `div` 2)
 
   let
-      headDim = modelDim' `div` numAttentionHeads'
+      headDim = modelDim `div` numAttentionHeads
       -- Construct the Embedding
       embedding = EmbeddingComponent
         { vocabulary = tokenEmbeddingTable',
@@ -242,7 +255,7 @@ parseModelConfigFile = do
                               , wvHead = getHeadArray2D layerIdx headIdx headDim wv'
                               , rotary = RotaryEncodingComponent { freqCos = freqCisReal', freqSin = freqCisImag' }
                               }
-                          | headIdx <- [0..numAttentionHeads' - 1]
+                          | headIdx <- [0..numAttentionHeads - 1]
                           ]
                 , mWo     = getArray2D layerIdx wo'
                 , rmsAtt = getRow layerIdx rmsAttWeight'
@@ -254,25 +267,14 @@ parseModelConfigFile = do
                        fRMSFfn = getRow layerIdx rmsFfnWeight'
                      }
             }
-        | layerIdx <- [0..nLayers' - 1]
+        | layerIdx <- [0..numLayers - 1]
         ]
       -- Construct the TransformerArchitecture
       decoder = TransformerDecoderComponent
         { modelEmbedding = embedding,
           modelLayers = layers
         }
-  return $
-    ModelConfig
-      { modelDim = modelDim',
-        hiddenDim = hiddenDim',
-        numLayers = nLayers',
-        numAttentionHeads = numAttentionHeads',
-        numKeyValueHeads = numKeyValueHeads',
-        vocabSize = abs vocabSize',
-        seqLen = seqLen',
-        headDimension = headDim,
-        decoder = decoder
-      }
+  return decoder
 
 getHeadArray2D :: Int      -- ^ layer index
                -> Int      -- ^ head index
@@ -293,8 +295,8 @@ getHeadArray2D layerIdx headIdx headDim (Array3D vec _ sizeY sizeZ) =
       ]
   in Array2D { items2D = newItems, nrows = headDim, ncols = ncols }
 
-initDecoderCaches :: ModelConfig -> IO DecoderCache
-initDecoderCaches ModelConfig{numLayers, seqLen, headDimension, decoder} = do
+initDecoderCaches :: TransformerDecoderComponent -> IO DecoderCache
+initDecoderCaches decoder = do
   let numHeads = length (heads (multiHeadAttention (head (modelLayers decoder))))
       cacheSize = seqLen * headDimension
   layerCachesList <- replicateM numLayers $ do
@@ -402,16 +404,12 @@ embed embedding (Token tokenCode) = do
     tokenVector = TokenVector $ V.slice rowStart (ncols vocab) (items2D vocab)
   return tokenVector
 
-applyRotation :: RotaryEncodingComponent -> StepCount -> TokenVector -> TransformerResult TokenVector
-applyRotation (RotaryEncodingComponent freqCos freqSin) (StepCount step) inputToken = do
-  network <- ask
-  let
+-- Apply rotation per head
+applyRotation :: RotaryEncodingComponent -> StepCount -> TokenVector -> TokenVector
+applyRotation (RotaryEncodingComponent freqCos freqSin) (StepCount step) = applyRotaryPositionEncoding headDim cosFrequencies sinFrequencies where
       cosFrequencies = getRow step freqCos
       sinFrequencies = getRow step freqSin
-      headDim = headDimension network
-
-  -- Apply rotation per head
-  return $ applyRotaryPositionEncoding headDim cosFrequencies sinFrequencies inputToken
+      headDim = headDimension
 
 applyRotaryPositionEncoding :: Int -> V.Vector Float -> V.Vector Float -> TokenVector -> TokenVector
 applyRotaryPositionEncoding headDim cosFrequencies sinFrequencies (TokenVector inputVector) = let
@@ -470,20 +468,18 @@ singleHeadAttention (HeadCache kc vc) (TokenVector qHead) (StepCount stepInt) he
   return $ TokenVector result
 
 -- QKV per head
-runSingleHeadQKV :: SingleHeadComponent -> TokenVector -> TransformerResult (TokenVector, TokenVector, TokenVector)
-runSingleHeadQKV headComp (TokenVector normalizedInput) = do
-  let q = matrixVectorMult (wqHead headComp) normalizedInput
-      k = matrixVectorMult (wkHead headComp) normalizedInput
-      v = matrixVectorMult (wvHead headComp) normalizedInput
-  return (TokenVector q, TokenVector k, TokenVector v)
+runSingleHeadQKV :: SingleHeadComponent -> TokenVector -> (TokenVector, TokenVector, TokenVector)
+runSingleHeadQKV headComp (TokenVector normalizedInput) = (TokenVector q, TokenVector k, TokenVector v) where
+    q = matrixVectorMult (wqHead headComp) normalizedInput
+    k = matrixVectorMult (wkHead headComp) normalizedInput
+    v = matrixVectorMult (wvHead headComp) normalizedInput
 
 -- Rotary application
-applyRotaryToHead :: SingleHeadComponent -> StepCount -> (TokenVector , TokenVector ) -> TransformerResult (TokenVector , TokenVector )
-applyRotaryToHead headComp step (q, k) = do
-  let rot = rotary headComp
-  q' <- applyRotation rot step q
-  k' <- applyRotation rot step k
-  return (q', k')
+applyRotaryToHead :: SingleHeadComponent -> StepCount -> (TokenVector , TokenVector ) -> (TokenVector , TokenVector )
+applyRotaryToHead headComp step (q, k) = (q', k') where
+    rot = rotary headComp
+    q' = applyRotation rot step q
+    k' = applyRotation rot step k
 
 -- Per-head cache update
 updateCache :: MVectorFloat -> StepCount -> Int -> TokenVector -> TransformerResult ()
@@ -494,16 +490,16 @@ updateCache cache (StepCount step) headDim (TokenVector slice) = do
 
 runLayer :: MultiHeadAttentionComponent -> FeedForwardNetworkComponent -> LayerAttentionCache -> TokenVector -> StepCount -> TransformerResult (TokenVector, LayerAttentionCache)
 runLayer mha feedForwardNetwork layerCache inputToken step = do
-  network <- ask
   let rmsWeights = rmsAtt mha
       normalizedInput = rmsNorm inputToken rmsWeights
       outputProjectionWeights = mWo mha
-      headDim = headDimension network
+      headDim = headDimension
 
   -- Compute per-head QKV (rotated Q/K)
   qkvList <- forM (heads mha) $ \headComp -> do
-    (q, k, v) <- runSingleHeadQKV headComp normalizedInput
-    (q', k') <- applyRotaryToHead headComp step (q, k)
+    let
+      (q, k, v) = runSingleHeadQKV headComp normalizedInput
+      (q', k') = applyRotaryToHead headComp step (q, k)
     return (q', k', v)
 
   let (qList, _, _) = unzip3 qkvList
@@ -543,9 +539,8 @@ runLayers (_ : _) [] _ _ = fail "Mismatch: Non-empty layers but empty caches"
 runLayers [] (_ : _) _ _ = fail "Mismatch: Empty layers but non-empty caches"
 
 -- classifier logits for a given token vector
-transformerLogits :: TransformerDecoderComponent -> TokenVector -> TransformerResult TokenVector
-transformerLogits dec tokenVector = do
-  let
+transformerLogits :: TransformerDecoderComponent -> TokenVector -> TokenVector
+transformerLogits dec tokenVector = TokenVector logits where
       vocab = vocabulary (modelEmbedding dec)
       rmsWeight = rmsFinalWeight (modelEmbedding dec)
       TokenVector tokenWithRms = rmsNorm tokenVector rmsWeight
@@ -554,7 +549,6 @@ transformerLogits dec tokenVector = do
             end = start + ncols vocab
             dot = sum [(items2D vocab V.! i) * (tokenWithRms V.! (i - start)) | i <- [start .. end - 1]]
          in dot
-  return $ TokenVector logits
 
 --------------------------------------------------------------------------------
 -- Transformer runtime
@@ -563,17 +557,16 @@ transformerLogits dec tokenVector = do
 -- Transformer step
 transformer :: Token -> StepCount -> TransformerResult TokenVector
 transformer inputTokenCode stepCount = do
-  network <- ask
+  decoder <- ask
   decoderCache <- get
   let
-    dec = decoder network
-    embeddingLayer = modelEmbedding dec
-    layers = modelLayers dec
+    embeddingLayer = modelEmbedding decoder
+    layers = modelLayers decoder
   inputTokenVector <- embed embeddingLayer inputTokenCode
   (outputTokenVector, updatedCache) <- runLayers layers (layerCache decoderCache) inputTokenVector stepCount
   put $ DecoderCache { layerCache = updatedCache }
   -- Classifier into logits
-  transformerLogits dec outputTokenVector
+  return $ transformerLogits decoder outputTokenVector
 
 -- Sampling
 drawSample :: Int -> V.Vector Float -> IO Token
@@ -586,7 +579,6 @@ drawSample randomSeed probabilities = do
 
 generateNextToken :: StepCount -> PromptTokens -> Float -> Vocabulary -> Token -> Int -> TransformerResult (BS.ByteString, Token)
 generateNextToken timestep promptTokens temperature vocab tokenCode seedValue = do
-  network <- ask
   TokenVector logits <- transformer tokenCode timestep
   let StepCount step = timestep
   Token nextToken <-
@@ -596,7 +588,7 @@ generateNextToken timestep promptTokens temperature vocab tokenCode seedValue = 
         if temperature == 0.0
           then return $ fromIntegral (V.maxIndex logits)
           else do
-            liftIO $ drawSample seedValue $ softmax (V.map (/ temperature) logits) (vocabSize network)
+            liftIO $ drawSample seedValue $ softmax (V.map (/ temperature) logits) vocabSize
   let word = vocab !! fromIntegral nextToken :: BS.ByteString
       firstChar = BSC.head word :: Char
       tokenStr =
@@ -623,11 +615,11 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
   currentTime <- getPOSIXTime
   let
     seedValue = fromMaybe (round currentTime) seed
-    initModel :: BS.ByteString -> ModelConfig
+    initModel :: BS.ByteString -> TransformerDecoderComponent
     initModel = BG.runGet parseModelConfigFile
     config = initModel modelFileContent
     prompt' = fromMaybe "" prompt
-    (promptTokens, vocab) = tokenizerInit tokenizerFileContent (vocabSize config) (BSC.pack prompt')
+    (promptTokens, vocab) = tokenizerInit tokenizerFileContent vocabSize (BSC.pack prompt')
   attentionKV <- initDecoderCaches config
   putStrLn "<s>"
   startTime <- getPOSIXTime

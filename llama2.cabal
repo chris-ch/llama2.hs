@@ -26,6 +26,7 @@ executable llama2
   hs-source-dirs:
       project/llama2
   build-depends: base,
+    clash-prelude,
     binary,
     bytestring,
     mtl,
@@ -51,4 +52,7 @@ executable llama2
     NamedFieldPuns
     OverloadedStrings
     GeneralizedNewtypeDeriving
+    RecordWildCards
+    TemplateHaskell
+    DataKinds
   default-language: Haskell2010
