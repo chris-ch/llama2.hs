@@ -232,20 +232,15 @@ parseModelConfigFile = do
         { vocabulary = tokenEmbeddingTable',
           rmsFinalWeight = rmsFinalWeight'
         }
-      -- Construct the RotaryEncoding
-      rotary = RotaryEncodingComponent
-        { freqCos = freqCisReal',
-          freqSin = freqCisImag'
-        }
-      -- Construct the list of TransformerLayers
+      -- Construct the parameters for Transformer layers
       layers =
-        [ TransformerLayerComponent
-            { multiHeadAttention = MultiHeadAttentionComponent
+        [ TransformerLayerComponent {
+          multiHeadAttention = MultiHeadAttentionComponent
                 { heads = [ SingleHeadComponent
                               { wqHead = getHeadArray2D layerIdx headIdx headDim wq'
                               , wkHead = getHeadArray2D layerIdx headIdx headDim wk'
                               , wvHead = getHeadArray2D layerIdx headIdx headDim wv'
-                              , rotary = rotary
+                              , rotary = RotaryEncodingComponent { freqCos = freqCisReal', freqSin = freqCisImag' }
                               }
                           | headIdx <- [0..numAttentionHeads' - 1]
                           ]
