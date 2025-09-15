@@ -22,27 +22,16 @@ source-repository head
 
 executable llama2
   main-is: Main.hs
+  other-modules:
   hs-source-dirs:
       project/llama2
   build-depends: base,
-    array,
     binary,
     bytestring,
-    containers,
-    deepseq,
-    directory,
-    filepath,
-    linear,
-    matrices,
     mtl,
     optparse-applicative,
-    parallel,
-    primitive,
     random,
-    split,
-    text,
     time,
-    transformers,
     vector
   ghc-options:
     -Wall
