@@ -15,10 +15,11 @@ import Helpers
 import qualified GHC.TypeNats
 import Control.Monad.Identity
 import Data.Functor ((<&>), ($>))
+import qualified System.Random as R
 
 type MVectorFloat = MV.MVector (MV.PrimState IO) Float
 
-type TransformerResult dom a = MR.ReaderT TransformerDecoderComponent (StateT (DecoderCache dom) Identity) a
+type TransformerResult dom a = MR.ReaderT TransformerDecoderComponent (StateT (DecoderCache dom) IO) a
 
 data HeadCache dom = HeadCache
   { headKeyCache :: Signal dom CacheAddr -> Signal dom (Maybe (CacheAddr, Float)) -> Signal dom Float
@@ -350,30 +351,6 @@ runLayers layers decoderCache inputToken step = fmap P.fst (foldLayers inputToke
     layerCachePairs :: Vec NumLayers (TransformerLayerComponent, LayerAttentionCache dom)
     layerCachePairs = zip layers layerCaches
 
-transformer
-  :: forall dom. ( Monad (Signal dom))
-  => Helpers.Token
-  -> StepCount
-  -> TransformerResult dom (Signal dom (Vec VocabSize Float))
-transformer inputTokenCode stepCount = do
-  decoder <- MR.ask
-  decoderCache <- get
-  let embeddingLayer = modelEmbedding decoder
-      layers = modelLayers decoder
-      inputTokenVector = embed (vocabulary embeddingLayer) inputTokenCode
-
-  -- runLayers returns a Signal dom (Vec ModelDim Float)
-  let resultSig = runLayers layers decoderCache inputTokenVector stepCount
-
-  -- use the resulting signal as the output vector signal
-  let outputTokenVectorSig = resultSig
-
-  -- put back the (unchanged) decoder cache into state
-  put decoderCache
-
-  -- map through final logits and return the Signal inside the TransformerResult
-  return $ outputTokenVectorSig <&> transformerLogits decoder
-
 parseModelConfigFile :: BG.Get TransformerDecoderComponent
 parseModelConfigFile = do
   _ <- BG.getInt32le
@@ -427,3 +404,79 @@ parseModelConfigFile = do
                 modelLayers = map layer (indicesI :: Vec NumLayers (Index NumLayers)) :: Vec NumLayers TransformerLayerComponent
               }
   return decoder
+
+-- Sampling
+drawSample :: Int -> V.Vector Float -> IO Helpers.Token
+drawSample randomSeed probabilities = do
+  let gen = R.mkStdGen randomSeed
+      (randomValue, _) = R.random gen :: (Float, R.StdGen)
+      cumulativeDistribution = V.scanl1 (+) probabilities
+      selectedIndex = V.length (V.takeWhile (< randomValue) cumulativeDistribution)
+  return $ fromIntegral (min selectedIndex (V.length probabilities - 1))
+
+-- Pure deterministic sampling from probabilities
+drawSamplePure :: Int -> Vec VocabSize Float -> Int
+drawSamplePure seed probabilities =
+    let gen = R.mkStdGen seed
+        (randomValue, _) = R.random gen :: (Float, R.StdGen)
+
+        -- cumulative sum using scanl1'
+        cumulativeDistribution :: Vec VocabSize Float
+        cumulativeDistribution = CV.scanl1 (+) probabilities
+
+        -- find first index where cumulative >= randomValue
+        selectedIndex :: Index VocabSize
+        selectedIndex = maybe maxBound id (findIndex (>= randomValue) cumulativeDistribution)
+
+    in fromEnum selectedIndex
+
+-- | Find the index of the maximum element in a non-empty vector
+argMax :: forall n. (KnownNat n) => Vec n Float -> Int
+argMax vec = fst $ foldl compareMax (0, vec !! 0) (imap (\i x -> (fromEnum i, x)) vec)
+  where
+    compareMax :: (Int, Float) -> (Int, Float) -> (Int, Float)
+    compareMax (maxIdx, maxVal) (i, x)
+      | x > maxVal = (i, x)
+      | otherwise  = (maxIdx, maxVal)
+
+-- Pure transformer function
+transformer
+  :: forall dom. Monad (Signal dom)
+  => Helpers.Token        -- input token
+  -> StepCount
+  -> Float                -- temperature
+  -> [Helpers.Token]      -- prompt tokens
+  -> Int                  -- seed
+  -> TransformerResult dom (Signal dom Helpers.Token)
+transformer inputTokenCode stepCount temperature promptTokens seedValue = do
+  decoder <- MR.ask
+  decoderCache <- get
+
+  let embeddingLayer = modelEmbedding decoder
+      layers = modelLayers decoder
+      inputTokenVector = embed (vocabulary embeddingLayer) inputTokenCode
+      StepCount step = stepCount
+
+      -- Run transformer layers
+      outputTokenVectorSig :: Signal dom (Vec ModelDim Float)
+      outputTokenVectorSig = runLayers layers decoderCache inputTokenVector stepCount
+
+      -- Compute logits
+      logitsSig :: Signal dom (Vec VocabSize Float)
+      logitsSig = liftA2 (flip transformerLogits) outputTokenVectorSig (pure decoder)
+
+      -- Select next token
+      nextTokenSig :: Signal dom Helpers.Token
+      nextTokenSig
+        | step < P.length promptTokens
+        = pure (promptTokens P.!! step)   -- use prompt token
+        | temperature == 0.0
+        = logitsSig <&> \logits -> Helpers.Token $ fromIntegral $ argMax logits
+        | otherwise
+        = logitsSig <&> \logits ->
+            let scaled = map (/ temperature) logits
+            in Helpers.Token $ fromIntegral $ drawSamplePure seedValue scaled
+
+  -- Put back the unchanged cache
+  put decoderCache
+  return nextTokenSig

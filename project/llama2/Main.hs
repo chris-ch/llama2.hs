@@ -5,21 +5,22 @@ import qualified Data.ByteString.Lazy as BS
 import qualified Data.ByteString.Lazy.Char8 as BSC
 import qualified Data.List as DL
 import qualified Options.Applicative as OA
-import qualified System.Random as R
 import qualified Foreign as F
 import Control.Monad.Reader (ReaderT(runReaderT), MonadIO(liftIO), MonadReader(ask))
-import Control.Monad.State (evalStateT )
+import Control.Monad.State (evalStateT, MonadState )
 import Data.Maybe (fromMaybe)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import GHC.Unicode (isSpace)
 import System.IO (hFlush, stdout)
 import Control.Monad (replicateM)
 import Text.Printf (printf)
-import qualified Data.Vector.Unboxed as V
 
 import Helpers
 import Model
 import qualified Clash.Prelude as C
+import qualified Clash.Explicit.Prelude as CEP
+import qualified Clash.Explicit.SimIO as CES
+import qualified Clash.Clocks as CC
 
 type Vocabulary = [BS.ByteString]
 type VocabularyScores = [Float]
@@ -142,27 +143,37 @@ bpeEncode prompt vocab vocabScores =
   let tokens = map (\char -> fromMaybe (error "Character not found in vocabulary") (DL.elemIndex (BS.pack [char]) vocab)) (BS.unpack prompt)
    in applyBPEMerges (map fromIntegral tokens) vocab vocabScores
 
--- Sampling
-drawSample :: Int -> V.Vector Float -> IO Helpers.Token
-drawSample randomSeed probabilities = do
-  let gen = R.mkStdGen randomSeed
-      (randomValue, _) = R.random gen :: (Float, R.StdGen)
-      cumulativeDistribution = V.scanl1 (+) probabilities
-      selectedIndex = V.length (V.takeWhile (< randomValue) cumulativeDistribution)
-  return $ fromIntegral (min selectedIndex (V.length probabilities - 1))
+generateNextToken :: StepCount -> PromptTokens -> Float -> Vocabulary -> Helpers.Token -> Int -> TransformerResult dom (BS.ByteString, Helpers.Token)
+generateNextToken timestep promptTokens temperature vocab tokenCode seedValue = do
+  nextTokenSig <- transformer tokenCode timestep temperature promptTokens seedValue
+  -- C.sample is an IO action, so it must be run with liftIO
+  -- The Signal here represents a stream of values, but in this imperative context,
+  -- we only care about the first value of the stream.
+  let nextToken = C.sample nextTokenSig
+  let word = vocab !! fromIntegral nextToken :: BS.ByteString
+      firstChar = BSC.head word :: Char
+      tokenStr =
+        if tokenCode == 1 && isSpace firstChar
+          then BSC.tail word
+          else word
+  return (tokenStr, nextToken)
 
-generateTokens :: StepCount -> PromptTokens -> Float -> Vocabulary -> Int -> TransformerResult dom ([BS.ByteString], StepCount)
+generateTokens
+  ::  StepCount
+  -> PromptTokens
+  -> Float
+  -> Vocabulary
+  -> Int
+  -> TransformerResult dom  ([BS.ByteString], StepCount)
 generateTokens maxSteps promptTokens temperature vocab seedValue = do
-  network <- ask
-  go network (StepCount 0) [] 1
-  where
-    go network timestep result token
-      | timestep >= maxSteps || (timestep /= StepCount 0 && token == 1) = return (result, timestep)
-      | otherwise = do
-          (tokenStr, nextToken) <- generateNextToken timestep promptTokens temperature vocab token seedValue
-          liftIO $ putStr $ BSC.unpack tokenStr
-          liftIO $ hFlush stdout
-          go network (timestep + StepCount 1) (result ++ [tokenStr]) nextToken
+  let go timestep result token
+        | timestep >= maxSteps || (timestep /= StepCount 0 && token == 1) = return (result, timestep)
+        | otherwise = do
+            (tokenStr, nextToken) <- generateNextToken timestep promptTokens temperature vocab token seedValue
+            liftIO $ putStr $ BSC.unpack tokenStr
+            liftIO $ hFlush stdout
+            go (timestep + StepCount 1) (result ++ [tokenStr]) nextToken
+  go (StepCount 0) [] 1
 
 runModel :: BS.ByteString -> BS.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
 runModel modelFileContent tokenizerFileContent temperature steps prompt seed = do
@@ -174,10 +185,29 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
     config = initModel modelFileContent
     prompt' = fromMaybe "" prompt
     (promptTokens, vocab) = tokenizerInit tokenizerFileContent vocabSize (BSC.pack prompt')
-  attentionKV <- initDecoderCaches
+
   putStrLn "<s>"
   startTime <- getPOSIXTime
-  (_, StepCount countTokens) <- evalStateT (runReaderT (generateTokens (StepCount steps) promptTokens temperature vocab seedValue) config) attentionKV
+
+  -- Create actual clock/reset/enable values for implicit parameters
+  let clk :: C.Clock C.System
+      clk = C.clockGen
+      rst :: C.Reset C.System
+      rst = C.resetGen
+      en  :: C.Enable C.System
+      en  = C.enableGen
+
+  -- Bind implicit parameters for initDecoderCaches
+  let ?clock = clk
+      ?reset = rst
+      ?enable = en
+
+  attentionKV :: DecoderCache C.System <- initDecoderCaches
+
+  (_, StepCount countTokens) <- evalStateT
+    (runReaderT (generateTokens (StepCount steps) promptTokens temperature vocab seedValue) config)
+    attentionKV
+
   endTime <- getPOSIXTime
   let duration :: Integer
       duration = round (endTime - startTime)
@@ -185,30 +215,3 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
       tokensPerSec = fromIntegral countTokens / fromIntegral duration
   printf "\nduration: %ds - (%.02f tokens/s)\n" duration tokensPerSec
   return ()
-
-generateNextToken :: StepCount -> PromptTokens -> Float -> Vocabulary -> Helpers.Token -> Int -> TransformerResult dom (BS.ByteString, Helpers.Token)
-generateNextToken timestep promptTokens temperature vocab tokenCode seedValue = do
-  logitsSig <- transformer tokenCode timestep
-  -- Extract the Vec from the Signal
-  let logits = C.sample logitsSig  -- logits :: Vec VocabSize Float
-  let StepCount step = timestep
-  Helpers.Token nextToken <-
-    if step < length promptTokens
-      then return (promptTokens !! step)
-      else
-        if temperature == 0.0
-          then do
-            -- For greedy decoding, work directly with the Vec
-            return $ fromIntegral (V.maxIndex (V.fromList logits))
-          else do
-            -- For sampling, apply temperature scaling to the Vec, then softmax
-            let scaledLogits = map (/ temperature) logits  -- Vec VocabSize Float
-                transformerOutput = Helpers.softmaxVector scaledLogits  -- Need to ensure this works with VocabSize
-            liftIO $ drawSample seedValue $ (V.fromList . C.toList) transformerOutput
-  let word = vocab !! fromIntegral nextToken :: BS.ByteString
-      firstChar = BSC.head word :: Char
-      tokenStr =
-        if tokenCode == 1 && isSpace firstChar
-          then BSC.tail (vocab !! fromIntegral nextToken)
-          else vocab !! fromIntegral nextToken
-  return (tokenStr, Helpers.Token nextToken)
