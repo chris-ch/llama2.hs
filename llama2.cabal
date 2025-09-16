@@ -63,5 +63,6 @@ executable llama2
     TypeOperators
     ScopedTypeVariables
     StarIsType
+    TupleSections
     FlexibleContexts
   default-language: Haskell2010

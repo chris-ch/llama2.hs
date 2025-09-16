@@ -51,15 +51,15 @@ data RotaryEncodingComponent = RotaryEncodingComponent
   } deriving (Show)
 
 data SingleHeadComponent = SingleHeadComponent
-  { wqHead :: CArray2D ModelDim ModelDim
-  , wkHead :: CArray2D ModelDim ModelDim
-  , wvHead :: CArray2D ModelDim ModelDim
+  { wqHead :: CArray2D HeadDimension ModelDim
+  , wkHead :: CArray2D HeadDimension ModelDim
+  , wvHead :: CArray2D HeadDimension ModelDim
   , rotary :: RotaryEncodingComponent
   } deriving (Show)
 
 data MultiHeadAttentionComponent = MultiHeadAttentionComponent
   { heads    :: Vec NumAttentionHeads SingleHeadComponent
-  , mWo      :: CArray2D ModelDim ModelDim         -- Output projection matrix
+  , mWo      :: CArray2D ModelDim ModelDim -- Output projection matrix
   , rmsAtt   :: CVector ModelDim  -- RMSNorm before QKV projection
   } deriving (Show)
 
@@ -109,6 +109,22 @@ softmax values = map (/ sumExpValues) expValues
     maxVal = maximum values
     expValues = map (\x -> exp (x - maxVal)) values
     sumExpValues = sum expValues
+    
+softmaxVocab :: Vec VocabSize Float -> Vec VocabSize Float
+softmaxVocab values = map (/ sumExpValues) expValues
+  where
+    maxVal = maximum values
+    expValues = map (\x -> exp (x - maxVal)) values
+    sumExpValues = sum expValues
+
+softmaxVector :: Vec n Float -> Signal dom Float
+softmaxVector values = 
+  let valuesList = toList values
+      maxVal = P.maximum valuesList  -- Regular Prelude maximum on lists
+      expValues = P.map (\x -> exp (x - maxVal)) valuesList
+      sumExpValues = sum expValues
+      resultList = P.map (/ sumExpValues) expValues
+  in fromList resultList
 
 -- Embed a token
 embed :: CArray2D VocabSize ModelDim -> Token -> Vec ModelDim Float
@@ -118,17 +134,17 @@ embed (CArray2D vocab) (Token tokenCode) = vocab !! (fromIntegral tokenCode :: I
 applyRotation
   :: RotaryEncodingComponent
   -> StepCount
-  -> Vec ModelDim Float
-  -> Vec ModelDim Float
+  -> Vec HeadDimension Float
+  -> Vec HeadDimension Float
 applyRotation rot step tokenVec =
   let CVector cosFrequencies = getRow step (freqCos rot)
       CVector sinFrequencies = getRow step (freqSin rot)
   in applyRotaryPositionEncoding tokenVec cosFrequencies sinFrequencies
 
-applyRotaryPositionEncoding :: Vec ModelDim Float    -- input vector
+applyRotaryPositionEncoding :: Vec HeadDimension Float    -- input vector
   -> Vec FreqDim Float  -- cosFrequencies
   -> Vec FreqDim Float  -- sinFrequencies
-  -> Vec ModelDim Float
+  -> Vec HeadDimension Float
 applyRotaryPositionEncoding inputVec cosVec sinVec =
   imap rotatePair inputVec
   where
@@ -154,8 +170,8 @@ cVecZipWith :: (Float -> Float -> Float)
             -> CVector n
 cVecZipWith f (CVector v1) (CVector v2) = CVector $ zipWith f v1 v2
 
-runFeedForward :: FeedForwardNetworkComponent -> CVector ModelDim -> CVector ModelDim
-runFeedForward feedForwardNetwork (CVector inputToken) = feedforwardNetworkOutput' where
+runFeedForward :: FeedForwardNetworkComponent -> Vec ModelDim Float -> Vec ModelDim Float
+runFeedForward feedForwardNetwork inputToken = feedforwardNetworkOutput' where
     CVector rmsFfnWeights = fRMSFfn feedForwardNetwork
     w1 = fW1 feedForwardNetwork
     w2 = fW2 feedForwardNetwork
@@ -165,17 +181,17 @@ runFeedForward feedForwardNetwork (CVector inputToken) = feedforwardNetworkOutpu
     upProjectionOutput' = matrixVectorMult w3 normalizedInput
     gateOutput = CVector $ map sigmoidLinearUnit gateOutput'
 
-    feedforwardNetworkOutput' = matrixVectorMult w2 (cVecZipWith (*) gateOutput upProjectionOutput')
+    CVector feedforwardNetworkOutput' = matrixVectorMult w2 (cVecZipWith (*) gateOutput upProjectionOutput')
 
--- QKV per head
-runSingleHeadQKV :: SingleHeadComponent -> Vec ModelDim Float -> (CVector ModelDim, CVector ModelDim, CVector ModelDim)
+-- QKV per head - should return HeadDimension vectors, not ModelDim
+runSingleHeadQKV :: SingleHeadComponent -> Vec ModelDim Float -> (Vec HeadDimension Float, Vec HeadDimension Float, Vec HeadDimension Float)
 runSingleHeadQKV headComp normalizedInput = (q, k, v) where
-    q = matrixVectorMult (wqHead headComp) (CVector normalizedInput)
-    k = matrixVectorMult (wkHead headComp) (CVector normalizedInput)
-    v = matrixVectorMult (wvHead headComp) (CVector normalizedInput)
+    CVector q = matrixVectorMult (wqHead headComp) (CVector normalizedInput)  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
+    CVector k = matrixVectorMult (wkHead headComp) (CVector normalizedInput)  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
+    CVector v = matrixVectorMult (wvHead headComp) (CVector normalizedInput)  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
 
 -- Rotary application
-applyRotaryToHead :: SingleHeadComponent -> StepCount -> (Vec ModelDim Float , Vec ModelDim Float ) -> (Vec ModelDim Float , Vec ModelDim Float )
+applyRotaryToHead :: SingleHeadComponent -> StepCount -> (Vec HeadDimension Float , Vec HeadDimension Float ) -> (Vec HeadDimension Float , Vec HeadDimension Float )
 applyRotaryToHead headComp step (q, k) = (q', k') where
     rot = rotary headComp
     q' = applyRotation rot step q

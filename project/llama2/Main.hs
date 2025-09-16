@@ -151,28 +151,6 @@ drawSample randomSeed probabilities = do
       selectedIndex = V.length (V.takeWhile (< randomValue) cumulativeDistribution)
   return $ fromIntegral (min selectedIndex (V.length probabilities - 1))
 
-generateNextToken :: StepCount -> PromptTokens -> Float -> Vocabulary -> Helpers.Token -> Int -> TransformerResult dom (BS.ByteString, Helpers.Token)
-generateNextToken timestep promptTokens temperature vocab tokenCode seedValue = do
-  logits <- transformer tokenCode timestep
-  let StepCount step = timestep
-  Helpers.Token nextToken <-
-    if step < length promptTokens
-      then return (promptTokens !! step)
-      else
-        if temperature == 0.0
-          then return $ fromIntegral (V.maxIndex (V.fromList . C.toList $ logits))
-          else do
-            let
-              transformerOutput = Helpers.softmax (C.map (/ temperature) logits)
-            liftIO $ drawSample seedValue $ (V.fromList . C.toList) transformerOutput
-  let word = vocab !! fromIntegral nextToken :: BS.ByteString
-      firstChar = BSC.head word :: Char
-      tokenStr =
-        if tokenCode == 1 && isSpace firstChar
-          then BSC.tail (vocab !! fromIntegral nextToken)
-          else vocab !! fromIntegral nextToken
-  return (tokenStr, Helpers.Token nextToken)
-
 generateTokens :: StepCount -> PromptTokens -> Float -> Vocabulary -> Int -> TransformerResult dom ([BS.ByteString], StepCount)
 generateTokens maxSteps promptTokens temperature vocab seedValue = do
   network <- ask
@@ -207,3 +185,30 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
       tokensPerSec = fromIntegral countTokens / fromIntegral duration
   printf "\nduration: %ds - (%.02f tokens/s)\n" duration tokensPerSec
   return ()
+
+generateNextToken :: StepCount -> PromptTokens -> Float -> Vocabulary -> Helpers.Token -> Int -> TransformerResult dom (BS.ByteString, Helpers.Token)
+generateNextToken timestep promptTokens temperature vocab tokenCode seedValue = do
+  logitsSig <- transformer tokenCode timestep
+  -- Extract the Vec from the Signal
+  let logits = C.sample logitsSig  -- logits :: Vec VocabSize Float
+  let StepCount step = timestep
+  Helpers.Token nextToken <-
+    if step < length promptTokens
+      then return (promptTokens !! step)
+      else
+        if temperature == 0.0
+          then do
+            -- For greedy decoding, work directly with the Vec
+            return $ fromIntegral (V.maxIndex (V.fromList logits))
+          else do
+            -- For sampling, apply temperature scaling to the Vec, then softmax
+            let scaledLogits = map (/ temperature) logits  -- Vec VocabSize Float
+                transformerOutput = Helpers.softmaxVector scaledLogits  -- Need to ensure this works with VocabSize
+            liftIO $ drawSample seedValue $ (V.fromList . C.toList) transformerOutput
+  let word = vocab !! fromIntegral nextToken :: BS.ByteString
+      firstChar = BSC.head word :: Char
+      tokenStr =
+        if tokenCode == 1 && isSpace firstChar
+          then BSC.tail (vocab !! fromIntegral nextToken)
+          else vocab !! fromIntegral nextToken
+  return (tokenStr, Helpers.Token nextToken)
