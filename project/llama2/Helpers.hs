@@ -1,10 +1,41 @@
-module Helpers where
+module Helpers (
+  NumAttentionHeads
+  , NumLayers
+  , SeqLen
+  , HeadDimension
+  , ModelDim
+  , HiddenDim
+  , VocabSize
+  , TransformerLayerComponent(..)
+  , TransformerDecoderComponent(..)
+  , Token(..)
+  , SingleHeadComponent(..)
+  , MultiHeadAttentionComponent(..)
+  , RotaryEncodingComponent(..)
+  , FeedForwardNetworkComponent(..)
+  ,EmbeddingComponent(..)
+  , StepCount(..)
+  , CArray2D(..)
+  , runSingleHeadQKV
+  ,applyRotaryToHead
+  , rmsNorm
+  , computeAttentionWeights
+  , computeAttentionScores
+  , computeAttentionOutput
+  , matrixVectorMult
+  , computeFeedForward
+  , embed
+  , transformerLogits
+  , argMax
+  , drawSample
+  , computeMultiHeadAttention
+) where
 
 import Clash.Prelude
 import qualified Prelude as P
-import qualified Foreign as F
 import qualified System.Random as R
 import qualified Clash.Sized.Vector as CV
+import Data.Maybe (fromMaybe)
 
 -- model config 110M
 type ModelDim = 768
@@ -12,7 +43,7 @@ type HiddenDim = 2048
 type NumLayers = 12
 type NumAttentionHeads = 12
 vocabSize :: Integer
-vocabSize = 32000 
+vocabSize = 32000
 type VocabSize = 32000 :: Nat
 type SeqLen         = 1024
 type HeadDimension  = 64
@@ -90,14 +121,6 @@ rmsNorm vec weights =
 -- Activation
 sigmoidLinearUnit :: Float -> Float
 sigmoidLinearUnit x = x / (1.0 + exp (-x))
-
--- Softmax for non-empty vectors
-softmax :: (KnownNat (n + 1)) => Vec (n + 1) Float -> Vec (n + 1) Float
-softmax values = map (/ sumExpValues) expValues
-  where
-    maxVal = maximum values
-    expValues = map (\x -> exp (x - maxVal)) values
-    sumExpValues = sum expValues
 
 -- Embed a token
 embed :: CArray2D VocabSize ModelDim -> Token -> Vec ModelDim Float
@@ -192,8 +215,8 @@ softmaxVec xs =
   in map (/ s) exps
 
 -- Pure deterministic sampling from probabilities
-drawSamplePure :: Int -> Vec VocabSize Float -> Int
-drawSamplePure seed probabilities =
+drawSample :: Int -> Vec VocabSize Float -> Unsigned 32
+drawSample seed probabilities =
     let gen = R.mkStdGen seed
         (randomValue, _) = R.random gen :: (Float, R.StdGen)
 
@@ -203,6 +226,62 @@ drawSamplePure seed probabilities =
 
         -- find first index where cumulative >= randomValue
         selectedIndex :: Index VocabSize
-        selectedIndex = maybe maxBound id (findIndex (>= randomValue) cumulativeDistribution)
+        selectedIndex = fromMaybe maxBound (findIndex (>= randomValue) cumulativeDistribution)
 
-    in fromEnum selectedIndex
+    in fromIntegral (fromEnum selectedIndex)
+
+-- Pure attention computation
+computeAttentionScores
+  :: Vec HeadDimension Float        -- query
+  -> Vec SeqLen (Vec HeadDimension Float)  -- keys
+  -> Vec SeqLen Float
+computeAttentionScores query keys =
+  let headDim = snatToNum (SNat @HeadDimension)
+      scaling = P.sqrt (headDim :: Float)
+  in map (\key -> dotVec query key / scaling) keys
+
+-- Pure attention weights computation
+computeAttentionWeights
+  :: Vec SeqLen Float
+  -> Vec SeqLen Float
+computeAttentionWeights = softmaxVec
+
+-- Pure attention output computation
+computeAttentionOutput
+  :: Vec SeqLen Float                    -- attention weights
+  -> Vec SeqLen (Vec HeadDimension Float)    -- values
+  -> Vec HeadDimension Float
+computeAttentionOutput weights values =
+  let zeroVec = repeat 0 :: Vec HeadDimension Float
+      weightedAdd acc (w, vrow) = zipWith (+) acc (map (* w) vrow)
+      pairs = zip weights values
+  in foldl weightedAdd zeroVec pairs
+
+-- Pure multi-head attention computation
+computeMultiHeadAttention
+  :: MultiHeadAttentionComponent
+  -> Vec ModelDim Float                 -- input
+  -> Vec NumAttentionHeads (Vec HeadDimension Float)  -- queries
+  -> Vec NumAttentionHeads (Vec SeqLen (Vec HeadDimension Float))  -- keys per head
+  -> Vec NumAttentionHeads (Vec SeqLen (Vec HeadDimension Float))  -- values per head
+  -> Vec ModelDim Float
+computeMultiHeadAttention mha input queries keysPerHead valuesPerHead =
+  let headOutputs = zipWith3 (\q ks vs ->
+        let scores = computeAttentionScores q ks
+            weights = computeAttentionWeights scores
+        in computeAttentionOutput weights vs
+        ) queries keysPerHead valuesPerHead
+      concatenatedHeads = concat headOutputs
+      outputProjection = matrixVectorMult (mWo mha) concatenatedHeads
+      normalizedInput = rmsNorm input (rmsAtt mha)
+  in zipWith (+) normalizedInput outputProjection
+
+-- Pure feed-forward computation
+computeFeedForward
+  :: FeedForwardNetworkComponent
+  -> Vec ModelDim Float
+  -> Vec ModelDim Float
+computeFeedForward ffn input =
+  let normalizedInput = rmsNorm input (fRMSFfn ffn)
+      ffnOutput = runFeedForward ffn normalizedInput
+  in zipWith (+) input ffnOutput

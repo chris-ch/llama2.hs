@@ -5,75 +5,41 @@ import Clash.Prelude
 import qualified Clash.Sized.Vector as CV
 import qualified Data.Binary.Get as BG
 import qualified Data.Vector.Unboxed as V
-import qualified Data.Vector.Unboxed.Mutable as MV
 import qualified Foreign as F
-import qualified Control.Monad.Reader as MR
-import Control.Monad.State (StateT, get, MonadState (put))
 import GHC.IO (unsafePerformIO)
 import Data.ByteString (useAsCString)
-import Helpers
 import qualified GHC.TypeNats
-import Data.Functor ((<&>), ($>))
+import Data.Functor (($>))
 import qualified Clash.Explicit.SimIO as SimIO
+import Data.Foldable (for_)
 
-type MVectorFloat = MV.MVector (MV.PrimState IO) Float
+import Helpers ( NumAttentionHeads
+  , NumLayers
+  , SeqLen
+  , HeadDimension
+  , ModelDim
+  , HiddenDim
+  , VocabSize
+  , Token(..)
+  , TransformerLayerComponent(..), TransformerDecoderComponent (..)
+  , SingleHeadComponent(..)
+  , MultiHeadAttentionComponent(..)
+  , RotaryEncodingComponent(..)
+  , FeedForwardNetworkComponent(..), EmbeddingComponent (..),
+  runSingleHeadQKV, applyRotaryToHead, StepCount (..),
+  computeFeedForward, transformerLogits, argMax, embed,
+  drawSample,
+   CArray2D (..), computeMultiHeadAttention
+  )
 
-type TransformerResult dom a = MR.ReaderT TransformerDecoderComponent (StateT (DecoderCache dom) SimIO.SimIO) a
-
-data HeadCache dom = HeadCache
-  { headKeyCache :: Signal dom CacheAddr -> Signal dom (Maybe (CacheAddr, Float)) -> Signal dom Float
-  , headValueCache :: Signal dom CacheAddr -> Signal dom (Maybe (CacheAddr, Float)) -> Signal dom Float
-  }
-
-newtype LayerAttentionCache dom = LayerAttentionCache
-  { multiHeadCache :: Vec NumAttentionHeads (HeadCache dom)
-  }
-
-newtype DecoderCache dom = DecoderCache
-  { layerCache :: Vec NumLayers (LayerAttentionCache dom)
-  }
+-- ============================================================================
+-- Types and Cache Management
+-- ============================================================================
 
 type CacheDepth = NumLayers GHC.TypeNats.* NumAttentionHeads GHC.TypeNats.* SeqLen GHC.TypeNats.* HeadDimension
 type CacheAddr  = Index CacheDepth
 
-initKeyRams
-  :: forall dom
-   . HiddenClockResetEnable dom
-  => Vec NumAttentionHeads
-       (Signal dom CacheAddr
-     -> Signal dom (Maybe (CacheAddr, Float))
-     -> Signal dom Float)
-initKeyRams = repeat (blockRam (replicate (SNat @CacheDepth) 0))
-
-initValueRams
-  :: forall dom
-   . HiddenClockResetEnable dom
-  => Vec NumAttentionHeads
-       (Signal dom CacheAddr
-     -> Signal dom (Maybe (CacheAddr, Float))
-     -> Signal dom Float)
-initValueRams = repeat (blockRam (replicate (SNat @CacheDepth) 0))
-
-readRowRAM
-  :: forall dom
-   . (KnownNat HeadDimension)
-  => (Signal dom CacheAddr -> Signal dom (Maybe (CacheAddr, Float)) -> Signal dom Float)
-  -> Index NumLayers
-  -> Index NumAttentionHeads
-  -> Index SeqLen
-  -> Vec HeadDimension (Signal dom Float)
-readRowRAM ram l h s = map (\d -> ram (pure $ cacheAddr l h s d) (pure Nothing)) indicesI
-
-writeRowRAM
-  :: forall dom
-   . (Signal dom CacheAddr -> Signal dom (Maybe (CacheAddr, Float)) -> Signal dom Float)
-  -> Index NumLayers
-  -> Index NumAttentionHeads
-  -> Index SeqLen
-  -> Vec HeadDimension Float
-  -> Vec HeadDimension (Maybe (CacheAddr, Float))
-writeRowRAM _ram l h s = zipWith (\d val -> Just (cacheAddr l h s d, val)) indicesI
-
+-- Pure cache addressing
 cacheAddr
   :: Index NumLayers
   -> Index NumAttentionHeads
@@ -92,6 +58,191 @@ cacheAddr l h s d =
       + fromIntegral l * layerSize
   in addr
 
+-- Simplified cache structure - just the RAM functions
+data AttentionCache dom = AttentionCache
+  { keyCache :: Signal dom CacheAddr -> Signal dom (Maybe (CacheAddr, Float)) -> Signal dom Float
+  , valueCache :: Signal dom CacheAddr -> Signal dom (Maybe (CacheAddr, Float)) -> Signal dom Float
+  }
+
+-- Initialize caches with block RAMs
+initAttentionCache
+  :: forall dom. HiddenClockResetEnable dom
+  => AttentionCache dom
+initAttentionCache = AttentionCache
+  { keyCache = blockRam (replicate (SNat @CacheDepth) 0)
+  , valueCache = blockRam (replicate (SNat @CacheDepth) 0)
+  }
+
+-- ============================================================================
+-- Cache Access Functions (Handle Signals)
+-- ============================================================================
+
+-- Read a complete sequence from cache for one head
+readCachedSequence
+  :: forall dom
+   . (KnownNat SeqLen, KnownNat HeadDimension)
+  => (Signal dom CacheAddr -> Signal dom (Maybe (CacheAddr, Float)) -> Signal dom Float)
+  -> Index NumLayers
+  -> Index NumAttentionHeads
+  -> Int  -- current sequence position
+  -> Signal dom (Vec SeqLen (Vec HeadDimension Float))
+readCachedSequence ram layerIdx headIdx seqPos =
+  let -- Create a mask for valid sequence positions
+      isValidPos :: Index SeqLen -> Bool
+      isValidPos i = fromIntegral i < seqPos
+
+      -- Read all positions, but we'll mask invalid ones later
+      readRow :: Index SeqLen -> Signal dom (Vec HeadDimension Float)
+      readRow s = traverse (\d ->
+        ram (pure $ cacheAddr layerIdx headIdx s d) (pure Nothing)
+        ) indicesI
+
+      -- Read all sequence positions
+      allRows :: Signal dom (Vec SeqLen (Vec HeadDimension Float))
+      allRows = traverse readRow indicesI
+
+      -- Mask invalid positions with zeros
+      zeroVec = repeat 0 :: Vec HeadDimension Float
+
+  in fmap (imap (\i row -> if isValidPos i then row else zeroVec)
+     ) allRows
+
+-- Write current key/value to cache
+writeToCacheRow
+  :: forall dom
+   . (Signal dom CacheAddr -> Signal dom (Maybe (CacheAddr, Float)) -> Signal dom Float)
+  -> Index NumLayers
+  -> Index NumAttentionHeads
+  -> Int  -- current sequence position
+  -> Vec HeadDimension Float
+  -> Signal dom ()  -- side effect
+writeToCacheRow ram layerIdx headIdx seqPos vec =
+  let seqIdx = fromIntegral seqPos :: Index SeqLen
+      writeOps = imap (\d val ->
+        ram (pure $ cacheAddr layerIdx headIdx seqIdx d)
+            (pure $ Just (cacheAddr layerIdx headIdx seqIdx d, val)) ) vec
+  in sequenceA writeOps $> ()
+
+-- ============================================================================
+-- Main Transformer Logic
+-- ============================================================================
+
+-- Single transformer layer with proper cache management
+transformerLayer
+  :: forall dom
+   . ( Monad (Signal dom))
+  =>TransformerLayerComponent
+  -> AttentionCache dom
+  -> Index NumLayers
+  -> Int  -- current sequence position
+  -> Signal dom (Vec ModelDim Float)  -- input token
+  -> Signal dom (Vec ModelDim Float)  -- output token
+transformerLayer layer cache layerIdx seqPos inputSig = do
+  let mha = multiHeadAttention layer
+      ffn = feedforwardNetwork layer
+      keyRam = keyCache cache
+      valueRam = valueCache cache
+
+  inputSig >>= \input -> do
+    -- Generate Q, K, V with rotary encoding for current input
+    let currentQKV = map (\hIdx ->
+          let headComp = heads mha !! hIdx
+              (q, k, v) = runSingleHeadQKV headComp input
+              -- Apply rotary encoding here
+              (q_rot, k_rot) = applyRotaryToHead headComp (StepCount (fromIntegral seqPos)) (q, k)
+          in (q_rot, k_rot, v)
+          ) indicesI
+
+        queries = map (\(q, _, _) -> q) currentQKV
+
+    -- Write ROTARY-ENCODED K, V to cache
+    for_ (imap (,) currentQKV) $ \(hIdx, (k, v, _)) ->
+        writeToCacheRow keyRam   layerIdx hIdx seqPos k *>
+        writeToCacheRow valueRam layerIdx hIdx seqPos v
+
+    -- Read cached sequences INCLUDING the just-written current timestep
+    keysPerHead <- traverse (\hIdx ->
+      readCachedSequence keyRam layerIdx hIdx (seqPos + 1) -- +1 to include current
+      ) indicesI
+
+    valuesPerHead <- traverse (\hIdx ->
+      readCachedSequence valueRam layerIdx hIdx (seqPos + 1)
+      ) indicesI
+
+    -- Compute attention and feed-forward (pure computations)
+    let -- Apply RMS normalization to input for attention
+        tokenAfterAttention = computeMultiHeadAttention mha input queries keysPerHead valuesPerHead
+        -- Apply feed-forward network with its own normalization and residual
+        ffnOutput = computeFeedForward ffn tokenAfterAttention
+        -- Final output (second residual connection handled in computeFeedForward)
+        layerOutput = ffnOutput
+
+    return layerOutput
+
+-- Full transformer with all layers
+transformer
+  :: forall dom .
+     (Monad (Signal dom))
+  => TransformerDecoderComponent                 -- ^ decoder (holds embedding, layers, logits)
+  -> Vec NumLayers (AttentionCache dom)          -- ^ per‑layer caches
+  -> Int                                         -- ^ current sequence position (step)
+  -> Token                                       -- ^ input token
+  -> Float                                       -- ^ temperature (0 → deterministic)
+  -> Int                                         -- ^ RNG seed for sampling
+  -> [Token]                                     -- ^ prompt tokens (may be empty)
+  -> Signal dom Token                            -- ^ produced token
+transformer decoder caches seqPos inputToken temperature seed promptTokens = do
+  let embedding = modelEmbedding decoder
+      layers    = modelLayers decoder
+
+      -- Embed the incoming token
+      inputVector :: Vec ModelDim Float
+      inputVector = embed (vocabulary embedding) inputToken
+
+      ------------------------------------------------------------------
+      -- Recursive processing of all layers
+      ------------------------------------------------------------------
+      processLayers
+        :: Vec ModelDim Float          -- ^ current hidden vector
+        -> Int                         -- ^ layer index we are about to run
+        -> Signal dom (Vec ModelDim Float)
+      processLayers vec layerIdx
+        | layerIdx >= length layers = return vec
+        | otherwise = do
+            let layer = layers !! layerIdx
+                cache = caches   !! layerIdx
+            out <- transformerLayer layer cache (fromIntegral layerIdx) seqPos (pure vec)
+            processLayers out (layerIdx + 1)
+
+  -- Run through every layer
+  finalHidden <- processLayers inputVector 0
+
+  ------------------------------------------------------------------
+  -- Logits & token selection
+  ------------------------------------------------------------------
+  let rawLogits :: Vec VocabSize Float
+      rawLogits = transformerLogits decoder finalHidden
+
+      -- Helper to pick the next token from a probability vector
+      pickToken :: Vec VocabSize Float -> Token
+      pickToken probs
+        | temperature == 0.0 = fromIntegral $ argMax probs
+        | otherwise =
+            let scaled = map (/ temperature) probs
+            in Token $ drawSample seed scaled
+
+  -- Prompt‑token shortcut: if we are still inside the prompt length,
+  -- just emit the corresponding prompt token.
+  let nextToken
+        | seqPos < P.length promptTokens = promptTokens P.!! seqPos
+        | otherwise                    = pickToken rawLogits
+
+  return nextToken
+
+-- ============================================================================
+-- File Parsing
+-- ============================================================================
+
 readVector :: Int -> BG.Get (V.Vector Float)
 readVector count = do
   byteData <- BG.getByteString (count * 4)
@@ -106,15 +257,13 @@ readVec1D = do
     vec <- readVector total
     return $ CV.unsafeFromList (V.toList vec)
 
--- Fixed readVec2D function
 readVec2D :: forall n m. (KnownNat n, KnownNat m) => BG.Get (Vec n (Vec m Float))
 readVec2D = do
     let n = snatToNum (SNat :: SNat n)
         m = snatToNum (SNat :: SNat m)
         total = n * m
-    vec <- readVector total  -- this returns V.Vector Float (unboxed)
-    let -- Convert to list and then chunk it
-        floatList = V.toList vec
+    vec <- readVector total
+    let floatList = V.toList vec
         chunks = chunksOf m floatList
         vecs = P.map CV.unsafeFromList chunks
     return $ CV.unsafeFromList vecs
@@ -130,214 +279,16 @@ readVec3D = do
         p = snatToNum (SNat :: SNat p)
         total = n * m * p
     vec <- readVector total
-    let
-      floatList = V.toList vec
-      innerChunks = chunksOf p floatList
-      innerVecs = P.map CV.unsafeFromList innerChunks
-      middleChunks = chunksOf m innerVecs
-      middleVecs = P.map CV.unsafeFromList middleChunks
+    let floatList = V.toList vec
+        innerChunks = chunksOf p floatList
+        innerVecs = P.map CV.unsafeFromList innerChunks
+        middleChunks = chunksOf m innerVecs
+        middleVecs = P.map CV.unsafeFromList middleChunks
     return $ CV.unsafeFromList middleVecs
   where
     chunksOf :: Int -> [a] -> [[a]]
     chunksOf _ [] = []
     chunksOf k xs = P.take k xs : chunksOf k (P.drop k xs)
-
-initDecoderCaches
-  :: forall dom. Vec NumAttentionHeads
-       (Signal dom CacheAddr
-     -> Signal dom (Maybe (CacheAddr, Float))
-     -> Signal dom Float)
-  -> Vec NumAttentionHeads
-       (Signal dom CacheAddr
-     -> Signal dom (Maybe (CacheAddr, Float))
-     -> Signal dom Float)
-  -> IO (DecoderCache dom)
-initDecoderCaches keyRams valueRams = do
-  -- Create one LayerAttentionCache per layer, but use the same per-head RAM vector
-  let layerCaches = CV.repeat @NumLayers $
-        LayerAttentionCache $
-          imap (\hIdx _ ->
-            HeadCache
-              { headKeyCache = keyRams  !! hIdx
-              , headValueCache = valueRams !! hIdx
-              }
-          ) keyRams
-  return $ DecoderCache { layerCache = layerCaches }
-
-readRow
-  :: forall dom.
-     ( KnownNat HeadDimension )
-  => (Signal dom CacheAddr -> Signal dom (Maybe (CacheAddr, Float)) -> Signal dom Float)
-  -> Index NumLayers
-  -> Index NumAttentionHeads
-  -> Index SeqLen
-  -> Signal dom (Vec HeadDimension Float)
-readRow ram l h s =
-  P.traverse (\d -> ram (pure $ cacheAddr l h s d) (pure Nothing)) indicesI
-
-readPrefixRowsRam
-  :: forall dom.
-     ( KnownNat SeqLen
-     , KnownNat HeadDimension )
-  =>(Signal dom CacheAddr -> Signal dom (Maybe (CacheAddr, Float)) -> Signal dom Float)
-  -> Index NumLayers
-  -> Index NumAttentionHeads
-  -> Signal dom (Vec SeqLen (Vec HeadDimension Float))
-readPrefixRowsRam ram l h = do
-  let seqIndices = indicesI :: Vec SeqLen (Index SeqLen)
-      rows = map (readRow ram l h) seqIndices
-  sequenceA rows
-
-updateCache :: (Signal dom CacheAddr -> Signal dom (Maybe (CacheAddr, Float)) -> Signal dom Float)
-            -> StepCount
-            -> Vec HeadDimension Float
-            -> Signal dom ()
-updateCache ram (StepCount step) vec =
-  let writes = CV.map (\d ->
-                let addr = cacheAddr 0 0 (fromIntegral step :: Index SeqLen) d
-                in ram (pure addr) (pure $ Just (addr, vec !! d))
-              ) indicesI
-  in sequenceA writes $> ()  -- sequence into a signal and discard values
-
-singleHeadAttention
-  :: forall dom. HeadCache dom
-  -> Index NumAttentionHeads        -- head index
-  -> Vec HeadDimension Float       -- qHead (Vec, not list)
-  -> StepCount
-  -> Signal dom (Vec HeadDimension Float)
-singleHeadAttention (HeadCache kcRam vcRam) hIdx qHead (StepCount stepInt) =
-  let headDim = snatToNum (SNat @HeadDimension)
-      scaling = P.sqrt (headDim :: Float)
-      layerIdx = fromIntegral stepInt :: Index NumLayers
-
-      -- readPrefixRowsRam already returns a Signal, so bind with let (not <-)
-      kRowsSig :: Signal dom (Vec SeqLen (Vec HeadDimension Float))
-      kRowsSig = readPrefixRowsRam kcRam layerIdx hIdx
-
-      vRowsSig :: Signal dom (Vec SeqLen (Vec HeadDimension Float))
-      vRowsSig = readPrefixRowsRam vcRam layerIdx hIdx
-
-      -- compute scores as a Vec SeqLen Float inside the Signal
-      scoresSig :: Signal dom (Vec SeqLen Float)
-      scoresSig = fmap ((\q kRows -> map (\kRow -> dotVec q kRow / scaling) kRows) qHead) kRowsSig
-
-      attWeightsSig :: Signal dom (Vec SeqLen Float)
-      attWeightsSig = fmap softmaxVec scoresSig
-
-      resultSig :: Signal dom (Vec HeadDimension Float)
-      resultSig = liftA2 (\attWeights vRows ->
-        -- weighted sum over sequence
-        let zeroVec = repeat 0 :: Vec HeadDimension Float
-            weightedAdd acc (w, vrow) = zipWith (+) acc (map (* w) vrow)
-            pairs = zip attWeights vRows :: Vec SeqLen (Float, Vec HeadDimension Float)
-        in foldl weightedAdd zeroVec pairs
-        ) attWeightsSig vRowsSig
-  in resultSig
-
-runLayer
-  :: forall dom. (Monad (Signal dom))
-  =>MultiHeadAttentionComponent
-  -> FeedForwardNetworkComponent
-  -> LayerAttentionCache dom
-  -> Vec ModelDim Float
-  -> StepCount
-  -> Signal dom (Vec ModelDim Float)
-runLayer mha feedForwardNetwork layerCache inputToken step = do
-  let rmsWeights = rmsAtt mha
-      normalizedInput = rmsNorm inputToken rmsWeights
-      outputProjectionWeights = mWo mha
-      headCaches = multiHeadCache layerCache
-
-  -- Compute QKV and update caches for each head (Vec-based)
-  let qkvResults :: Vec NumAttentionHeads (Vec HeadDimension Float, HeadCache dom)
-      qkvResults = imap (\hIdx hc ->
-                          let headComp = heads mha !! hIdx
-                              (q, k, _) = runSingleHeadQKV headComp normalizedInput
-                              (q', _) = applyRotaryToHead headComp step (q, k)
-                          in (q', hc)
-                        ) headCaches
-
-  -- Write keys/values to cache (side-effecting signals)
-  let cacheWrites :: Vec NumAttentionHeads (Signal dom ())
-      cacheWrites = imap (\hIdx (_, hc) ->
-                            let HeadCache kcRam vcRam = hc
-                                (_, k, v) = runSingleHeadQKV (heads mha !! hIdx) normalizedInput
-                                (_, k') = applyRotaryToHead (heads mha !! hIdx) step (k, k)
-                                kcWrite = updateCache kcRam step k'
-                                vcWrite = updateCache vcRam step v
-                            in kcWrite *> vcWrite
-                        ) qkvResults
-
-  -- Combine all cache write signals into one (ignored output)
-  _ <- sequenceA cacheWrites
-
-  -- Compute attention output for each head
-  let headOutputsSig :: Vec NumAttentionHeads (Signal dom (Vec HeadDimension Float))
-      headOutputsSig = imap (\hIdx (qHead, hc) -> singleHeadAttention hc hIdx qHead step) qkvResults
-
-      -- Sequence Vec of signals -> Signal of Vec
-      multiHeadOutSig :: Signal dom (Vec NumAttentionHeads (Vec HeadDimension Float))
-      multiHeadOutSig = sequenceA headOutputsSig
-
-  -- Combine heads and apply output projection
-  let attentionDeltaSig :: Signal dom (Vec ModelDim Float)
-      attentionDeltaSig = multiHeadOutSig <&> \headOutputs ->
-        let concatenatedHeads :: Vec ModelDim Float
-            concatenatedHeads = concat headOutputs
-            headsOut = matrixVectorMult outputProjectionWeights concatenatedHeads
-        in headsOut
-
-  -- Residual connection after attention
-  let tokenAfterAttentionSig = fmap (Clash.Prelude.zipWith (+) inputToken) attentionDeltaSig
-
-  -- Apply feed-forward network
-  let ffnOutSig = fmap (runFeedForward feedForwardNetwork) tokenAfterAttentionSig
-
-  -- Final residual connection
-  let finalTokenSig = liftA2 (Clash.Prelude.zipWith (+)) tokenAfterAttentionSig ffnOutSig
-
-  finalTokenSig
-
-runLayers
-  :: forall dom. ( Monad (Signal dom))
-  => Vec NumLayers TransformerLayerComponent
-  -> DecoderCache dom
-  -> Vec ModelDim Float
-  -> StepCount
-  -> Signal dom (Vec ModelDim Float)
-runLayers layers decoderCache inputToken step = fmap P.fst (foldLayers inputToken layerCachePairs)
-  where
-    -- Extract layer caches from DecoderCache
-    layerCaches = layerCache decoderCache
-
-    -- Helper function to process a single layer
-    processLayer
-      :: TransformerLayerComponent
-      -> LayerAttentionCache dom
-      -> Vec ModelDim Float
-      -> Signal dom (Vec ModelDim Float)
-    processLayer layer layerCache token = runLayer (multiHeadAttention layer) (feedforwardNetwork layer) layerCache token step
-    -- Fold over layers and caches to produce the final token and updated caches
-
-    -- Fold over layers and caches to produce the final token and updated caches
-    foldLayers
-      :: Vec ModelDim Float
-      -> Vec NumLayers (TransformerLayerComponent, LayerAttentionCache dom)
-      -> Signal dom (Vec ModelDim Float, [LayerAttentionCache dom])
-    foldLayers token = Clash.Prelude.foldr combineLayer (pure (token, []))
-      where
-        combineLayer
-          :: (TransformerLayerComponent, LayerAttentionCache dom)
-          -> Signal dom (Vec ModelDim Float, [LayerAttentionCache dom])
-          -> Signal dom (Vec ModelDim Float, [LayerAttentionCache dom])
-        combineLayer (layer, cache) accSig = do
-          (nextToken, restCaches) <- accSig
-          token' <- processLayer layer cache nextToken
-          pure (token', restCaches)
-
-    -- Pair layers with their corresponding caches
-    layerCachePairs :: Vec NumLayers (TransformerLayerComponent, LayerAttentionCache dom)
-    layerCachePairs = zip layers layerCaches
 
 parseModelConfigFile :: BG.Get TransformerDecoderComponent
 parseModelConfigFile = do
@@ -361,75 +312,39 @@ parseModelConfigFile = do
   rmsFinalWeight' <- readVec1D @ModelDim
   freqCisReal' <- readVec2D @SeqLen
   freqCisImag' <- readVec2D @SeqLen
-  let
-      embedding = EmbeddingComponent
-        { vocabulary = CArray2D tokenEmbeddingTable',
-          rmsFinalWeight = rmsFinalWeight'
+
+  let embedding = EmbeddingComponent
+        { vocabulary = CArray2D tokenEmbeddingTable'
+        , rmsFinalWeight = rmsFinalWeight'
         }
+
       sha hIdx = SingleHeadComponent
-                          { wqHead = CArray2D $ wq' !! toInteger hIdx
-                          , wkHead = CArray2D $ wk' !! toInteger hIdx
-                          , wvHead = CArray2D $ wv' !! toInteger hIdx
-                          , rotary = RotaryEncodingComponent { freqCos = CArray2D freqCisReal'
-                                                            , freqSin = CArray2D freqCisImag' }
-                          }
-      layer lIdx = TransformerLayerComponent {
-          multiHeadAttention = MultiHeadAttentionComponent
-                {
-                  heads = map sha (indicesI :: Vec NumAttentionHeads (Index NumAttentionHeads)) :: Vec NumAttentionHeads SingleHeadComponent
-                , mWo     = CArray2D $ wo' !! lIdx
-                , rmsAtt = rmsAttWeight' !! lIdx
-                },
-            feedforwardNetwork = FeedForwardNetworkComponent
-                     { fW1 = CArray2D $ w1' !! toInteger lIdx,
-                       fW2 = CArray2D $ w2' !! toInteger lIdx,
-                       fW3 = CArray2D $ w3' !! toInteger lIdx,
-                       fRMSFfn = rmsFfnWeight' !! lIdx
-                     }
+        { wqHead = CArray2D $ wq' !! toInteger hIdx
+        , wkHead = CArray2D $ wk' !! toInteger hIdx
+        , wvHead = CArray2D $ wv' !! toInteger hIdx
+        , rotary = RotaryEncodingComponent
+            { freqCos = CArray2D freqCisReal'
+            , freqSin = CArray2D freqCisImag'
             }
+        }
+
+      layer lIdx = TransformerLayerComponent
+        { multiHeadAttention = MultiHeadAttentionComponent
+            { heads = map sha (indicesI :: Vec NumAttentionHeads (Index NumAttentionHeads))
+            , mWo = CArray2D $ wo' !! lIdx
+            , rmsAtt = rmsAttWeight' !! lIdx
+            }
+        , feedforwardNetwork = FeedForwardNetworkComponent
+            { fW1 = CArray2D $ w1' !! toInteger lIdx
+            , fW2 = CArray2D $ w2' !! toInteger lIdx
+            , fW3 = CArray2D $ w3' !! toInteger lIdx
+            , fRMSFfn = rmsFfnWeight' !! lIdx
+            }
+        }
+
       decoder = TransformerDecoderComponent
-              { modelEmbedding = embedding,
-                modelLayers = map layer (indicesI :: Vec NumLayers (Index NumLayers)) :: Vec NumLayers TransformerLayerComponent
-              }
+        { modelEmbedding = embedding
+        , modelLayers = map layer (indicesI :: Vec NumLayers (Index NumLayers))
+        }
+
   return decoder
-
-transformer
-  :: forall dom. Monad (Signal dom)
-  => Helpers.Token        -- input token
-  -> StepCount
-  -> Float                -- temperature
-  -> [Helpers.Token]      -- prompt tokens
-  -> Int                  -- seed
-  -> TransformerResult dom (Signal dom Helpers.Token)
-transformer inputTokenCode stepCount temperature promptTokens seedValue = do
-  decoder <- MR.ask
-  decoderCache <- get
-
-  let embeddingLayer = modelEmbedding decoder
-      layers = modelLayers decoder
-      inputTokenVector = embed (vocabulary embeddingLayer) inputTokenCode
-      StepCount step = stepCount
-
-      -- Run transformer layers
-      outputTokenVectorSig :: Signal dom (Vec ModelDim Float)
-      outputTokenVectorSig = runLayers layers decoderCache inputTokenVector stepCount
-
-      -- Compute logits
-      logitsSig :: Signal dom (Vec VocabSize Float)
-      logitsSig = liftA2 (flip transformerLogits) outputTokenVectorSig (pure decoder)
-
-      -- Select next token
-      nextTokenSig :: Signal dom Helpers.Token
-      nextTokenSig
-        | fromIntegral step < P.length promptTokens
-        = pure (promptTokens P.!! fromIntegral step)   -- use prompt token
-        | temperature == 0.0
-        = logitsSig <&> \logits -> Helpers.Token $ fromIntegral $ argMax logits
-        | otherwise
-        = logitsSig <&> \logits ->
-            let scaled = map (/ temperature) logits
-            in Helpers.Token $ fromIntegral $ drawSamplePure seedValue scaled
-
-  -- Put back the unchanged cache
-  put decoderCache
-  return nextTokenSig
