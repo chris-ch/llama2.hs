@@ -256,7 +256,7 @@ runLayer
   -> StepCount
   -> Signal dom (Vec ModelDim Float)
 runLayer mha feedForwardNetwork layerCache inputToken step = do
-  let CVector rmsWeights = rmsAtt mha
+  let rmsWeights = rmsAtt mha
       normalizedInput = rmsNorm inputToken rmsWeights
       outputProjectionWeights = mWo mha
       headCaches = multiHeadCache layerCache
@@ -297,7 +297,7 @@ runLayer mha feedForwardNetwork layerCache inputToken step = do
       attentionDeltaSig = multiHeadOutSig <&> \headOutputs ->
         let concatenatedHeads :: Vec ModelDim Float
             concatenatedHeads = flattenVec headOutputs
-            CVector headsOut = matrixVectorMult outputProjectionWeights (CVector concatenatedHeads)
+            headsOut = matrixVectorMult outputProjectionWeights concatenatedHeads
         in headsOut
 
   -- Residual connection after attention
@@ -377,7 +377,7 @@ parseModelConfigFile = do
   let
       embedding = EmbeddingComponent
         { vocabulary = CArray2D tokenEmbeddingTable',
-          rmsFinalWeight = CVector rmsFinalWeight'
+          rmsFinalWeight = rmsFinalWeight'
         }
       sha hIdx = SingleHeadComponent
                           { wqHead = CArray2D $ wq' !! toInteger hIdx
@@ -391,13 +391,13 @@ parseModelConfigFile = do
                 {
                   heads = map sha (indicesI :: Vec NumAttentionHeads (Index NumAttentionHeads)) :: Vec NumAttentionHeads SingleHeadComponent
                 , mWo     = CArray2D $ wo' !! lIdx
-                , rmsAtt = CVector $ rmsAttWeight' !! lIdx
+                , rmsAtt = rmsAttWeight' !! lIdx
                 },
             feedforwardNetwork = FeedForwardNetworkComponent
                      { fW1 = CArray2D $ w1' !! toInteger lIdx,
                        fW2 = CArray2D $ w2' !! toInteger lIdx,
                        fW3 = CArray2D $ w3' !! toInteger lIdx,
-                       fRMSFfn = CVector $ rmsFfnWeight' !! lIdx
+                       fRMSFfn = rmsFfnWeight' !! lIdx
                      }
             }
       decoder = TransformerDecoderComponent

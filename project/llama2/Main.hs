@@ -184,7 +184,7 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
     initModel = BG.runGet parseModelConfigFile
     config = initModel modelFileContent
     prompt' = fromMaybe "" prompt
-    (promptTokens, vocab) = tokenizerInit tokenizerFileContent vocabSize (BSC.pack prompt')
+    (promptTokens, vocab) = tokenizerInit tokenizerFileContent (fromIntegral vocabSize) (BSC.pack prompt')
 
   putStrLn "<s>"
   startTime <- getPOSIXTime

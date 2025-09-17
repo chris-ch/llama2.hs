@@ -5,35 +5,22 @@ import qualified Prelude as P
 import qualified Foreign as F
 
 -- model config 110M
-modelDim :: Int
-modelDim = 768
 type ModelDim = 768
-hiddenDim :: Int
-hiddenDim = 2048
 type HiddenDim = 2048
-numLayers :: Int
-numLayers      = 12
 type NumLayers = 12
-numAttentionHeads :: Int
-numAttentionHeads = 12
 type NumAttentionHeads = 12
-vocabSize :: Int
-vocabSize = 32000
-type VocabSize = 32000
-seqLen :: Int
-seqLen = 1024
+vocabSize :: Integer
+vocabSize = 32000 
+type VocabSize = 32000 :: Nat
 type SeqLen         = 1024
-headDimension :: Int
-headDimension = 64
 type HeadDimension  = 64
 type FreqDim = 32
 
-newtype CVector (n :: Nat) = CVector (Vec n Float) deriving (Show)
 newtype CArray2D (n :: Nat) (m :: Nat) = CArray2D (Vec n (Vec m Float)) deriving (Show)
 
 -- Index into CArray2D to get a row
-getRow :: forall n m. (KnownNat n) => StepCount -> CArray2D n m -> CVector m
-getRow (StepCount i) (CArray2D arr) = CVector $ arr !! (fromIntegral i :: Index n)
+getRow :: forall n m. (KnownNat n) => StepCount -> CArray2D n m -> Vec m Float
+getRow (StepCount i) (CArray2D arr) = arr !! (fromIntegral i :: Index n)
 
 newtype Token = Token F.Int32 deriving (Show, Eq, Ord, Num)
 newtype StepCount' = StepCount' Int deriving (Show, Eq, Ord, Num)
@@ -44,7 +31,7 @@ newtype StepCount = StepCount (Unsigned 32) deriving (Show, Eq, Ord, Num)
 
 data EmbeddingComponent = EmbeddingComponent
   { vocabulary :: CArray2D VocabSize ModelDim,
-    rmsFinalWeight :: CVector ModelDim
+    rmsFinalWeight :: Vec ModelDim Float
   } deriving (Show)
 
 data RotaryEncodingComponent = RotaryEncodingComponent
@@ -62,14 +49,14 @@ data SingleHeadComponent = SingleHeadComponent
 data MultiHeadAttentionComponent = MultiHeadAttentionComponent
   { heads    :: Vec NumAttentionHeads SingleHeadComponent
   , mWo      :: CArray2D ModelDim ModelDim -- Output projection matrix
-  , rmsAtt   :: CVector ModelDim  -- RMSNorm before QKV projection
+  , rmsAtt   :: Vec ModelDim Float -- RMSNorm before QKV projection
   } deriving (Show)
 
 data FeedForwardNetworkComponent = FeedForwardNetworkComponent
   { fW1 :: CArray2D HiddenDim ModelDim,
     fW2 :: CArray2D ModelDim HiddenDim,
     fW3 :: CArray2D HiddenDim ModelDim,
-    fRMSFfn :: CVector ModelDim
+    fRMSFfn :: Vec ModelDim Float
   } deriving (Show)
 
 data TransformerLayerComponent = TransformerLayerComponent
@@ -88,9 +75,8 @@ dotProduct :: KnownNat n => Vec n Float -> Vec n Float -> Float
 dotProduct v1 v2 = sum $ zipWith (*) v1 v2
 
 -- Vector multiplication by a Matrix
-matrixVectorMult :: forall n m. ( KnownNat m) => CArray2D n m -> CVector m -> CVector n
-matrixVectorMult (CArray2D mat) (CVector vec) =
-  CVector $ map (`dotProduct` vec) mat
+matrixVectorMult :: forall n m. ( KnownNat m) => CArray2D n m -> Vec m Float -> Vec n Float
+matrixVectorMult (CArray2D mat) vec = map (`dotProduct` vec) mat
 
 -- RMS Norm
 rmsNorm :: Vec ModelDim Float -> Vec ModelDim Float -> Vec ModelDim Float
@@ -123,8 +109,8 @@ applyRotation
   -> Vec HeadDimension Float
   -> Vec HeadDimension Float
 applyRotation rot step tokenVec =
-  let CVector cosFrequencies = getRow step (freqCos rot)
-      CVector sinFrequencies = getRow step (freqSin rot)
+  let cosFrequencies = getRow step (freqCos rot)
+      sinFrequencies = getRow step (freqSin rot)
   in applyRotaryPositionEncoding tokenVec cosFrequencies sinFrequencies
 
 applyRotaryPositionEncoding :: Vec HeadDimension Float    -- input vector
@@ -149,32 +135,25 @@ applyRotaryPositionEncoding inputVec cosVec sinVec =
             rotatedReal = realComponent * cosValue - imagComponent * sinValue
             rotatedImag = realComponent * sinValue + imagComponent * cosValue
 
--- Elementwise multiplication of two CVector
-cVecZipWith :: (Float -> Float -> Float)
-            -> CVector n
-            -> CVector n
-            -> CVector n
-cVecZipWith f (CVector v1) (CVector v2) = CVector $ zipWith f v1 v2
-
 runFeedForward :: FeedForwardNetworkComponent -> Vec ModelDim Float -> Vec ModelDim Float
 runFeedForward feedForwardNetwork inputToken = feedforwardNetworkOutput' where
-    CVector rmsFfnWeights = fRMSFfn feedForwardNetwork
+    rmsFfnWeights = fRMSFfn feedForwardNetwork
     w1 = fW1 feedForwardNetwork
     w2 = fW2 feedForwardNetwork
     w3 = fW3 feedForwardNetwork
-    normalizedInput = CVector $ rmsNorm inputToken rmsFfnWeights
-    CVector gateOutput' = matrixVectorMult w1 normalizedInput
+    normalizedInput = rmsNorm inputToken rmsFfnWeights
+    gateOutput' = matrixVectorMult w1 normalizedInput
     upProjectionOutput' = matrixVectorMult w3 normalizedInput
-    gateOutput = CVector $ map sigmoidLinearUnit gateOutput'
+    gateOutput = map sigmoidLinearUnit gateOutput'
 
-    CVector feedforwardNetworkOutput' = matrixVectorMult w2 (cVecZipWith (*) gateOutput upProjectionOutput')
+    feedforwardNetworkOutput' = matrixVectorMult w2 (zipWith (*) gateOutput upProjectionOutput')
 
 -- QKV per head - should return HeadDimension vectors, not ModelDim
 runSingleHeadQKV :: SingleHeadComponent -> Vec ModelDim Float -> (Vec HeadDimension Float, Vec HeadDimension Float, Vec HeadDimension Float)
 runSingleHeadQKV headComp normalizedInput = (q, k, v) where
-    CVector q = matrixVectorMult (wqHead headComp) (CVector normalizedInput)  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
-    CVector k = matrixVectorMult (wkHead headComp) (CVector normalizedInput)  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
-    CVector v = matrixVectorMult (wvHead headComp) (CVector normalizedInput)  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
+    q = matrixVectorMult (wqHead headComp) normalizedInput  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
+    k = matrixVectorMult (wkHead headComp) normalizedInput  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
+    v = matrixVectorMult (wvHead headComp) normalizedInput  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
 
 -- Rotary application
 applyRotaryToHead :: SingleHeadComponent -> StepCount -> (Vec HeadDimension Float , Vec HeadDimension Float ) -> (Vec HeadDimension Float , Vec HeadDimension Float )
@@ -187,7 +166,7 @@ applyRotaryToHead headComp step (q, k) = (q', k') where
 transformerLogits :: TransformerDecoderComponent -> Vec ModelDim Float -> Vec VocabSize Float
 transformerLogits decoder tokenVector = logits where
     vocab = vocabulary (modelEmbedding decoder)
-    CVector rmsWeight = rmsFinalWeight (modelEmbedding decoder)
+    rmsWeight = rmsFinalWeight (modelEmbedding decoder)
     tokenWithRms = rmsNorm tokenVector rmsWeight
     CArray2D vocabRows = vocab
     logits = map (`dotProduct` tokenWithRms) vocabRows
