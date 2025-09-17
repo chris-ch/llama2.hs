@@ -30,6 +30,7 @@ module Helpers (
   , drawSample
   , computeMultiHeadAttention
   , vocabSize
+  , seqLen
 ) where
 
 import Clash.Prelude
@@ -43,10 +44,12 @@ type ModelDim = 768
 type HiddenDim = 2048
 type NumLayers = 12
 type NumAttentionHeads = 12
-vocabSize :: Integer
-vocabSize = 32000
 type VocabSize = 32000 :: Nat
+vocabSize :: Int
+vocabSize = natToNum @VocabSize
 type SeqLen         = 1024
+seqLen :: Int
+seqLen = natToNum @SeqLen
 type HeadDimension  = 64
 type FreqDim = 32
 
@@ -197,10 +200,10 @@ transformerLogits decoder tokenVector = logits where
     logits = map (`dotProduct` tokenWithRms) vocabRows
 
 -- | Find the index of the maximum element in a non-empty vector
-argMax :: forall n. (KnownNat n) => Vec n Float -> Int
-argMax vec = fst $ foldl compareMax (0, vec !! 0) (imap (\i x -> (fromEnum i, x)) vec)
+argMax :: forall n. (KnownNat n) => Vec n Float -> Unsigned 32
+argMax vec = fst $ foldl compareMax (0, vec !! 0) (imap (\i x -> (fromIntegral i, x)) vec)
   where
-    compareMax :: (Int, Float) -> (Int, Float) -> (Int, Float)
+    compareMax :: (Unsigned 32, Float) -> (Unsigned 32, Float) -> (Unsigned 32, Float)
     compareMax (maxIdx, maxVal) (i, x)
       | x > maxVal = (i, x)
       | otherwise  = (maxIdx, maxVal)

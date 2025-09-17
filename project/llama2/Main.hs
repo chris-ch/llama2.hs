@@ -175,11 +175,17 @@ generateTokens :: (MonadIO m) => TransformerDecoderComponent -> StepCount -> Pro
 generateTokens decoder (StepCount maxSteps) promptTokens temperature vocab seedValue = do
   -- Initialize attention caches for all layers with System domain
   let initCaches = C.repeat initAttentionCache :: C.Vec NumLayers (AttentionCache C.System)
-      -- Wrap transformer to take a Signal System (Unsigned 32, Helpers.Token) as input
-      transformerWrapper (timestep, token) =
-        C.sampleN 1 (transformer decoder initCaches (fromIntegral timestep)
-                                token temperature seedValue promptTokens) !! 0
-      -- Generate tokens iteratively
+      transformerWrapper :: C.Signal C.System (C.Unsigned 32, Helpers.Token) -> C.Signal C.System Helpers.Token
+      transformerWrapper sigIn =
+        let timestepSig = fmap fst sigIn
+            tokenSig    = fmap snd sigIn
+        in transformer decoder initCaches
+            <$> fmap fromIntegral timestepSig
+            <*> tokenSig
+            <*> pure temperature
+            <*> pure seedValue
+            <*> pure promptTokens
+
       go timestep result token
         | timestep >= maxSteps || (timestep /= 0 && token == Helpers.Token 1) = pure (result, StepCount timestep)
         | otherwise = do
