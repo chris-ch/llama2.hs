@@ -3,6 +3,8 @@ module Helpers where
 import Clash.Prelude
 import qualified Prelude as P
 import qualified Foreign as F
+import qualified System.Random as R
+import qualified Clash.Sized.Vector as CV
 
 -- model config 110M
 type ModelDim = 768
@@ -22,8 +24,7 @@ newtype CArray2D (n :: Nat) (m :: Nat) = CArray2D (Vec n (Vec m Float)) deriving
 getRow :: forall n m. (KnownNat n) => StepCount -> CArray2D n m -> Vec m Float
 getRow (StepCount i) (CArray2D arr) = arr !! (fromIntegral i :: Index n)
 
-newtype Token = Token F.Int32 deriving (Show, Eq, Ord, Num)
-newtype StepCount' = StepCount' Int deriving (Show, Eq, Ord, Num)
+newtype Token = Token (Unsigned 32) deriving (Show, Eq, Ord, Num)
 
 newtype StepCount = StepCount (Unsigned 32) deriving (Show, Eq, Ord, Num)
 
@@ -170,3 +171,38 @@ transformerLogits decoder tokenVector = logits where
     tokenWithRms = rmsNorm tokenVector rmsWeight
     CArray2D vocabRows = vocab
     logits = map (`dotProduct` tokenWithRms) vocabRows
+
+-- | Find the index of the maximum element in a non-empty vector
+argMax :: forall n. (KnownNat n) => Vec n Float -> Int
+argMax vec = fst $ foldl compareMax (0, vec !! 0) (imap (\i x -> (fromEnum i, x)) vec)
+  where
+    compareMax :: (Int, Float) -> (Int, Float) -> (Int, Float)
+    compareMax (maxIdx, maxVal) (i, x)
+      | x > maxVal = (i, x)
+      | otherwise  = (maxIdx, maxVal)
+
+dotVec :: forall n. KnownNat n => Vec n Float -> Vec n Float -> Float
+dotVec xs ys = sum (zipWith (*) xs ys)
+
+softmaxVec :: forall n. KnownNat (n+1) => Vec (n+1) Float -> Vec (n+1) Float
+softmaxVec xs =
+  let m = maximum xs
+      exps = map (\x -> P.exp (x - m)) xs
+      s = sum exps
+  in map (/ s) exps
+
+-- Pure deterministic sampling from probabilities
+drawSamplePure :: Int -> Vec VocabSize Float -> Int
+drawSamplePure seed probabilities =
+    let gen = R.mkStdGen seed
+        (randomValue, _) = R.random gen :: (Float, R.StdGen)
+
+        -- cumulative sum using scanl1'
+        cumulativeDistribution :: Vec VocabSize Float
+        cumulativeDistribution = CV.scanl1 (+) probabilities
+
+        -- find first index where cumulative >= randomValue
+        selectedIndex :: Index VocabSize
+        selectedIndex = maybe maxBound id (findIndex (>= randomValue) cumulativeDistribution)
+
+    in fromEnum selectedIndex

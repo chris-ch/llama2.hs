@@ -14,12 +14,10 @@ import Data.ByteString (useAsCString)
 import Helpers
 import qualified GHC.TypeNats
 import Data.Functor ((<&>), ($>))
-import qualified System.Random as R
 import qualified Clash.Explicit.SimIO as SimIO
 
 type MVectorFloat = MV.MVector (MV.PrimState IO) Float
 
-type TransformerResult' dom a = MR.ReaderT TransformerDecoderComponent (StateT (DecoderCache dom) IO) a
 type TransformerResult dom a = MR.ReaderT TransformerDecoderComponent (StateT (DecoderCache dom) SimIO.SimIO) a
 
 data HeadCache dom = HeadCache
@@ -104,7 +102,6 @@ readVec1D = do
     vec <- readVector total
     return $ CV.unsafeFromList (V.toList vec)
 
-
 -- Fixed readVec2D function
 readVec2D :: forall n m. (KnownNat n, KnownNat m) => BG.Get (Vec n (Vec m Float))
 readVec2D = do
@@ -153,25 +150,6 @@ initDecoderCaches = do
               , headValueCache = valueCacheRam
               }
   return $ DecoderCache { layerCache = layerCaches }
-
-vecToList :: CV.Vec n a -> [a]
-vecToList = CV.toList
-
-dotVec :: forall n. KnownNat n => Vec n Float -> Vec n Float -> Float
-dotVec xs ys = sum (zipWith (*) xs ys)
-
-softmaxVec :: forall n. KnownNat (n+1) => Vec (n+1) Float -> Vec (n+1) Float
-softmaxVec xs =
-  let m = maximum xs
-      exps = map (\x -> P.exp (x - m)) xs
-      s = sum exps
-  in map (/ s) exps
-
-readRowAsList :: MVectorFloat -> Int -> Int -> IO [Float]
-readRowAsList mv pos headDim = do
-  v <- V.freeze mv
-  let offset = pos * headDim
-  return $ V.toList $ V.slice offset headDim v
 
 readRow
   :: forall dom.
@@ -243,10 +221,6 @@ singleHeadAttention (HeadCache kcRam vcRam) hIdx qHead (StepCount stepInt) =
         ) attWeightsSig vRowsSig
   in resultSig
 
-
-flattenVec :: Vec n (Vec m a) -> Vec (n GHC.TypeNats.* m) a
-flattenVec = concat
-
 runLayer
   :: forall dom. (Monad (Signal dom))
   =>MultiHeadAttentionComponent
@@ -296,7 +270,7 @@ runLayer mha feedForwardNetwork layerCache inputToken step = do
   let attentionDeltaSig :: Signal dom (Vec ModelDim Float)
       attentionDeltaSig = multiHeadOutSig <&> \headOutputs ->
         let concatenatedHeads :: Vec ModelDim Float
-            concatenatedHeads = flattenVec headOutputs
+            concatenatedHeads = concat headOutputs
             headsOut = matrixVectorMult outputProjectionWeights concatenatedHeads
         in headsOut
 
@@ -406,41 +380,6 @@ parseModelConfigFile = do
               }
   return decoder
 
--- Sampling
-drawSample :: Int -> V.Vector Float -> IO Helpers.Token
-drawSample randomSeed probabilities = do
-  let gen = R.mkStdGen randomSeed
-      (randomValue, _) = R.random gen :: (Float, R.StdGen)
-      cumulativeDistribution = V.scanl1 (+) probabilities
-      selectedIndex = V.length (V.takeWhile (< randomValue) cumulativeDistribution)
-  return $ fromIntegral (min selectedIndex (V.length probabilities - 1))
-
--- Pure deterministic sampling from probabilities
-drawSamplePure :: Int -> Vec VocabSize Float -> Int
-drawSamplePure seed probabilities =
-    let gen = R.mkStdGen seed
-        (randomValue, _) = R.random gen :: (Float, R.StdGen)
-
-        -- cumulative sum using scanl1'
-        cumulativeDistribution :: Vec VocabSize Float
-        cumulativeDistribution = CV.scanl1 (+) probabilities
-
-        -- find first index where cumulative >= randomValue
-        selectedIndex :: Index VocabSize
-        selectedIndex = maybe maxBound id (findIndex (>= randomValue) cumulativeDistribution)
-
-    in fromEnum selectedIndex
-
--- | Find the index of the maximum element in a non-empty vector
-argMax :: forall n. (KnownNat n) => Vec n Float -> Int
-argMax vec = fst $ foldl compareMax (0, vec !! 0) (imap (\i x -> (fromEnum i, x)) vec)
-  where
-    compareMax :: (Int, Float) -> (Int, Float) -> (Int, Float)
-    compareMax (maxIdx, maxVal) (i, x)
-      | x > maxVal = (i, x)
-      | otherwise  = (maxIdx, maxVal)
-
--- Pure transformer function
 transformer
   :: forall dom. Monad (Signal dom)
   => Helpers.Token        -- input token
