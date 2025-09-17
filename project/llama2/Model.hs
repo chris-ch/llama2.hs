@@ -36,19 +36,23 @@ newtype DecoderCache dom = DecoderCache
 type CacheDepth = NumLayers GHC.TypeNats.* NumAttentionHeads GHC.TypeNats.* SeqLen GHC.TypeNats.* HeadDimension
 type CacheAddr  = Index CacheDepth
 
-keyCacheRam
-  :: HiddenClockResetEnable dom
-  => Signal dom CacheAddr
-  -> Signal dom (Maybe (CacheAddr, Float))
-  -> Signal dom Float
-keyCacheRam = blockRam (replicate (SNat @CacheDepth) 0)
+initKeyRams
+  :: forall dom
+   . HiddenClockResetEnable dom
+  => Vec NumAttentionHeads
+       (Signal dom CacheAddr
+     -> Signal dom (Maybe (CacheAddr, Float))
+     -> Signal dom Float)
+initKeyRams = repeat (blockRam (replicate (SNat @CacheDepth) 0))
 
-valueCacheRam
-  :: HiddenClockResetEnable dom
-  => Signal dom CacheAddr
-  -> Signal dom (Maybe (CacheAddr, Float))
-  -> Signal dom Float
-valueCacheRam = blockRam (replicate (SNat @CacheDepth) 0)
+initValueRams
+  :: forall dom
+   . HiddenClockResetEnable dom
+  => Vec NumAttentionHeads
+       (Signal dom CacheAddr
+     -> Signal dom (Maybe (CacheAddr, Float))
+     -> Signal dom Float)
+initValueRams = repeat (blockRam (replicate (SNat @CacheDepth) 0))
 
 readRowRAM
   :: forall dom
@@ -139,16 +143,25 @@ readVec3D = do
     chunksOf k xs = P.take k xs : chunksOf k (P.drop k xs)
 
 initDecoderCaches
-  :: forall dom. HiddenClockResetEnable dom
-  => IO (DecoderCache dom)
-initDecoderCaches = do
+  :: forall dom. Vec NumAttentionHeads
+       (Signal dom CacheAddr
+     -> Signal dom (Maybe (CacheAddr, Float))
+     -> Signal dom Float)
+  -> Vec NumAttentionHeads
+       (Signal dom CacheAddr
+     -> Signal dom (Maybe (CacheAddr, Float))
+     -> Signal dom Float)
+  -> IO (DecoderCache dom)
+initDecoderCaches keyRams valueRams = do
+  -- Create one LayerAttentionCache per layer, but use the same per-head RAM vector
   let layerCaches = CV.repeat @NumLayers $
         LayerAttentionCache $
-          CV.repeat @NumAttentionHeads $
+          imap (\hIdx _ ->
             HeadCache
-              { headKeyCache = keyCacheRam
-              , headValueCache = valueCacheRam
+              { headKeyCache = keyRams  !! hIdx
+              , headValueCache = valueRams !! hIdx
               }
+          ) keyRams
   return $ DecoderCache { layerCache = layerCaches }
 
 readRow

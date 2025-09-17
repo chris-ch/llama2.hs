@@ -146,9 +146,6 @@ bpeEncode prompt vocab vocabScores =
 generateNextToken :: StepCount -> PromptTokens -> Float -> Vocabulary -> Helpers.Token -> Int -> TransformerResult dom (BS.ByteString, Helpers.Token)
 generateNextToken timestep promptTokens temperature vocab tokenCode seedValue = do
   nextTokenSig <- transformer tokenCode timestep temperature promptTokens seedValue
-  -- C.sample is an IO action, so it must be run with liftIO
-  -- The Signal here represents a stream of values, but in this imperative context,
-  -- we only care about the first value of the stream.
   let nextToken = C.sample nextTokenSig
   let word = vocab !! fromIntegral nextToken :: BS.ByteString
       firstChar = BSC.head word :: Char
