@@ -29,6 +29,7 @@ module Helpers (
   , argMax
   , drawSample
   , computeMultiHeadAttention
+  , vocabSize
 ) where
 
 import Clash.Prelude

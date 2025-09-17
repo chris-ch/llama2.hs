@@ -17,10 +17,10 @@ import Text.Printf (printf)
 
 import Helpers
 import Model
-import qualified Clash.Prelude as C
-import qualified Clash.Explicit.Prelude as CEP
+import qualified Clash.Explicit.Prelude as C
 import qualified Clash.Explicit.SimIO as CES
 import qualified Clash.Clocks as CC
+import qualified Clash.Signal as CS (simulate, withClockResetEnable)
 
 type Vocabulary = [BS.ByteString]
 type VocabularyScores = [Float]
@@ -143,35 +143,6 @@ bpeEncode prompt vocab vocabScores =
   let tokens = map (\char -> fromMaybe (error "Character not found in vocabulary") (DL.elemIndex (BS.pack [char]) vocab)) (BS.unpack prompt)
    in applyBPEMerges (map fromIntegral tokens) vocab vocabScores
 
-generateNextToken :: StepCount -> PromptTokens -> Float -> Vocabulary -> Helpers.Token -> Int -> TransformerResult dom (BS.ByteString, Helpers.Token)
-generateNextToken timestep promptTokens temperature vocab tokenCode seedValue = do
-  nextTokenSig <- transformer tokenCode timestep temperature promptTokens seedValue
-  let nextToken = C.sample nextTokenSig
-  let word = vocab !! fromIntegral nextToken :: BS.ByteString
-      firstChar = BSC.head word :: Char
-      tokenStr =
-        if tokenCode == 1 && isSpace firstChar
-          then BSC.tail word
-          else word
-  return (tokenStr, nextToken)
-
-generateTokens
-  ::  StepCount
-  -> PromptTokens
-  -> Float
-  -> Vocabulary
-  -> Int
-  -> TransformerResult dom  ([BS.ByteString], StepCount)
-generateTokens maxSteps promptTokens temperature vocab seedValue = do
-  let go timestep result token
-        | timestep >= maxSteps || (timestep /= StepCount 0 && token == 1) = return (result, timestep)
-        | otherwise = do
-            (tokenStr, nextToken) <- generateNextToken timestep promptTokens temperature vocab token seedValue
-            liftIO $ putStr $ BSC.unpack tokenStr
-            liftIO $ hFlush stdout
-            go (timestep + StepCount 1) (result ++ [tokenStr]) nextToken
-  go (StepCount 0) [] 1
-
 runModel :: BS.ByteString -> BS.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
 runModel modelFileContent tokenizerFileContent temperature steps prompt seed = do
   currentTime <- getPOSIXTime
@@ -186,24 +157,7 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
   putStrLn "<s>"
   startTime <- getPOSIXTime
 
-  -- Create actual clock/reset/enable values for implicit parameters
-  let clk :: C.Clock C.System
-      clk = C.clockGen
-      rst :: C.Reset C.System
-      rst = C.resetGen
-      en  :: C.Enable C.System
-      en  = C.enableGen
-
-  -- Bind implicit parameters for initDecoderCaches
-  let ?clock = clk
-      ?reset = rst
-      ?enable = en
-
-  attentionKV :: DecoderCache C.System <- initDecoderCaches
-
-  (_, StepCount countTokens) <- evalStateT
-    (runReaderT (generateTokens (StepCount steps) promptTokens temperature vocab seedValue) config)
-    attentionKV
+  (_, StepCount countTokens) <- generateTokens config (StepCount (fromIntegral steps)) promptTokens temperature vocab seedValue
 
   endTime <- getPOSIXTime
   let duration :: Integer
@@ -212,3 +166,30 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
       tokensPerSec = fromIntegral countTokens / fromIntegral duration
   printf "\nduration: %ds - (%.02f tokens/s)\n" duration tokensPerSec
   return ()
+
+--------------------------------------------------------------------------------
+-- Token Generation with Clash Simulation
+--------------------------------------------------------------------------------
+
+generateTokens :: (MonadIO m) => TransformerDecoderComponent -> StepCount -> PromptTokens -> Float -> Vocabulary -> Int -> m ([BSC.ByteString], StepCount)
+generateTokens decoder (StepCount maxSteps) promptTokens temperature vocab seedValue = do
+  -- Initialize attention caches for all layers with System domain
+  let initCaches = C.repeat initAttentionCache :: C.Vec NumLayers (AttentionCache C.System)
+      -- Wrap transformer to take a Signal System (Unsigned 32, Helpers.Token) as input
+      transformerWrapper (timestep, token) =
+        C.sampleN 1 (transformer decoder initCaches (fromIntegral timestep)
+                                token temperature seedValue promptTokens) !! 0
+      -- Generate tokens iteratively
+      go timestep result token
+        | timestep >= maxSteps || (timestep /= 0 && token == Helpers.Token 1) = pure (result, StepCount timestep)
+        | otherwise = do
+            -- Simulate transformer for one step
+            let input = (timestep :: C.Unsigned 32, token)
+                [nextToken] = C.simulate transformerWrapper [input]
+                tokenStr = vocab !! fromIntegral nextToken
+            -- Output token
+            liftIO $ putStr $ BSC.unpack tokenStr
+            liftIO $ hFlush stdout
+            go (timestep + 1) (result ++ [tokenStr]) nextToken
+  (tokens, finalStep) <- go 0 [] (Helpers.Token 1)
+  pure (tokens, finalStep)
