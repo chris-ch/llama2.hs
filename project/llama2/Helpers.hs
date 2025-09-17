@@ -36,7 +36,9 @@ getRow :: forall n m. (KnownNat n) => StepCount -> CArray2D n m -> CVector m
 getRow (StepCount i) (CArray2D arr) = CVector $ arr !! (fromIntegral i :: Index n)
 
 newtype Token = Token F.Int32 deriving (Show, Eq, Ord, Num)
-newtype StepCount = StepCount Int deriving (Show, Eq, Ord, Num)
+newtype StepCount' = StepCount' Int deriving (Show, Eq, Ord, Num)
+
+newtype StepCount = StepCount (Unsigned 32) deriving (Show, Eq, Ord, Num)
 
 -- Data definitions for LLM architecture
 
@@ -109,22 +111,6 @@ softmax values = map (/ sumExpValues) expValues
     maxVal = maximum values
     expValues = map (\x -> exp (x - maxVal)) values
     sumExpValues = sum expValues
-    
-softmaxVocab :: Vec VocabSize Float -> Vec VocabSize Float
-softmaxVocab values = map (/ sumExpValues) expValues
-  where
-    maxVal = maximum values
-    expValues = map (\x -> exp (x - maxVal)) values
-    sumExpValues = sum expValues
-
-softmaxVector :: Vec n Float -> Signal dom Float
-softmaxVector values = 
-  let valuesList = toList values
-      maxVal = P.maximum valuesList  -- Regular Prelude maximum on lists
-      expValues = P.map (\x -> exp (x - maxVal)) valuesList
-      sumExpValues = sum expValues
-      resultList = P.map (/ sumExpValues) expValues
-  in fromList resultList
 
 -- Embed a token
 embed :: CArray2D VocabSize ModelDim -> Token -> Vec ModelDim Float

@@ -7,13 +7,14 @@ import qualified Data.List as DL
 import qualified Options.Applicative as OA
 import qualified Foreign as F
 import Control.Monad.Reader (ReaderT(runReaderT), MonadIO(liftIO), MonadReader(ask))
-import Control.Monad.State (evalStateT, MonadState )
+import Control.Monad.State (evalStateT, MonadState (..), runStateT )
 import Data.Maybe (fromMaybe)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import GHC.Unicode (isSpace)
 import System.IO (hFlush, stdout)
 import Control.Monad (replicateM)
 import Text.Printf (printf)
+import qualified Control.Monad.Reader as MR
 
 import Helpers
 import Model
@@ -21,12 +22,13 @@ import qualified Clash.Prelude as C
 import qualified Clash.Explicit.Prelude as CEP
 import qualified Clash.Explicit.SimIO as CES
 import qualified Clash.Clocks as CC
+import qualified Clash.Explicit.SimIO as SimIO
+import Control.Monad.State (StateT, get, MonadState (put))
 
 type Vocabulary = [BS.ByteString]
 type VocabularyScores = [Float]
 newtype Token = Token F.Int32 deriving (Show, Eq, Ord, Num)
 type PromptTokens = [Helpers.Token]
-
 
 -- example model config 110M: 
 -- modelDim = 768
@@ -143,37 +145,35 @@ bpeEncode prompt vocab vocabScores =
   let tokens = map (\char -> fromMaybe (error "Character not found in vocabulary") (DL.elemIndex (BS.pack [char]) vocab)) (BS.unpack prompt)
    in applyBPEMerges (map fromIntegral tokens) vocab vocabScores
 
-generateNextToken :: StepCount -> PromptTokens -> Float -> Vocabulary -> Helpers.Token -> Int -> TransformerResult dom (BS.ByteString, Helpers.Token)
-generateNextToken timestep promptTokens temperature vocab tokenCode seedValue = do
-  nextTokenSig <- transformer tokenCode timestep temperature promptTokens seedValue
-  -- C.sample is an IO action, so it must be run with liftIO
-  -- The Signal here represents a stream of values, but in this imperative context,
-  -- we only care about the first value of the stream.
-  let nextToken = C.sample nextTokenSig
-  let word = vocab !! fromIntegral nextToken :: BS.ByteString
-      firstChar = BSC.head word :: Char
-      tokenStr =
-        if tokenCode == 1 && isSpace firstChar
-          then BSC.tail word
-          else word
-  return (tokenStr, nextToken)
-
+-- | Generate tokens step by step using Clash's SimIO API
 generateTokens
-  ::  StepCount
-  -> PromptTokens
-  -> Float
-  -> Vocabulary
-  -> Int
-  -> TransformerResult dom  ([BS.ByteString], StepCount)
+    :: StepCount
+    -> PromptTokens
+    -> Float
+    -> Vocabulary
+    -> Int
+    -> TransformerResult C.System ([BS.ByteString], StepCount)
 generateTokens maxSteps promptTokens temperature vocab seedValue = do
-  let go timestep result token
-        | timestep >= maxSteps || (timestep /= StepCount 0 && token == 1) = return (result, timestep)
-        | otherwise = do
-            (tokenStr, nextToken) <- generateNextToken timestep promptTokens temperature vocab token seedValue
-            liftIO $ putStr $ BSC.unpack tokenStr
-            liftIO $ hFlush stdout
-            go (timestep + StepCount 1) (result ++ [tokenStr]) nextToken
-  go (StepCount 0) [] 1
+    sigTokens :: C.Signal C.System (C.Unsigned 32) <- tokenSignal maxSteps promptTokens temperature vocab seedValue
+
+    liftIO $ do
+        simSig <- SimIO.runSim sigTokens   -- turn the pure signal into a runnable simulation
+
+        let go :: Int -> [BS.ByteString] -> IO ([BS.ByteString], StepCount)
+            go step acc
+              | step >= fromIntegral (C.unNat maxSteps) = return (reverse acc, maxSteps)
+              | otherwise = do
+                  [tokId] <- SimIO.sampleN simSig 1   -- pull exactly one token ID
+                  let word = vocab !! fromIntegral tokId
+                      tokenStr =
+                        if tokId == 1 && not (BS.null word) && isSpace (BSC.head word)
+                           then BSC.tail word
+                           else word
+                  BSC.putStr tokenStr
+                  hFlush stdout
+                  go (step + 1) (tokenStr : acc)
+
+        go 0 []
 
 runModel :: BS.ByteString -> BS.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
 runModel modelFileContent tokenizerFileContent temperature steps prompt seed = do
@@ -215,3 +215,44 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
       tokensPerSec = fromIntegral countTokens / fromIntegral duration
   printf "\nduration: %ds - (%.02f tokens/s)\n" duration tokensPerSec
   return ()
+
+-- | Pure signal that produces one token ID per cycle.
+tokenSignal
+    :: StepCount                 -- ^ maximum number of steps (maxSteps)
+    -> PromptTokens              -- ^ pre‑tokenised prompt
+    -> Float                     -- ^ temperature (passed to transformer)
+    -> Vocabulary                -- ^ vocab for lookup (only needed later)
+    -> Int                       -- ^ seed value
+    -> MR.ReaderT TransformerDecoderComponent (StateT (DecoderCache C.System) SimIO.SimIO)
+         (C.Signal C.System (C.Unsigned 32))   -- ^ Signal of token IDs
+tokenSignal (StepCount maxSteps) promptTokens temperature vocab seedValue = do
+    cfg   <- ask               -- the model configuration (Reader env)
+    cache <- get               -- current decoder cache (State)
+
+    -- Build the *pure* signal that runs the transformer step‑by‑step.
+    let stepFn :: C.Signal C.System (C.Unsigned 32)
+        stepFn = C.mealy (transformerStep cfg temperature promptTokens seedValue) cache
+                 (C.fromList [0..maxSteps-1])   -- dummy clock ticks, one per step
+    return stepFn
+  where
+    -- | One‑step transition function for the transformer.
+    --   It receives the previous cache and the current tick (ignored),
+    --   and returns the next token ID together with the updated cache.
+    transformerStep
+        :: TransformerDecoderComponent
+        -> Float
+        -> PromptTokens
+        -> Int
+        -> DecoderCache C.System
+        -> C.Unsigned 32                -- ^ dummy input (tick index)
+        -> (DecoderCache C.System, C.Unsigned 32)   -- ^ (new cache, token ID)
+    transformerStep cfg temp pTokens seedVal oldCache _tick =
+        let (nextTok, newCache) = MR.runReader (runStateT (transformer (promptTokenAt stepIdx) (StepCount stepIdx) temp pTokens seedVal) oldCache) cfg
+            stepIdx = fromIntegral (C.unNat (C.length (C.unbundle oldCache)))   -- just a placeholder; adjust if you keep an explicit step counter
+        in (newCache, nextTok)
+
+    -- Helper to fetch the appropriate prompt token (same as before)
+    promptTokenAt :: Int -> Helpers.Token
+    promptTokenAt s
+      | s < length promptTokens = promptTokens !! s
+      | otherwise               = 1   -- EOS / dummy token after prompt

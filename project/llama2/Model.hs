@@ -13,13 +13,14 @@ import GHC.IO (unsafePerformIO)
 import Data.ByteString (useAsCString)
 import Helpers
 import qualified GHC.TypeNats
-import Control.Monad.Identity
 import Data.Functor ((<&>), ($>))
 import qualified System.Random as R
+import qualified Clash.Explicit.SimIO as SimIO
 
 type MVectorFloat = MV.MVector (MV.PrimState IO) Float
 
-type TransformerResult dom a = MR.ReaderT TransformerDecoderComponent (StateT (DecoderCache dom) IO) a
+type TransformerResult' dom a = MR.ReaderT TransformerDecoderComponent (StateT (DecoderCache dom) IO) a
+type TransformerResult dom a = MR.ReaderT TransformerDecoderComponent (StateT (DecoderCache dom) SimIO.SimIO) a
 
 data HeadCache dom = HeadCache
   { headKeyCache :: Signal dom CacheAddr -> Signal dom (Maybe (CacheAddr, Float)) -> Signal dom Float
@@ -468,8 +469,8 @@ transformer inputTokenCode stepCount temperature promptTokens seedValue = do
       -- Select next token
       nextTokenSig :: Signal dom Helpers.Token
       nextTokenSig
-        | step < P.length promptTokens
-        = pure (promptTokens P.!! step)   -- use prompt token
+        | fromIntegral step < P.length promptTokens
+        = pure (promptTokens P.!! fromIntegral step)   -- use prompt token
         | temperature == 0.0
         = logitsSig <&> \logits -> Helpers.Token $ fromIntegral $ argMax logits
         | otherwise

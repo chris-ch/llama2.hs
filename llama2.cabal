@@ -62,7 +62,6 @@ executable llama2
     OverloadedStrings
     RecordWildCards
     ScopedTypeVariables
-    StarIsType
     TemplateHaskell
     TupleSections
     TypeApplications
