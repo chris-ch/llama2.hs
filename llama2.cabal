@@ -59,6 +59,7 @@ executable llama2
     KindSignatures
     MonoLocalBinds
     NamedFieldPuns
+    NoImplicitPrelude
     OverloadedStrings
     RecordWildCards
     ScopedTypeVariables

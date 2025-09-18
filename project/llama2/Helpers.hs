@@ -34,7 +34,7 @@ module Helpers (
 ) where
 
 import Clash.Prelude
-import qualified Prelude as P
+
 import qualified System.Random as R
 import qualified Clash.Sized.Vector as CV
 import Data.Maybe (fromMaybe)
@@ -200,8 +200,8 @@ transformerLogits decoder tokenVector = logits where
     logits = map (`dotProduct` tokenWithRms) vocabRows
 
 -- | Find the index of the maximum element in a non-empty vector
-argMax :: forall n. (KnownNat n) => Vec n Float -> Unsigned 32
-argMax vec = fst $ foldl compareMax (0, vec !! 0) (imap (\i x -> (fromIntegral i, x)) vec)
+argMax :: forall n. ( KnownNat (n + 1)) =>Vec (n+1) Float -> Unsigned 32
+argMax vec = fst $ foldl compareMax (0, head vec) (imap (\i x -> (fromIntegral i, x)) vec)
   where
     compareMax :: (Unsigned 32, Float) -> (Unsigned 32, Float) -> (Unsigned 32, Float)
     compareMax (maxIdx, maxVal) (i, x)
@@ -214,7 +214,7 @@ dotVec xs ys = sum (zipWith (*) xs ys)
 softmaxVec :: forall n. KnownNat (n+1) => Vec (n+1) Float -> Vec (n+1) Float
 softmaxVec xs =
   let m = maximum xs
-      exps = map (\x -> P.exp (x - m)) xs
+      exps = map (\x -> exp (x - m)) xs
       s = sum exps
   in map (/ s) exps
 
@@ -241,7 +241,7 @@ computeAttentionScores
   -> Vec SeqLen Float
 computeAttentionScores query keys =
   let headDim = snatToNum (SNat @HeadDimension)
-      scaling = P.sqrt (headDim :: Float)
+      scaling = sqrt (headDim :: Float)
   in map (\key -> dotVec query key / scaling) keys
 
 -- Pure attention weights computation

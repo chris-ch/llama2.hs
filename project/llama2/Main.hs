@@ -1,13 +1,17 @@
 module Main (main) where
 
+import Prelude
+
 import qualified Data.Binary.Get as BG
-import qualified Data.ByteString.Lazy as BS
+import qualified Data.ByteString.Lazy as BSL
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy.Char8 as BSC
 import qualified Data.List as DL
 import qualified Options.Applicative as OA
 import qualified Foreign as F
-import Control.Monad.Reader (ReaderT(runReaderT), MonadIO(liftIO), MonadReader(ask))
-import Control.Monad.State (evalStateT )
+import qualified Data.Vector.Unboxed as V
+import qualified Clash.Sized.Vector as CV
+
 import Data.Maybe (fromMaybe)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import GHC.Unicode (isSpace)
@@ -16,12 +20,36 @@ import Control.Monad (replicateM)
 import Text.Printf (printf)
 
 import Helpers
-import Model
-import qualified Clash.Explicit.Prelude as C
+    ( TransformerDecoderComponent(..),
+      TransformerLayerComponent(TransformerLayerComponent,
+                                feedforwardNetwork, multiHeadAttention),
+      FeedForwardNetworkComponent(FeedForwardNetworkComponent, fRMSFfn,
+                                  fW1, fW2, fW3),
+      MultiHeadAttentionComponent(MultiHeadAttentionComponent, rmsAtt,
+                                  heads, mWo),
+      SingleHeadComponent(SingleHeadComponent, rotary, wqHead, wkHead,
+                          wvHead),
+      RotaryEncodingComponent(RotaryEncodingComponent, freqSin, freqCos),
+      EmbeddingComponent(EmbeddingComponent, rmsFinalWeight, vocabulary),
+      StepCount(..),
+      Token(..),
+      CArray2D(CArray2D),
+      HeadDimension,
+      SeqLen,
+      VocabSize,
+      NumAttentionHeads,
+      NumLayers,
+      HiddenDim,
+      ModelDim,
+      vocabSize,
+      seqLen )
+import Model ( topEntity )
+import qualified Clash.Prelude as C
 import qualified Clash.Signal as CS
 import qualified Clash.Sized.Vector as CSV
+import GHC.IO (unsafePerformIO)
 
-type Vocabulary = [BS.ByteString]
+type Vocabulary = [BSL.ByteString]
 type VocabularyScores = [Float]
 newtype Token = Token F.Int32 deriving (Show, Eq, Ord, Num)
 type PromptTokens = [Helpers.Token]
@@ -56,8 +84,8 @@ main :: IO ()
 main = do
   Options {seed, tokenizerFile, modelFile, temperature, steps,
          prompt} <- OA.execParser $ OA.info (optionsParser OA.<**> OA.helper) OA.fullDesc
-  modelFileContent <- BS.readFile modelFile
-  tokenizerFileContent <- BS.readFile tokenizerFile
+  modelFileContent <- BSL.readFile modelFile
+  tokenizerFileContent <- BSL.readFile tokenizerFile
   runModel modelFileContent tokenizerFileContent (realToFrac temperature) steps prompt seed
 
 --------------------------------------------------------------------------------
@@ -89,29 +117,29 @@ optionsParser =
 -- Tokenizer
 --------------------------------------------------------------------------------
 
-parseTokens :: BS.ByteString -> Int -> (Vocabulary, VocabularyScores)
+parseTokens :: BSL.ByteString -> Int -> (Vocabulary, VocabularyScores)
 parseTokens fileContent size = (vocab, vocabScores)
   where
     scoresTokens = BG.runGet scoresAndTokens fileContent
     vocabScores = map fst scoresTokens
     vocab = map snd scoresTokens
 
-    scoresAndTokens :: BG.Get [(Float, BS.ByteString)]
+    scoresAndTokens :: BG.Get [(Float, BSL.ByteString)]
     scoresAndTokens = replicateM size readToken
 
-    readToken :: BG.Get (Float, BS.ByteString)
+    readToken :: BG.Get (Float, BSL.ByteString)
     readToken = do
       score <- BG.getFloatle
       tokenSize <- BG.getInt32le
       token <- BG.getLazyByteString (fromIntegral tokenSize)
       return (score, token)
 
-tokenizerInit :: BS.ByteString -> Int -> BS.ByteString -> (PromptTokens, Vocabulary)
+tokenizerInit :: BSL.ByteString -> Int -> BSL.ByteString -> (PromptTokens, Vocabulary)
 tokenizerInit file size prompt = (bpeEncode prompt vocab vocabScores, vocab)
   where
-    (vocab, vocabScores) = parseTokens (BS.drop 4 file) size
+    (vocab, vocabScores) = parseTokens (BSL.drop 4 file) size
 
-strLookup :: BS.ByteString -> Vocabulary -> Int
+strLookup :: BSL.ByteString -> Vocabulary -> Int
 strLookup occurrence = fromMaybe (-1) . DL.elemIndex occurrence
 
 applyBPEMerges :: [Helpers.Token] -> Vocabulary -> VocabularyScores -> PromptTokens
@@ -126,7 +154,7 @@ applyBPEMerges tokens vocab vocabScores = case findBestPair tokens of
       where
         checkPair :: (Int, (Helpers.Token, Helpers.Token)) -> Maybe (Int, Helpers.Token) -> Maybe (Int, Helpers.Token)
         checkPair (count, (Helpers.Token tokenPrev, Helpers.Token tokenNext)) acc =
-          case strLookup ((vocab !! fromIntegral tokenPrev) `BS.append` (vocab !! fromIntegral tokenNext)) vocab of
+          case strLookup ((vocab !! fromIntegral tokenPrev) `BSL.append` (vocab !! fromIntegral tokenNext)) vocab of
             pos | pos /= -1 && vocabScores !! pos > bestScore -> Just (count, fromIntegral pos)
             _ -> acc
 
@@ -137,17 +165,17 @@ applyBPEMerges tokens vocab vocabScores = case findBestPair tokens of
     mergePair count token tokens' =
       take count tokens' ++ [token] ++ drop (count + 2) tokens'
 
-bpeEncode :: BS.ByteString -> Vocabulary -> VocabularyScores -> PromptTokens
+bpeEncode :: BSL.ByteString -> Vocabulary -> VocabularyScores -> PromptTokens
 bpeEncode prompt vocab vocabScores =
-  let tokens = map (\char -> fromMaybe (error "Character not found in vocabulary") (DL.elemIndex (BS.pack [char]) vocab)) (BS.unpack prompt)
+  let tokens = map (\char -> fromMaybe (error "Character not found in vocabulary") (DL.elemIndex (BSL.pack [char]) vocab)) (BSL.unpack prompt)
    in applyBPEMerges (map fromIntegral tokens) vocab vocabScores
 
-runModel :: BS.ByteString -> BS.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
+runModel :: BSL.ByteString -> BSL.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
 runModel modelFileContent tokenizerFileContent temperature steps prompt seed = do
   currentTime <- getPOSIXTime
   let
     seedValue = fromMaybe (round currentTime) seed
-    initModel :: BS.ByteString -> TransformerDecoderComponent
+    initModel :: BSL.ByteString -> TransformerDecoderComponent
     initModel = BG.runGet parseModelConfigFile
     config = initModel modelFileContent
     prompt' = fromMaybe "" prompt
@@ -165,6 +193,114 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
       tokensPerSec = fromIntegral countTokens / fromIntegral duration
   printf "\nduration: %ds - (%.02f tokens/s)\n" duration tokensPerSec
   return ()
+
+-- ============================================================================
+-- File Parsing
+-- ============================================================================
+
+readVector :: Int -> BG.Get (V.Vector Float)
+readVector count = do
+  byteData <- BG.getByteString (count * 4)
+  return $! unsafePerformIO $ do
+    BS.useAsCString byteData $ \ptr -> do
+      let floatPtr = F.castPtr ptr :: F.Ptr Float
+      V.generateM count (F.peekElemOff floatPtr)
+
+readVec1D :: forall n. C.KnownNat n => BG.Get (C.Vec n Float)
+readVec1D = do
+    let total = C.snatToNum (C.SNat :: C.SNat n)
+    vec <- readVector total
+    return $ CV.unsafeFromList (V.toList vec)
+
+readVec2D :: forall n m. (C.KnownNat n, C.KnownNat m) => BG.Get (C.Vec n (C.Vec m Float))
+readVec2D = do
+    let n = C.snatToNum (C.SNat :: C.SNat n)
+        m = C.snatToNum (C.SNat :: C.SNat m)
+        total = n * m
+    vec <- readVector total
+    let floatList = V.toList vec
+        chunks = chunksOf m floatList
+        vecs = map CV.unsafeFromList chunks
+    return $ CV.unsafeFromList vecs
+  where
+    chunksOf :: Int -> [a] -> [[a]]
+    chunksOf _ [] = []
+    chunksOf k xs = take k xs : chunksOf k (drop k xs)
+
+readVec3D :: forall n m p. (C.KnownNat n, C.KnownNat m, C.KnownNat p) => BG.Get (C.Vec n (C.Vec m (C.Vec p Float)))
+readVec3D = do
+    let n = C.snatToNum (C.SNat :: C.SNat n)
+        m = C.snatToNum (C.SNat :: C.SNat m)
+        p = C.snatToNum (C.SNat :: C.SNat p)
+        total = n * m * p
+    vec <- readVector total
+    let floatList = V.toList vec
+        innerChunks = chunksOf p floatList
+        innerVecs = map CV.unsafeFromList innerChunks
+        middleChunks = chunksOf m innerVecs
+        middleVecs = map CV.unsafeFromList middleChunks
+    return $ CV.unsafeFromList middleVecs
+  where
+    chunksOf :: Int -> [a] -> [[a]]
+    chunksOf _ [] = []
+    chunksOf k xs = take k xs : chunksOf k (drop k xs)
+
+parseModelConfigFile :: BG.Get TransformerDecoderComponent
+parseModelConfigFile = do
+  _ <- BG.getInt32le
+  _ <- BG.getInt32le
+  _ <- BG.getInt32le
+  _ <- BG.getInt32le
+  _ <- BG.getInt32le
+  _ <- BG.getInt32le
+  _ <- BG.getInt32le
+  tokenEmbeddingTable' <- readVec2D @VocabSize
+  rmsAttWeight' <- readVec2D @NumLayers
+  wq' <- readVec3D @NumLayers @HeadDimension @ModelDim
+  wk' <- readVec3D @NumLayers @HeadDimension @ModelDim
+  wv' <- readVec3D @NumLayers @HeadDimension @ModelDim
+  wo' <- readVec3D @NumLayers @ModelDim @ModelDim
+  rmsFfnWeight' <- readVec2D @NumLayers
+  w1' <- readVec3D @NumLayers @HiddenDim @ModelDim
+  w2' <- readVec3D @NumLayers @ModelDim @HiddenDim
+  w3' <- readVec3D @NumLayers @HiddenDim @ModelDim
+  rmsFinalWeight' <- readVec1D @ModelDim
+  freqCisReal' <- readVec2D @SeqLen
+  freqCisImag' <- readVec2D @SeqLen
+
+  let embedding = EmbeddingComponent
+        { vocabulary = CArray2D tokenEmbeddingTable'
+        , rmsFinalWeight = rmsFinalWeight'
+        }
+      sha hIdx = SingleHeadComponent
+        { wqHead = CArray2D $ wq' C.!! toInteger hIdx
+        , wkHead = CArray2D $ wk' C.!! toInteger hIdx
+        , wvHead = CArray2D $ wv' C.!! toInteger hIdx
+        , rotary = RotaryEncodingComponent
+            { freqCos = CArray2D freqCisReal'
+            , freqSin = CArray2D freqCisImag'
+            }
+        }
+      layer lIdx = TransformerLayerComponent
+        { multiHeadAttention = MultiHeadAttentionComponent
+            { heads = C.map sha (C.indicesI :: C.Vec NumAttentionHeads (C.Index NumAttentionHeads))
+            , mWo = CArray2D $ wo' C.!! lIdx
+            , rmsAtt = rmsAttWeight' C.!! lIdx
+            }
+        , feedforwardNetwork = FeedForwardNetworkComponent
+            { fW1 = CArray2D $ w1' C.!! toInteger lIdx
+            , fW2 = CArray2D $ w2' C.!! toInteger lIdx
+            , fW3 = CArray2D $ w3' C.!! toInteger lIdx
+            , fRMSFfn = rmsFfnWeight' C.!! lIdx
+            }
+        }
+
+      decoder = TransformerDecoderComponent
+        { modelEmbedding = embedding
+        , modelLayers = C.map layer (C.indicesI :: C.Vec NumLayers (C.Index NumLayers))
+        }
+
+  return decoder
 
 --------------------------------------------------------------------------------
 -- Token Generation with Clash Simulation
