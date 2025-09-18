@@ -53,6 +53,7 @@ executable llama2
     BangPatterns
     DataKinds
     DeriveAnyClass
+    DeriveGeneric
     FlexibleContexts
     GeneralizedNewtypeDeriving
     ImplicitParams

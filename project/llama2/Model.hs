@@ -1,16 +1,10 @@
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
-
 module Model (topEntity) where
 
 import Clash.Prelude
 import qualified GHC.TypeNats
 import Data.Functor (($>))
 import Helpers
-  ( NumAttentionHeads, NumKeyValueHeads, NumLayers, SeqLen, HeadDimension, ModelDim, VocabSize
+  ( NumQueryHeads, NumKeyValueHeads, NumLayers, SeqLen, HeadDimension, ModelDim, VocabSize
   , Token, TransformerLayerComponent(..), TransformerDecoderComponent (..)
   , MultiHeadAttentionComponent(..), EmbeddingComponent (..)
   , runSingleHeadQKV, applyRotaryToHead, StepCount (..)
@@ -49,7 +43,7 @@ data ProcessingState = ProcessingState
   } deriving (Show, Generic, NFDataX)
 
 initialProcessingState :: ProcessingState
-initialProcessingState = ProcessingState Cycle1_ReadCache 0 0 False
+initialProcessingState = ProcessingState { psStage = Cycle1_ReadCache, psLayer = 0, psSeqPos = 0, psTokenReady = False }
 
 -- ============================================================================
 -- Intermediate data storage
@@ -57,7 +51,7 @@ initialProcessingState = ProcessingState Cycle1_ReadCache 0 0 False
 
 data IntermediateData = IntermediateData
   { idInputVec    :: Vec ModelDim Float
-  , idQueries     :: Vec NumAttentionHeads (Vec HeadDimension Float)
+  , idQueries     :: Vec NumQueryHeads (Vec HeadDimension Float)
   , idKeys        :: Vec NumKeyValueHeads (Vec HeadDimension Float)
   , idValues      :: Vec NumKeyValueHeads (Vec HeadDimension Float)
   , idCachedKeys  :: Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
@@ -208,9 +202,9 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
   -- Write to cache on Cycle4
   writeOpsSig :: Signal dom ()
   writeOpsSig =
-    let kvSig = liftA2 (\ks vs -> zip ks vs) (idKeys <$> dataSig) (idValues <$> dataSig)
+    let kvSig = liftA2 zip (fmap idKeys dataSig) (fmap idValues dataSig)
     in bundle (traverse (imap (\hIdx kv ->
-        writeToCacheSequence cache layerIdx hIdx (psSeqPos <$> stateSig) (pure kv)
+        writeToCacheSequence cache layerIdx hIdx (fmap psSeqPos stateSig) (pure kv)
         )) kvSig)
        $> ()
 
@@ -241,7 +235,7 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
               in q_rot
               ) indicesI
             -- Compute keys and values for NumKeyValueHeads
-            headsPerGroup = natToNum @NumAttentionHeads `div` natToNum @NumKeyValueHeads
+            headsPerGroup = natToNum @NumQueryHeads `div` natToNum @NumKeyValueHeads
             keysAndValues = imap (\hIdx _ ->
               let qIdx = hIdx * headsPerGroup
                   headComp = heads mha !! qIdx

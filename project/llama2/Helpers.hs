@@ -1,5 +1,5 @@
 module Helpers (
-  NumAttentionHeads
+  NumQueryHeads
   , NumLayers
   , NumKeyValueHeads
   , SeqLen
@@ -46,7 +46,7 @@ import Data.Maybe (fromMaybe)
 type ModelDim = 64
 type HiddenDim = 172
 type NumLayers = 5
-type NumAttentionHeads = 8
+type NumQueryHeads = 8
 type NumKeyValueHeads = 4
 type HeadDimension  = 8
 type FreqDim = 4
@@ -135,9 +135,9 @@ data SingleHeadComponent = SingleHeadComponent
   } deriving (Show)
 
 data MultiHeadAttentionComponent = MultiHeadAttentionComponent
-  { heads  :: Vec NumAttentionHeads SingleHeadComponent
+  { heads  :: Vec NumQueryHeads SingleHeadComponent
   -- | Per-head output projection matrix W_O (shape HeadDim × ModelDim)
-  , mWo :: Vec NumAttentionHeads (CArray2D ModelDim HeadDimension)
+  , mWo :: Vec NumQueryHeads (CArray2D ModelDim HeadDimension)
   -- | RMSNorm before QKV projection (size ModelDim)
   , rmsAtt :: Vec ModelDim Float
   } deriving (Show)
@@ -322,7 +322,7 @@ computeAttentionOutput weights values =
 computeMultiHeadAttention
   :: MultiHeadAttentionComponent
   -> Vec ModelDim Float
-  -> Vec NumAttentionHeads (Vec HeadDimension Float)
+  -> Vec NumQueryHeads (Vec HeadDimension Float)
   -> Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
   -> Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
   -> Vec ModelDim Float
@@ -330,14 +330,14 @@ computeMultiHeadAttention mha input queries keysPerHead valuesPerHead =
   let
     -- Compute the number of query heads per key/value head
     headsPerGroup :: Int
-    headsPerGroup = natToNum @NumAttentionHeads `div` natToNum @NumKeyValueHeads
+    headsPerGroup = natToNum @NumQueryHeads `div` natToNum @NumKeyValueHeads
 
     -- Map each query head to its corresponding key/value head
-    getKVIndex :: Index NumAttentionHeads -> Index NumKeyValueHeads
+    getKVIndex :: Index NumQueryHeads -> Index NumKeyValueHeads
     getKVIndex qIdx = fromIntegral (fromIntegral qIdx `div` headsPerGroup :: Int)
 
     -- Compute per-head outputs (HeadDimension each)
-    headOutputs :: Vec NumAttentionHeads (Vec HeadDimension Float)
+    headOutputs :: Vec NumQueryHeads (Vec HeadDimension Float)
     headOutputs = imap
         (\qIdx q ->
            let kvIdx = getKVIndex qIdx
@@ -349,7 +349,7 @@ computeMultiHeadAttention mha input queries keysPerHead valuesPerHead =
         queries
 
     -- Project each head’s output via its own W_O
-    perHeadProjected :: Vec NumAttentionHeads (Vec ModelDim Float)
+    perHeadProjected :: Vec NumQueryHeads (Vec ModelDim Float)
     perHeadProjected = zipWith matrixVectorMult (mWo mha) headOutputs
 
     -- Sum across heads (elementwise sum across ModelDim)

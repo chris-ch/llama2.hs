@@ -11,7 +11,11 @@ import qualified Options.Applicative as OA
 import qualified Foreign as F
 import qualified Data.Vector.Unboxed as V
 import qualified Clash.Sized.Vector as CV
+import qualified Clash.Prelude as C
+import qualified Clash.Signal as CS
 
+import GHC.IO (unsafePerformIO)
+import GHC.Base (when)
 import Data.Maybe (fromMaybe)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import GHC.Unicode (isSpace)
@@ -37,7 +41,7 @@ import Helpers
       HeadDimension,
       SeqLen,
       VocabSize,
-      NumAttentionHeads,
+      NumQueryHeads,
       NumLayers,
       NumKeyValueHeads,
       HiddenDim,
@@ -45,15 +49,10 @@ import Helpers
       vocabSize,
       FreqDim )
 import Model ( topEntity )
-import qualified Clash.Prelude as C
-import qualified Clash.Signal as CS
-import GHC.IO (unsafePerformIO)
-import GHC.Base (when)
 
 type Vocabulary = [BSL.ByteString]
 type VocabularyScores = [Float]
-type PromptTokens = [Helpers.Token]
-
+type PromptTokens = [Token]
 
 --------------------------------------------------------------------------------
 -- Main entry point
@@ -120,17 +119,17 @@ tokenizerInit file size prompt = (bpeEncode prompt vocab vocabScores, vocab)
 strLookup :: BSL.ByteString -> Vocabulary -> Int
 strLookup occurrence = fromMaybe (-1) . DL.elemIndex occurrence
 
-applyBPEMerges :: [Helpers.Token] -> Vocabulary -> VocabularyScores -> PromptTokens
+applyBPEMerges :: [Token] -> Vocabulary -> VocabularyScores -> PromptTokens
 applyBPEMerges tokens vocab vocabScores = case findBestPair tokens of
   Just (bestIndex, bestToken) ->
     applyBPEMerges (mergePair bestIndex bestToken tokens) vocab vocabScores
   Nothing ->
     tokens
   where
-    findBestPair :: [Helpers.Token] -> Maybe (Int, Helpers.Token)
+    findBestPair :: [Token] -> Maybe (Int, Token)
     findBestPair tokens' = foldr checkPair Nothing (zip [0 ..] (zip tokens' (drop 1 tokens')))
       where
-        checkPair :: (Int, (Helpers.Token, Helpers.Token)) -> Maybe (Int, Helpers.Token) -> Maybe (Int, Helpers.Token)
+        checkPair :: (Int, (Token, Token)) -> Maybe (Int, Token) -> Maybe (Int, Token)
         checkPair (count, (tokenPrev, tokenNext)) acc =
           case strLookup ((vocab !! fromIntegral tokenPrev) `BSL.append` (vocab !! fromIntegral tokenNext)) vocab of
             pos | pos /= -1 && vocabScores !! pos > bestScore -> Just (count, fromIntegral pos)
@@ -139,7 +138,7 @@ applyBPEMerges tokens vocab vocabScores = case findBestPair tokens of
         bestScore :: Float
         bestScore = -1e10
 
-    mergePair :: Int -> Helpers.Token -> [Helpers.Token] -> [Helpers.Token]
+    mergePair :: Int -> Token -> [Token] -> [Token]
     mergePair count token tokens' =
       take count tokens' ++ [token] ++ drop (count + 2) tokens'
 
@@ -159,16 +158,16 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
   currentTime <- getPOSIXTime
   let
     seedValue = fromMaybe (round currentTime) seed
-    initModel :: BSL.ByteString -> Helpers.TransformerDecoderComponent
+    initModel :: BSL.ByteString -> TransformerDecoderComponent
     initModel = BG.runGet parseModelConfigFile
     config = initModel modelFileContent
     prompt' = fromMaybe "" prompt
-    (promptTokens, vocab) = tokenizerInit tokenizerFileContent Helpers.vocabSize (BSC.pack prompt')
+    (promptTokens, vocab) = tokenizerInit tokenizerFileContent vocabSize (BSC.pack prompt')
 
   putStrLn "<s>"
   startTime <- getPOSIXTime
 
-  (_, Helpers.StepCount countTokens) <- generateTokensSimAutoregressive config vocab (fromIntegral steps) promptTokens temperature seedValue
+  (_, StepCount countTokens) <- generateTokensSimAutoregressive config vocab (fromIntegral steps) promptTokens temperature seedValue
 
   endTime <- getPOSIXTime
   let duration :: Integer
@@ -250,73 +249,73 @@ readVec4D = do
     chunksOf _ [] = []
     chunksOf k xs = take k xs : chunksOf k (drop k xs)
 
-parseModelConfigFile :: BG.Get Helpers.TransformerDecoderComponent
+parseModelConfigFile :: BG.Get TransformerDecoderComponent
 parseModelConfigFile = do
   replicateM_ 7 BG.getInt32le
 
-  tokenEmbeddingTable' <- readVec2D @Helpers.VocabSize @Helpers.ModelDim
-  rmsAttWeight'        <- readVec2D @Helpers.NumLayers @Helpers.ModelDim
-  wq'                  <- readVec4D @Helpers.NumLayers @Helpers.NumAttentionHeads @Helpers.HeadDimension @Helpers.ModelDim
-  wk'                  <- readVec4D @Helpers.NumLayers @Helpers.NumKeyValueHeads @Helpers.HeadDimension @Helpers.ModelDim
-  wv'                  <- readVec4D @Helpers.NumLayers @Helpers.NumKeyValueHeads @Helpers.HeadDimension @Helpers.ModelDim
-  wo'                  <- readVec4D @Helpers.NumLayers @Helpers.NumAttentionHeads @Helpers.ModelDim @Helpers.HeadDimension 
-  rmsFfnWeight'        <- readVec2D @Helpers.NumLayers @Helpers.ModelDim
-  w1'                  <- readVec3D @Helpers.NumLayers @Helpers.HiddenDim @Helpers.ModelDim
-  w2'                  <- readVec3D @Helpers.NumLayers @Helpers.ModelDim @Helpers.HiddenDim
-  w3'                  <- readVec3D @Helpers.NumLayers @Helpers.HiddenDim @Helpers.ModelDim
-  rmsFinalWeight'      <- readVec1D @Helpers.ModelDim
-  freqCisReal'         <- readVec2D @Helpers.SeqLen @Helpers.FreqDim
-  freqCisImag'         <- readVec2D @Helpers.SeqLen @Helpers.FreqDim
+  tokenEmbeddingTable' <- readVec2D @VocabSize @ModelDim
+  rmsAttWeight'        <- readVec2D @NumLayers @ModelDim
+  wq'                  <- readVec4D @NumLayers @NumQueryHeads @HeadDimension @ModelDim
+  wk'                  <- readVec4D @NumLayers @NumKeyValueHeads @HeadDimension @ModelDim
+  wv'                  <- readVec4D @NumLayers @NumKeyValueHeads @HeadDimension @ModelDim
+  wo'                  <- readVec4D @NumLayers @NumQueryHeads @ModelDim @HeadDimension 
+  rmsFfnWeight'        <- readVec2D @NumLayers @ModelDim
+  w1'                  <- readVec3D @NumLayers @HiddenDim @ModelDim
+  w2'                  <- readVec3D @NumLayers @ModelDim @HiddenDim
+  w3'                  <- readVec3D @NumLayers @HiddenDim @ModelDim
+  rmsFinalWeight'      <- readVec1D @ModelDim
+  freqCisReal'         <- readVec2D @SeqLen @FreqDim
+  freqCisImag'         <- readVec2D @SeqLen @FreqDim
 
   let
-    embedding = Helpers.EmbeddingComponent
-      { vocabulary     = Helpers.CArray2D tokenEmbeddingTable'
+    embedding = EmbeddingComponent
+      { vocabulary     = CArray2D tokenEmbeddingTable'
       , rmsFinalWeight = rmsFinalWeight'
       }
 
-    layer :: C.Index Helpers.NumLayers -> Helpers.TransformerLayerComponent
+    layer :: C.Index NumLayers -> TransformerLayerComponent
     layer lIdx =
       let
-        sha :: C.Index Helpers.NumAttentionHeads -> Helpers.SingleHeadComponent
+        sha :: C.Index NumQueryHeads -> SingleHeadComponent
         sha hIdx =
-          let nQ  = C.snatToNum (C.SNat @Helpers.NumAttentionHeads) :: Int
-              nKV = C.snatToNum (C.SNat @Helpers.NumKeyValueHeads)  :: Int
+          let nQ  = C.snatToNum (C.SNat @NumQueryHeads) :: Int
+              nKV = C.snatToNum (C.SNat @NumKeyValueHeads)  :: Int
               kvMul = max 1 (nQ `div` nKV)
               kvIdxInt = fromIntegral hIdx `div` kvMul
-              kvIdx :: C.Index Helpers.NumKeyValueHeads
+              kvIdx :: C.Index NumKeyValueHeads
               kvIdx = fromInteger (toInteger kvIdxInt)
-          in Helpers.SingleHeadComponent
-               { wqHead = Helpers.CArray2D $ (wq' C.!! lIdx) C.!! hIdx
-               , wkHead = Helpers.CArray2D $ (wk' C.!! lIdx) C.!! kvIdx
-               , wvHead = Helpers.CArray2D $ (wv' C.!! lIdx) C.!! kvIdx
-               , rotary  = Helpers.RotaryEncodingComponent
-                   { freqCos = Helpers.CArray2D freqCisReal'
-                   , freqSin = Helpers.CArray2D freqCisImag'
+          in SingleHeadComponent
+               { wqHead = CArray2D $ (wq' C.!! lIdx) C.!! hIdx
+               , wkHead = CArray2D $ (wk' C.!! lIdx) C.!! kvIdx
+               , wvHead = CArray2D $ (wv' C.!! lIdx) C.!! kvIdx
+               , rotary  = RotaryEncodingComponent
+                   { freqCos = CArray2D freqCisReal'
+                   , freqSin = CArray2D freqCisImag'
                    }
                }
 
-        mWoVec :: C.Vec NumAttentionHeads (CArray2D ModelDim HeadDimension)
+        mWoVec :: C.Vec NumQueryHeads (CArray2D ModelDim HeadDimension)
         mWoVec = C.map
-            (\hIdx -> Helpers.CArray2D $ (wo' C.!! lIdx) C.!! hIdx)
-            (C.indicesI @Helpers.NumAttentionHeads)
+            (\hIdx -> CArray2D $ (wo' C.!! lIdx) C.!! hIdx)
+            (C.indicesI @NumQueryHeads)
 
-      in Helpers.TransformerLayerComponent
-           { multiHeadAttention = Helpers.MultiHeadAttentionComponent
-               { heads  = C.map sha (C.indicesI :: C.Vec Helpers.NumAttentionHeads (C.Index Helpers.NumAttentionHeads))
+      in TransformerLayerComponent
+           { multiHeadAttention = MultiHeadAttentionComponent
+               { heads  = C.map sha (C.indicesI :: C.Vec NumQueryHeads (C.Index NumQueryHeads))
                , mWo    = mWoVec
                , rmsAtt = rmsAttWeight' C.!! lIdx
                }
-           , feedforwardNetwork = Helpers.FeedForwardNetworkComponent
-               { fW1     = Helpers.CArray2D $ w1' C.!! toInteger lIdx
-               , fW2     = Helpers.CArray2D $ w2' C.!! toInteger lIdx
-               , fW3     = Helpers.CArray2D $ w3' C.!! toInteger lIdx
+           , feedforwardNetwork = FeedForwardNetworkComponent
+               { fW1     = CArray2D $ w1' C.!! toInteger lIdx
+               , fW2     = CArray2D $ w2' C.!! toInteger lIdx
+               , fW3     = CArray2D $ w3' C.!! toInteger lIdx
                , fRMSFfn = rmsFfnWeight' C.!! lIdx
                }
            }
 
-    decoder = Helpers.TransformerDecoderComponent
+    decoder = TransformerDecoderComponent
       { modelEmbedding = embedding
-      , modelLayers    = C.map layer (C.indicesI :: C.Vec Helpers.NumLayers (C.Index Helpers.NumLayers))
+      , modelLayers    = C.map layer (C.indicesI :: C.Vec NumLayers (C.Index NumLayers))
       }
 
   return decoder
@@ -327,13 +326,13 @@ parseModelConfigFile = do
 
 -- | Autoregressive token generation, one token at a time.
 generateTokensSimAutoregressive
-  :: Helpers.TransformerDecoderComponent
+  :: TransformerDecoderComponent
   -> Vocabulary
   -> C.Unsigned 32                      -- ^ number of steps to generate
-  -> [Helpers.Token]                    -- ^ prompt tokens
+  -> [Token]                    -- ^ prompt tokens
   -> Float                              -- ^ temperature
   -> Int                                -- ^ seed
-  -> IO ([Helpers.Token], Helpers.StepCount)   -- ^ produced tokens and token count
+  -> IO ([Token], StepCount)   -- ^ produced tokens and token count
 generateTokensSimAutoregressive decoder vocab nSteps promptTokens temperature seed = do
   let promptLen  = length promptTokens
       totalSteps = promptLen + fromIntegral nSteps
@@ -343,7 +342,7 @@ generateTokensSimAutoregressive decoder vocab nSteps promptTokens temperature se
   hFlush stdout
 
   -- We keep an accumulating list of all tokens seen so far
-  let go :: Int -> [Helpers.Token] -> IO [Helpers.Token]
+  let go :: Int -> [Token] -> IO [Token]
       go step acc
         | step >= totalSteps = return (drop promptLen acc)  -- return only generated part
         | otherwise = do
@@ -367,14 +366,14 @@ generateTokensSimAutoregressive decoder vocab nSteps promptTokens temperature se
 
   generated <- go 0 promptTokens
   putStrLn ""
-  return (take (fromIntegral nSteps) generated, Helpers.StepCount nSteps)
+  return (take (fromIntegral nSteps) generated, StepCount nSteps)
 
 -- Helper function to create a bundled version of topEntity
 topEntityBundled
   :: CS.HiddenClockResetEnable dom
-  => Helpers.TransformerDecoderComponent
-  -> C.Signal dom (Int, Helpers.Token, Float, Int)
-  -> C.Signal dom Helpers.Token
-topEntityBundled decoder bundledInputs = 
-  let (seqPos, inputToken, temp, rngSeed) = C.unbundle bundledInputs
-  in topEntity decoder seqPos inputToken temp rngSeed
+  => TransformerDecoderComponent
+  -> C.Signal dom (Int, Token, Float, Int)
+  -> C.Signal dom Token
+topEntityBundled decoder bundledInputs = topEntity decoder seqPos inputToken temp rngSeed where
+  (seqPos, inputToken, temp, rngSeed) = C.unbundle bundledInputs
+
