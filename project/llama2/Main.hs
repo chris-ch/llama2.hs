@@ -359,8 +359,14 @@ applyBPEMerges tokens vocab vocabScores = case findBestPair tokens of
 
 bpeEncode :: BS.ByteString -> Vocabulary -> VocabularyScores -> PromptTokens
 bpeEncode prompt vocab vocabScores =
-  let tokens = map (\char -> fromMaybe (error "Character not found in vocabulary") (DL.elemIndex (BS.pack [char]) vocab)) (BS.unpack prompt)
-   in applyBPEMerges (map fromIntegral tokens) vocab vocabScores
+  let initialTokens = map (\byte ->
+        let byteStr = BS.pack [byte]
+            maybeIdx = DL.elemIndex byteStr vocab
+        in case maybeIdx of
+             Just idx -> fromIntegral idx
+             Nothing  -> fromIntegral (fromEnum byte + 3)  -- Fallback to byte + 3
+        ) (BS.unpack prompt)
+   in applyBPEMerges initialTokens vocab vocabScores
 
 --------------------------------------------------------------------------------
 -- LLM Structure
