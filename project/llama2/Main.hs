@@ -214,8 +214,8 @@ parseModelConfigFile = do
   tokenEmbeddingTable' <- readArray2D vocabSize' modelDim'
   rmsAttWeight' <- readArray2D nLayers' modelDim' :: BG.Get Array2D
   wq' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
-  wk' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
-  wv' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
+  wk' <- readArray3D nLayers' modelDim' (numKeyValueHeads' * (modelDim' `div` numAttentionHeads')) :: BG.Get Array3D
+  wv' <- readArray3D nLayers' modelDim' (numKeyValueHeads' * (modelDim' `div` numAttentionHeads')) :: BG.Get Array3D
   wo' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
   rmsFfnWeight' <- readArray2D nLayers' modelDim' :: BG.Get Array2D
   w1' <- readArray3D nLayers' hiddenDim' modelDim' :: BG.Get Array3D
@@ -238,7 +238,7 @@ parseModelConfigFile = do
           multiHeadAttention = MultiHeadAttentionComponent
                 { heads = [ SingleHeadComponent
                               { wqHead = getHeadArray2D layerIdx headIdx headDim wq'
-                              , wkHead = getHeadArray2D layerIdx headIdx headDim wk'
+                              , wkHead = getHeadArray2D layerIdx (headIdx `div` (numAttentionHeads' `div` numKeyValueHeads')) headDim wk'
                               , wvHead = getHeadArray2D layerIdx headIdx headDim wv'
                               , rotary = RotaryEncodingComponent { freqCos = freqCisReal', freqSin = freqCisImag' }
                               }
