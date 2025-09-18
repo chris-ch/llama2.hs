@@ -7,7 +7,6 @@
 module Model (topEntity) where
 
 import Clash.Prelude
-import Clash.XException
 import qualified GHC.TypeNats
 import Data.Functor (($>))
 import Helpers

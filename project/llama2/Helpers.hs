@@ -4,6 +4,7 @@ module Helpers (
   , SeqLen
   , HeadDimension
   , ModelDim
+  , FreqDim
   , HiddenDim
   , VocabSize
   , TransformerLayerComponent(..)
@@ -40,19 +41,78 @@ import qualified System.Random as R
 import qualified Clash.Sized.Vector as CV
 import Data.Maybe (fromMaybe)
 
--- model config 110M
+{-
+-- model config 260K
+type ModelDim = 64
+type HiddenDim = 172
+type NumLayers = 5
+type NumAttentionHeads = 8
+type HeadDimension  = 8
+type FreqDim = 4
+type VocabSize = 512 :: Nat
+vocabSize :: Int
+vocabSize = natToNum @VocabSize
+type SeqLen         = 512
+seqLen :: Int
+seqLen = natToNum @SeqLen
+ -}
+
+ -- model config 110M
 type ModelDim = 768
 type HiddenDim = 2048
 type NumLayers = 12
 type NumAttentionHeads = 12
+type HeadDimension  = 64
+type FreqDim = 32
 type VocabSize = 32000 :: Nat
 vocabSize :: Int
 vocabSize = natToNum @VocabSize
 type SeqLen         = 1024
 seqLen :: Int
 seqLen = natToNum @SeqLen
-type HeadDimension  = 64
-type FreqDim = 32
+
+{--------------------------------------------------- 
+110M
+modelDim 768
+hiddenDim 2048
+numLayers 12
+numAttentionHeads 12
+headDimension 64
+numKeyValueHeads 12
+vocabSize 32000
+seqLen 1024
+
+42M
+modelDim 512
+hiddenDim 1376
+numLayers 8
+numAttentionHeads 8
+headDimension 64
+numKeyValueHeads 8
+vocabSize 32000
+seqLen 1024
+
+15M
+modelDim 288
+hiddenDim 768
+numLayers 6
+numAttentionHeads 6
+headDimension 48
+numKeyValueHeads 6
+vocabSize 32000
+seqLen 256
+
+260K
+modelDim 64
+hiddenDim 172
+numLayers 5
+numAttentionHeads 8
+headDimension 8
+numKeyValueHeads 4
+vocabSize 512
+seqLen 512
+
+ ---------------------------------------------------}
 
 newtype CArray2D (n :: Nat) (m :: Nat) = CArray2D (Vec n (Vec m Float)) deriving (Show)
 

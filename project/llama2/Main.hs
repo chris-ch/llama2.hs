@@ -32,7 +32,7 @@ import Helpers
       RotaryEncodingComponent(RotaryEncodingComponent, freqSin, freqCos),
       EmbeddingComponent(EmbeddingComponent, rmsFinalWeight, vocabulary),
       StepCount(..),
-      Token(..),
+      Token,
       CArray2D(CArray2D),
       HeadDimension,
       SeqLen,
@@ -42,7 +42,7 @@ import Helpers
       HiddenDim,
       ModelDim,
       vocabSize,
-      seqLen )
+      seqLen, FreqDim )
 import Model ( topEntity )
 import qualified Clash.Prelude as C
 import qualified Clash.Signal as CS
@@ -51,7 +51,6 @@ import GHC.IO (unsafePerformIO)
 
 type Vocabulary = [BSL.ByteString]
 type VocabularyScores = [Float]
-newtype Token = Token F.Int32 deriving (Show, Eq, Ord, Num)
 type PromptTokens = [Helpers.Token]
 
 
@@ -181,16 +180,16 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
   currentTime <- getPOSIXTime
   let
     seedValue = fromMaybe (round currentTime) seed
-    initModel :: BSL.ByteString -> TransformerDecoderComponent
+    initModel :: BSL.ByteString -> Helpers.TransformerDecoderComponent
     initModel = BG.runGet parseModelConfigFile
     config = initModel modelFileContent
     prompt' = fromMaybe "" prompt
-    (promptTokens, vocab) = tokenizerInit tokenizerFileContent vocabSize (BSC.pack prompt')
+    (promptTokens, vocab) = tokenizerInit tokenizerFileContent Helpers.vocabSize (BSC.pack prompt')
 
   putStrLn "<s>"
   startTime <- getPOSIXTime
 
-  (_, StepCount countTokens) <- generateTokensSimAutoregressive config (fromIntegral steps) promptTokens temperature seedValue
+  (_, Helpers.StepCount countTokens) <- generateTokensSimAutoregressive config (fromIntegral steps) promptTokens temperature seedValue
 
   endTime <- getPOSIXTime
   let duration :: Integer
@@ -251,7 +250,28 @@ readVec3D = do
     chunksOf _ [] = []
     chunksOf k xs = take k xs : chunksOf k (drop k xs)
 
-parseModelConfigFile :: BG.Get TransformerDecoderComponent
+readVec4D :: forall n m p q. (C.KnownNat n, C.KnownNat m, C.KnownNat p, C.KnownNat q) => BG.Get (C.Vec n (C.Vec m (C.Vec p (C.Vec q Float))))
+readVec4D = do
+    let n = C.snatToNum (C.SNat :: C.SNat n)
+        m = C.snatToNum (C.SNat :: C.SNat m)
+        p = C.snatToNum (C.SNat :: C.SNat p)
+        q = C.snatToNum (C.SNat :: C.SNat q)
+        total = n * m * p * q
+    vec <- readVector total
+    let floatList = V.toList vec
+        innerChunks = chunksOf p floatList
+        innerVecs = map CV.unsafeFromList innerChunks
+        middleChunks = chunksOf m innerVecs
+        middleVecs = map CV.unsafeFromList middleChunks
+        externChunks = chunksOf m middleVecs
+        externVecs = map CV.unsafeFromList externChunks
+    return $ CV.unsafeFromList externVecs
+  where
+    chunksOf :: Int -> [a] -> [[a]]
+    chunksOf _ [] = []
+    chunksOf k xs = take k xs : chunksOf k (drop k xs)
+
+parseModelConfigFile :: BG.Get Helpers.TransformerDecoderComponent
 parseModelConfigFile = do
   _ <- BG.getInt32le
   _ <- BG.getInt32le
@@ -260,53 +280,68 @@ parseModelConfigFile = do
   _ <- BG.getInt32le
   _ <- BG.getInt32le
   _ <- BG.getInt32le
-  tokenEmbeddingTable' <- readVec2D @VocabSize
-  rmsAttWeight' <- readVec2D @NumLayers
-  wq' <- readVec3D @NumLayers @HeadDimension @ModelDim
-  wk' <- readVec3D @NumLayers @HeadDimension @ModelDim
-  wv' <- readVec3D @NumLayers @HeadDimension @ModelDim
-  wo' <- readVec3D @NumLayers @ModelDim @ModelDim
-  rmsFfnWeight' <- readVec2D @NumLayers
-  w1' <- readVec3D @NumLayers @HiddenDim @ModelDim
-  w2' <- readVec3D @NumLayers @ModelDim @HiddenDim
-  w3' <- readVec3D @NumLayers @HiddenDim @ModelDim
-  rmsFinalWeight' <- readVec1D @ModelDim
-  freqCisReal' <- readVec2D @SeqLen
-  freqCisImag' <- readVec2D @SeqLen
+  tokenEmbeddingTable' <- readVec2D @Helpers.VocabSize @Helpers.ModelDim
+  rmsAttWeight' <- readVec2D @Helpers.NumLayers @Helpers.ModelDim
+  wq' <- readVec4D @Helpers.NumLayers @Helpers.NumAttentionHeads @Helpers.HeadDimension @Helpers.ModelDim
+  wk' <- readVec4D @Helpers.NumLayers @Helpers.NumAttentionHeads @Helpers.HeadDimension @Helpers.ModelDim
+  wv' <- readVec4D @Helpers.NumLayers @Helpers.NumAttentionHeads @Helpers.HeadDimension @Helpers.ModelDim
+  wo' <- readVec3D @Helpers.NumLayers @Helpers.ModelDim @Helpers.ModelDim
+  rmsFfnWeight' <- readVec2D @Helpers.NumLayers @Helpers.ModelDim
+  w1' <- readVec3D @Helpers.NumLayers @Helpers.HiddenDim @Helpers.ModelDim
+  w2' <- readVec3D @Helpers.NumLayers @Helpers.ModelDim @Helpers.HiddenDim
+  w3' <- readVec3D @Helpers.NumLayers @Helpers.HiddenDim @Helpers.ModelDim
+  rmsFinalWeight' <- readVec1D @Helpers.ModelDim
+  freqCisReal' <- readVec2D @Helpers.SeqLen @Helpers.FreqDim
+  freqCisImag' <- readVec2D @Helpers.SeqLen @Helpers.FreqDim
 
-  let embedding = EmbeddingComponent
-        { vocabulary = CArray2D tokenEmbeddingTable'
-        , rmsFinalWeight = rmsFinalWeight'
-        }
-      sha hIdx = SingleHeadComponent
-        { wqHead = CArray2D $ wq' C.!! toInteger hIdx
-        , wkHead = CArray2D $ wk' C.!! toInteger hIdx
-        , wvHead = CArray2D $ wv' C.!! toInteger hIdx
-        , rotary = RotaryEncodingComponent
-            { freqCos = CArray2D freqCisReal'
-            , freqSin = CArray2D freqCisImag'
+  let
+    embedding = Helpers.EmbeddingComponent
+      { vocabulary = Helpers.CArray2D tokenEmbeddingTable'
+      , rmsFinalWeight = rmsFinalWeight'
+      }
+
+    sha
+      :: C.Index Helpers.NumLayers              -- ^ layer index
+      -> C.Index Helpers.NumAttentionHeads       -- ^ head index
+      -> Helpers.SingleHeadComponent
+    sha lIdx hIdx =
+      Helpers.SingleHeadComponent
+        { wqHead = Helpers.CArray2D $ (wq' C.!! lIdx) C.!! hIdx
+        , wkHead = Helpers.CArray2D $ (wk' C.!! lIdx) C.!! hIdx
+        , wvHead = Helpers.CArray2D $ (wv' C.!! lIdx) C.!! hIdx
+        , rotary = Helpers.RotaryEncodingComponent
+            { freqCos = Helpers.CArray2D freqCisReal'
+            , freqSin = Helpers.CArray2D freqCisImag'
             }
         }
-      layer lIdx = TransformerLayerComponent
-        { multiHeadAttention = MultiHeadAttentionComponent
-            { heads = C.map sha (C.indicesI :: C.Vec NumAttentionHeads (C.Index NumAttentionHeads))
-            , mWo = CArray2D $ wo' C.!! lIdx
+
+    layer :: C.Index Helpers.NumLayers -> Helpers.TransformerLayerComponent
+    layer lIdx =
+      Helpers.TransformerLayerComponent
+        { multiHeadAttention = Helpers.MultiHeadAttentionComponent
+            { heads =
+                C.map (sha lIdx)
+                      (C.indicesI :: C.Vec Helpers.NumAttentionHeads (C.Index Helpers.NumAttentionHeads))
+            , mWo    = Helpers.CArray2D $ wo' C.!! lIdx
             , rmsAtt = rmsAttWeight' C.!! lIdx
             }
-        , feedforwardNetwork = FeedForwardNetworkComponent
-            { fW1 = CArray2D $ w1' C.!! toInteger lIdx
-            , fW2 = CArray2D $ w2' C.!! toInteger lIdx
-            , fW3 = CArray2D $ w3' C.!! toInteger lIdx
+        , feedforwardNetwork = Helpers.FeedForwardNetworkComponent
+            { fW1 = Helpers.CArray2D $ w1' C.!! toInteger lIdx
+            , fW2 = Helpers.CArray2D $ w2' C.!! toInteger lIdx
+            , fW3 = Helpers.CArray2D $ w3' C.!! toInteger lIdx
             , fRMSFfn = rmsFfnWeight' C.!! lIdx
             }
         }
 
-      decoder = TransformerDecoderComponent
-        { modelEmbedding = embedding
-        , modelLayers = C.map layer (C.indicesI :: C.Vec NumLayers (C.Index NumLayers))
-        }
+    decoder = Helpers.TransformerDecoderComponent
+      { modelEmbedding = embedding
+      , modelLayers =
+          C.map layer
+                (C.indicesI :: C.Vec Helpers.NumLayers (C.Index Helpers.NumLayers))
+      }
 
   return decoder
+
 
 --------------------------------------------------------------------------------
 -- Token Generation with Clash Simulation
@@ -314,12 +349,12 @@ parseModelConfigFile = do
 
 -- This version feeds the output of each step as input to the next step
 generateTokensSimAutoregressive
-  :: TransformerDecoderComponent
+  :: Helpers.TransformerDecoderComponent
   -> C.Unsigned 32                      -- ^ number of steps to generate
   -> [Helpers.Token]                   -- ^ prompt tokens
   -> Float                     -- ^ temperature
   -> Int                       -- ^ seed
-  -> IO ([Helpers.Token], StepCount)   -- ^ produced tokens and token count
+  -> IO ([Helpers.Token], Helpers.StepCount)   -- ^ produced tokens and token count
 generateTokensSimAutoregressive decoder nSteps promptTokens temperature seed = do
   let promptLen = length promptTokens
       totalSteps = promptLen + fromIntegral nSteps
@@ -333,7 +368,7 @@ generateTokensSimAutoregressive decoder nSteps promptTokens temperature seed = d
       rngSeeds = [seed + i | i <- [0..totalSteps-1]]
       
       -- Create prompt vector (same for all steps in this simple version)
-      promptPadded = take seqLen (promptTokens ++ repeat 0)
+      promptPadded = take Helpers.seqLen (promptTokens ++ repeat 0)
       promptVec = replicate totalSteps (CSV.unsafeFromList promptPadded)
       
       -- For the input tokens, we need to simulate the autoregressive process
@@ -356,7 +391,7 @@ generateTokensSimAutoregressive decoder nSteps promptTokens temperature seed = d
   mapM_ (\t -> putStr (show t ++ " ") >> hFlush stdout) resultTokens
   putStrLn ""
 
-  return (resultTokens, StepCount nSteps)
+  return (resultTokens, Helpers.StepCount nSteps)
 
 zip5 :: [a] -> [b] -> [c] -> [d] -> [e] -> [(a, b, c, d, e)]
 zip5 (a:as) (b:bs) (c:cs) (d:ds) (e:es) = (a, b, c, d, e) : zip5 as bs cs ds es
@@ -365,8 +400,8 @@ zip5 _ _ _ _ _ = []
 -- Helper function to create a bundled version of topEntity
 topEntityBundled
   :: CS.HiddenClockResetEnable dom
-  => TransformerDecoderComponent
-  -> C.Signal dom (Int, Helpers.Token, Float, Int, C.Vec SeqLen Helpers.Token)
+  => Helpers.TransformerDecoderComponent
+  -> C.Signal dom (Int, Helpers.Token, Float, Int, C.Vec Helpers.SeqLen Helpers.Token)
   -> C.Signal dom Helpers.Token
 topEntityBundled decoder bundledInputs = 
   let (seqPos, inputToken, temp, rngSeed, promptVec) = C.unbundle bundledInputs
