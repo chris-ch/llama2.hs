@@ -8,7 +8,6 @@ module Helpers (
   , VocabSize
   , TransformerLayerComponent(..)
   , TransformerDecoderComponent(..)
-  , Token(..)
   , SingleHeadComponent(..)
   , MultiHeadAttentionComponent(..)
   , RotaryEncodingComponent(..)
@@ -16,6 +15,7 @@ module Helpers (
   ,EmbeddingComponent(..)
   , StepCount(..)
   , CArray2D(..)
+  , Token
   , runSingleHeadQKV
   ,applyRotaryToHead
   , rmsNorm
@@ -31,6 +31,7 @@ module Helpers (
   , computeMultiHeadAttention
   , vocabSize
   , seqLen
+  , liftA4
 ) where
 
 import Clash.Prelude
@@ -59,9 +60,9 @@ newtype CArray2D (n :: Nat) (m :: Nat) = CArray2D (Vec n (Vec m Float)) deriving
 getRow :: forall n m. (KnownNat n) => StepCount -> CArray2D n m -> Vec m Float
 getRow (StepCount i) (CArray2D arr) = arr !! (fromIntegral i :: Index n)
 
-newtype Token = Token (Unsigned 32) deriving (Show, Eq, Ord, Num, NFDataX)
+type Token = Unsigned 32
 
-newtype StepCount = StepCount (Unsigned 32) deriving (Show, Eq, Ord, Num)
+newtype StepCount = StepCount (Unsigned 32) deriving (Show, Eq, Ord)
 
 -- Data definitions for LLM architecture
 
@@ -106,6 +107,9 @@ data TransformerDecoderComponent = TransformerDecoderComponent
     modelLayers :: Vec NumLayers TransformerLayerComponent
   } deriving (Show)
 
+liftA4 :: Applicative f => (a -> b -> c -> d -> e) -> f a -> f b -> f c -> f d -> f e
+liftA4 f a b c d = liftA3 f a b c <*> d
+
 -- Dot product of two Vecs
 dotProduct :: KnownNat n => Vec n Float -> Vec n Float -> Float
 dotProduct v1 v2 = sum $ zipWith (*) v1 v2
@@ -128,7 +132,7 @@ sigmoidLinearUnit x = x / (1.0 + exp (-x))
 
 -- Embed a token
 embed :: CArray2D VocabSize ModelDim -> Token -> Vec ModelDim Float
-embed (CArray2D vocab) (Token tokenCode) = vocab !! (fromIntegral tokenCode :: Int)
+embed (CArray2D vocab) tokenCode = vocab !! (fromIntegral tokenCode :: Int)
 
 -- Apply rotation per head
 applyRotation

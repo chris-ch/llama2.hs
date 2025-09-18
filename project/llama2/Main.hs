@@ -153,7 +153,7 @@ applyBPEMerges tokens vocab vocabScores = case findBestPair tokens of
     findBestPair tokens' = foldr checkPair Nothing (zip [0 ..] (zip tokens' (drop 1 tokens')))
       where
         checkPair :: (Int, (Helpers.Token, Helpers.Token)) -> Maybe (Int, Helpers.Token) -> Maybe (Int, Helpers.Token)
-        checkPair (count, (Helpers.Token tokenPrev, Helpers.Token tokenNext)) acc =
+        checkPair (count, (tokenPrev, tokenNext)) acc =
           case strLookup ((vocab !! fromIntegral tokenPrev) `BSL.append` (vocab !! fromIntegral tokenNext)) vocab of
             pos | pos /= -1 && vocabScores !! pos > bestScore -> Just (count, fromIntegral pos)
             _ -> acc
@@ -327,12 +327,12 @@ generateTokensSimAutoregressive decoder nSteps promptTokens temperature seed = d
       rngSeeds = [seed + i | i <- [0..totalSteps-1]]
       
       -- Create prompt vector (same for all steps in this simple version)
-      promptPadded = take seqLen (promptTokens ++ repeat (Helpers.Token 0))
+      promptPadded = take seqLen (promptTokens ++ repeat 0)
       promptVec = replicate totalSteps (CSV.unsafeFromList promptPadded)
       
       -- For the input tokens, we need to simulate the autoregressive process
       -- This is a simplified version - in practice you'd need to feed outputs back as inputs
-      inputTokens = take totalSteps (promptTokens ++ repeat (Helpers.Token 0))
+      inputTokens = take totalSteps (promptTokens ++ repeat 0)
 
       -- Bundle all inputs together as tuples for CS.simulate
       bundledInputs = zip5 seqPositions inputTokens tempSig rngSeeds promptVec
