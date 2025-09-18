@@ -1,6 +1,7 @@
 module Helpers (
   NumAttentionHeads
   , NumLayers
+  , NumKeyValueHeads
   , SeqLen
   , HeadDimension
   , ModelDim
@@ -41,12 +42,12 @@ import qualified System.Random as R
 import qualified Clash.Sized.Vector as CV
 import Data.Maybe (fromMaybe)
 
-{-
 -- model config 260K
 type ModelDim = 64
 type HiddenDim = 172
 type NumLayers = 5
 type NumAttentionHeads = 8
+type NumKeyValueHeads = 4
 type HeadDimension  = 8
 type FreqDim = 4
 type VocabSize = 512 :: Nat
@@ -55,13 +56,31 @@ vocabSize = natToNum @VocabSize
 type SeqLen         = 512
 seqLen :: Int
 seqLen = natToNum @SeqLen
+
+{- 
+-- model config 15M
+type ModelDim = 288
+type HiddenDim = 768
+type NumLayers = 6
+type NumAttentionHeads = 6
+type NumKeyValueHeads = 6
+type HeadDimension  = 48
+type FreqDim = 16
+type VocabSize = 32000 :: Nat
+vocabSize :: Int
+vocabSize = natToNum @VocabSize
+type SeqLen         = 256
+seqLen :: Int
+seqLen = natToNum @SeqLen
  -}
 
- -- model config 110M
+{-
+-- model config 110M
 type ModelDim = 768
 type HiddenDim = 2048
 type NumLayers = 12
 type NumAttentionHeads = 12
+type NumKeyValueHeads = 12
 type HeadDimension  = 64
 type FreqDim = 32
 type VocabSize = 32000 :: Nat
@@ -70,17 +89,9 @@ vocabSize = natToNum @VocabSize
 type SeqLen         = 1024
 seqLen :: Int
 seqLen = natToNum @SeqLen
+-}
 
 {--------------------------------------------------- 
-110M
-modelDim 768
-hiddenDim 2048
-numLayers 12
-numAttentionHeads 12
-headDimension 64
-numKeyValueHeads 12
-vocabSize 32000
-seqLen 1024
 
 42M
 modelDim 512
@@ -91,26 +102,6 @@ headDimension 64
 numKeyValueHeads 8
 vocabSize 32000
 seqLen 1024
-
-15M
-modelDim 288
-hiddenDim 768
-numLayers 6
-numAttentionHeads 6
-headDimension 48
-numKeyValueHeads 6
-vocabSize 32000
-seqLen 256
-
-260K
-modelDim 64
-hiddenDim 172
-numLayers 5
-numAttentionHeads 8
-headDimension 8
-numKeyValueHeads 4
-vocabSize 512
-seqLen 512
 
  ---------------------------------------------------}
 
@@ -144,9 +135,11 @@ data SingleHeadComponent = SingleHeadComponent
   } deriving (Show)
 
 data MultiHeadAttentionComponent = MultiHeadAttentionComponent
-  { heads    :: Vec NumAttentionHeads SingleHeadComponent
-  , mWo      :: CArray2D ModelDim ModelDim -- Output projection matrix
-  , rmsAtt   :: Vec ModelDim Float -- RMSNorm before QKV projection
+  { heads  :: Vec NumAttentionHeads SingleHeadComponent
+  -- | Per-head output projection matrix W_O (shape HeadDim × ModelDim)
+  , mWo :: Vec NumAttentionHeads (CArray2D ModelDim HeadDimension)
+  -- | RMSNorm before QKV projection (size ModelDim)
+  , rmsAtt :: Vec ModelDim Float
   } deriving (Show)
 
 data FeedForwardNetworkComponent = FeedForwardNetworkComponent
@@ -175,7 +168,7 @@ dotProduct :: KnownNat n => Vec n Float -> Vec n Float -> Float
 dotProduct v1 v2 = sum $ zipWith (*) v1 v2
 
 -- Vector multiplication by a Matrix
-matrixVectorMult :: forall n m. ( KnownNat m) => CArray2D n m -> Vec m Float -> Vec n Float
+matrixVectorMult :: forall n m. KnownNat m => CArray2D n m -> Vec m Float -> Vec n Float
 matrixVectorMult (CArray2D mat) vec = map (`dotProduct` vec) mat
 
 -- RMS Norm
@@ -328,21 +321,44 @@ computeAttentionOutput weights values =
 -- Pure multi-head attention computation
 computeMultiHeadAttention
   :: MultiHeadAttentionComponent
-  -> Vec ModelDim Float                 -- input
-  -> Vec NumAttentionHeads (Vec HeadDimension Float)  -- queries
-  -> Vec NumAttentionHeads (Vec SeqLen (Vec HeadDimension Float))  -- keys per head
-  -> Vec NumAttentionHeads (Vec SeqLen (Vec HeadDimension Float))  -- values per head
+  -> Vec ModelDim Float
+  -> Vec NumAttentionHeads (Vec HeadDimension Float)
+  -> Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
+  -> Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
   -> Vec ModelDim Float
 computeMultiHeadAttention mha input queries keysPerHead valuesPerHead =
-  let headOutputs = zipWith3 (\q ks vs ->
-        let scores = computeAttentionScores q ks
-            weights = computeAttentionWeights scores
-        in computeAttentionOutput weights vs
-        ) queries keysPerHead valuesPerHead
-      concatenatedHeads = concat headOutputs
-      outputProjection = matrixVectorMult (mWo mha) concatenatedHeads
-      normalizedInput = rmsNorm input (rmsAtt mha)
-  in zipWith (+) normalizedInput outputProjection
+  let
+    -- Compute the number of query heads per key/value head
+    headsPerGroup :: Int
+    headsPerGroup = natToNum @NumAttentionHeads `div` natToNum @NumKeyValueHeads
+
+    -- Map each query head to its corresponding key/value head
+    getKVIndex :: Index NumAttentionHeads -> Index NumKeyValueHeads
+    getKVIndex qIdx = fromIntegral (fromIntegral qIdx `div` headsPerGroup :: Int)
+
+    -- Compute per-head outputs (HeadDimension each)
+    headOutputs :: Vec NumAttentionHeads (Vec HeadDimension Float)
+    headOutputs = imap
+        (\qIdx q ->
+           let kvIdx = getKVIndex qIdx
+               ks = keysPerHead !! kvIdx
+               vs = valuesPerHead !! kvIdx
+               scores = computeAttentionScores q ks
+               weights = computeAttentionWeights scores
+           in computeAttentionOutput weights vs)
+        queries
+
+    -- Project each head’s output via its own W_O
+    perHeadProjected :: Vec NumAttentionHeads (Vec ModelDim Float)
+    perHeadProjected = zipWith matrixVectorMult (mWo mha) headOutputs
+
+    -- Sum across heads (elementwise sum across ModelDim)
+    summedOutput :: Vec ModelDim Float
+    summedOutput = foldl1 (zipWith (+)) perHeadProjected
+
+    -- Residual connection
+    normalizedInput = rmsNorm input (rmsAtt mha)
+  in zipWith (+) normalizedInput summedOutput
 
 -- Pure feed-forward computation
 computeFeedForward

@@ -10,14 +10,13 @@ import Clash.Prelude
 import qualified GHC.TypeNats
 import Data.Functor (($>))
 import Helpers
-  ( NumAttentionHeads, NumLayers, SeqLen, HeadDimension, ModelDim, VocabSize
+  ( NumAttentionHeads, NumKeyValueHeads, NumLayers, SeqLen, HeadDimension, ModelDim, VocabSize
   , Token, TransformerLayerComponent(..), TransformerDecoderComponent (..)
   , MultiHeadAttentionComponent(..), EmbeddingComponent (..)
   , runSingleHeadQKV, applyRotaryToHead, StepCount (..)
   , computeFeedForward, transformerLogits, argMax, embed
   , drawSample, computeMultiHeadAttention, seqLen, liftA4
   )
-import GHC.IO (unsafePerformIO)
 import GHC.Stack (HasCallStack)
 
 -- ============================================================================
@@ -53,16 +52,16 @@ initialProcessingState :: ProcessingState
 initialProcessingState = ProcessingState Cycle1_ReadCache 0 0 False
 
 -- ============================================================================
--- Intermediate data storage (now pure!)
+-- Intermediate data storage
 -- ============================================================================
 
 data IntermediateData = IntermediateData
   { idInputVec    :: Vec ModelDim Float
-  , idQKV         :: Vec NumAttentionHeads (Vec HeadDimension Float,
-                                            Vec HeadDimension Float,
-                                            Vec HeadDimension Float)
-  , idCachedKeys  :: Vec NumAttentionHeads (Vec SeqLen (Vec HeadDimension Float))
-  , idCachedVals  :: Vec NumAttentionHeads (Vec SeqLen (Vec HeadDimension Float))
+  , idQueries     :: Vec NumAttentionHeads (Vec HeadDimension Float)
+  , idKeys        :: Vec NumKeyValueHeads (Vec HeadDimension Float)
+  , idValues      :: Vec NumKeyValueHeads (Vec HeadDimension Float)
+  , idCachedKeys  :: Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
+  , idCachedVals  :: Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
   , idAttnOutput  :: Vec ModelDim Float
   , idFFNOutput   :: Vec ModelDim Float
   } deriving (Show, Generic, NFDataX)
@@ -70,7 +69,9 @@ data IntermediateData = IntermediateData
 initialIntermediateData :: IntermediateData
 initialIntermediateData = IntermediateData
   { idInputVec   = repeat 0
-  , idQKV        = repeat (repeat 0, repeat 0, repeat 0)
+  , idQueries    = repeat (repeat 0)
+  , idKeys       = repeat (repeat 0)
+  , idValues     = repeat (repeat 0)
   , idCachedKeys = repeat (repeat (repeat 0))
   , idCachedVals = repeat (repeat (repeat 0))
   , idAttnOutput = repeat 0
@@ -81,14 +82,14 @@ initialIntermediateData = IntermediateData
 -- Memory Interface
 -- ============================================================================
 
-type CacheDepth = NumLayers GHC.TypeNats.* NumAttentionHeads GHC.TypeNats.* SeqLen GHC.TypeNats.* HeadDimension
+type CacheDepth = NumLayers GHC.TypeNats.* NumKeyValueHeads GHC.TypeNats.* SeqLen GHC.TypeNats.* HeadDimension
 type CacheAddr  = Index CacheDepth
 
-cacheAddr :: Index NumLayers -> Index NumAttentionHeads -> Index SeqLen -> Index HeadDimension -> CacheAddr
+cacheAddr :: Index NumLayers -> Index NumKeyValueHeads -> Index SeqLen -> Index HeadDimension -> CacheAddr
 cacheAddr l h s d =
   let headSize  = natToNum @HeadDimension
       seqSize   = natToNum @SeqLen * headSize
-      layerSize = natToNum @NumAttentionHeads * seqSize
+      layerSize = natToNum @NumKeyValueHeads * seqSize
       addr = fromIntegral d + fromIntegral s * headSize + fromIntegral h * seqSize + fromIntegral l * layerSize
   in addr
 
@@ -112,7 +113,7 @@ readCachedSequence
    . HiddenClockResetEnable dom
   => AttentionCache dom
   -> Index NumLayers
-  -> Index NumAttentionHeads
+  -> Index NumKeyValueHeads
   -> Signal dom Int
   -> Signal dom (Vec SeqLen (Vec HeadDimension Float))
 readCachedSequence cache layerIdx headIdx seqPosSig =
@@ -133,7 +134,7 @@ writeToCacheSequence
    . HiddenClockResetEnable dom
   => AttentionCache dom
   -> Index NumLayers
-  -> Index NumAttentionHeads
+  -> Index NumKeyValueHeads
   -> Signal dom Int
   -> Signal dom (Vec HeadDimension Float, Vec HeadDimension Float)
   -> Signal dom ()
@@ -188,44 +189,42 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
                    , psTokenReady = True }
         else state { psStage = Cycle1_ReadCache, psLayer = psLayer state + 1 }
 
-  -- cache reads for all heads
-  cachedKeysPerHead :: Vec NumAttentionHeads (Signal dom (Vec SeqLen (Vec HeadDimension Float)))
+  -- Cache reads for all heads
+  cachedKeysPerHead :: Vec NumKeyValueHeads (Signal dom (Vec SeqLen (Vec HeadDimension Float)))
   cachedKeysPerHead =
     map (\hIdx -> readCachedSequence cache layerIdx hIdx (psSeqPos <$> stateSig)) indicesI
 
-  cachedValsPerHead :: Vec NumAttentionHeads (Signal dom (Vec SeqLen (Vec HeadDimension Float)))
+  cachedValsPerHead :: Vec NumKeyValueHeads (Signal dom (Vec SeqLen (Vec HeadDimension Float)))
   cachedValsPerHead =
     map (\hIdx -> readCachedSequence cache layerIdx hIdx (psSeqPos <$> stateSig)) indicesI
 
-  -- bundle all heads into one signal of Vec-of-Vecs
-  cachedKeysSig :: Signal dom (Vec NumAttentionHeads (Vec SeqLen (Vec HeadDimension Float)))
+  -- Bundle all heads into one signal of Vec-of-Vecs
+  cachedKeysSig :: Signal dom (Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float)))
   cachedKeysSig = sequenceA cachedKeysPerHead
 
-  cachedValsSig :: Signal dom (Vec NumAttentionHeads (Vec SeqLen (Vec HeadDimension Float)))
+  cachedValsSig :: Signal dom (Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float)))
   cachedValsSig = sequenceA cachedValsPerHead
 
-  -- We’ll also write to cache on Cycle4
+  -- Write to cache on Cycle4
   writeOpsSig :: Signal dom ()
   writeOpsSig =
-    let qkvSig = idQKV <$> dataSig
-    in bundle (traverse (imap (\hIdx qkvTripleSig ->
-        let (_, k, v) = qkvTripleSig
-        in writeToCacheSequence cache layerIdx hIdx (psSeqPos <$> stateSig)
-               (pure (k, v))
-        )) qkvSig)
+    let kvSig = liftA2 (\ks vs -> zip ks vs) (idKeys <$> dataSig) (idValues <$> dataSig)
+    in bundle (traverse (imap (\hIdx kv ->
+        writeToCacheSequence cache layerIdx hIdx (psSeqPos <$> stateSig) (pure kv)
+        )) kvSig)
        $> ()
 
   -- Combine everything in processCycle
   baseNextDataSig = liftA4 processCycle stateSig dataSig cachedKeysSig cachedValsSig
 
-  -- tie the writeOpsSig in so it’s not dropped
+  -- Tie the writeOpsSig in so it’s not dropped
   nextDataSig = liftA2 const baseNextDataSig writeOpsSig
 
   processCycle
     :: ProcessingState
     -> IntermediateData
-    -> Vec NumAttentionHeads (Vec SeqLen (Vec HeadDimension Float))
-    -> Vec NumAttentionHeads (Vec SeqLen (Vec HeadDimension Float))
+    -> Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
+    -> Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
     -> IntermediateData
   processCycle state idata keysNow valsNow =
     case psStage state of
@@ -234,18 +233,26 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
               , idCachedVals = valsNow }
       Cycle2_ComputeQKV ->
         let input = idInputVec idata
-            qkvResults = map (\hIdx ->
+            -- Compute queries for all NumAttentionHeads
+            queries = imap (\hIdx _ ->
               let headComp = heads mha !! hIdx
-                  (q, k, v) = runSingleHeadQKV headComp input
-                  (q_rot, k_rot) =
-                    applyRotaryToHead headComp (StepCount $ fromIntegral $ psSeqPos state) (q, k)
-              in (q_rot, k_rot, v)
+                  (q, _, _) = runSingleHeadQKV headComp input
+                  (q_rot, _) = applyRotaryToHead headComp (StepCount $ fromIntegral $ psSeqPos state) (q, repeat 0)
+              in q_rot
               ) indicesI
-        in idata { idQKV = qkvResults }
+            -- Compute keys and values for NumKeyValueHeads
+            headsPerGroup = natToNum @NumAttentionHeads `div` natToNum @NumKeyValueHeads
+            keysAndValues = imap (\hIdx _ ->
+              let qIdx = hIdx * headsPerGroup
+                  headComp = heads mha !! qIdx
+                  (_, k, v) = runSingleHeadQKV headComp input
+                  (_, k_rot) = applyRotaryToHead headComp (StepCount $ fromIntegral $ psSeqPos state) (repeat 0, k)
+              in (k_rot, v)
+              ) indicesI
+            (keys, values) = unzip keysAndValues
+        in idata { idQueries = queries, idKeys = keys, idValues = values }
       Cycle3_ComputeAttn ->
-        let qkv = idQKV idata
-            queries = map (\(q,_,_) -> q) qkv
-            attnOut = computeMultiHeadAttention mha (idInputVec idata) queries keysNow valsNow
+        let attnOut = computeMultiHeadAttention mha (idInputVec idata) (idQueries idata) keysNow valsNow
         in idata { idAttnOutput = attnOut }
       Cycle4_WriteCache ->
         idata  -- writes happen via writeOpsSig side effect
@@ -265,9 +272,8 @@ multiCycleTransformer
   -> Signal dom Token
   -> Signal dom Float
   -> Signal dom Int
-  -> Signal dom (Vec SeqLen Token)
   -> Signal dom Token
-multiCycleTransformer decoder caches tokenSig temperatureSig seedSig promptTokensSig =
+multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
   outputTokenSig
  where
   embedding = modelEmbedding decoder
@@ -310,7 +316,6 @@ topEntity
   -> Signal dom Token
   -> Signal dom Float
   -> Signal dom Int
-  -> Signal dom (Vec SeqLen Token)
   -> Signal dom Token
 topEntity decoder _ = multiCycleTransformer decoder caches
  where
