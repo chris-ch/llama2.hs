@@ -59,7 +59,7 @@ newtype CArray2D (n :: Nat) (m :: Nat) = CArray2D (Vec n (Vec m Float)) deriving
 getRow :: forall n m. (KnownNat n) => StepCount -> CArray2D n m -> Vec m Float
 getRow (StepCount i) (CArray2D arr) = arr !! (fromIntegral i :: Index n)
 
-newtype Token = Token (Unsigned 32) deriving (Show, Eq, Ord, Num)
+newtype Token = Token (Unsigned 32) deriving (Show, Eq, Ord, Num, NFDataX)
 
 newtype StepCount = StepCount (Unsigned 32) deriving (Show, Eq, Ord, Num)
 

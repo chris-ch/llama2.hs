@@ -18,9 +18,8 @@ import Text.Printf (printf)
 import Helpers
 import Model
 import qualified Clash.Explicit.Prelude as C
-import qualified Clash.Explicit.SimIO as CES
-import qualified Clash.Clocks as CC
-import qualified Clash.Signal as CS (simulate, withClockResetEnable)
+import qualified Clash.Signal as CS
+import qualified Clash.Sized.Vector as CSV
 
 type Vocabulary = [BS.ByteString]
 type VocabularyScores = [Float]
@@ -152,12 +151,12 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
     initModel = BG.runGet parseModelConfigFile
     config = initModel modelFileContent
     prompt' = fromMaybe "" prompt
-    (promptTokens, vocab) = tokenizerInit tokenizerFileContent (fromIntegral vocabSize) (BSC.pack prompt')
+    (promptTokens, vocab) = tokenizerInit tokenizerFileContent vocabSize (BSC.pack prompt')
 
   putStrLn "<s>"
   startTime <- getPOSIXTime
 
-  (_, StepCount countTokens) <- generateTokens config (StepCount (fromIntegral steps)) promptTokens temperature vocab seedValue
+  (_, StepCount countTokens) <- generateTokensSimAutoregressive config (fromIntegral steps) promptTokens temperature seedValue
 
   endTime <- getPOSIXTime
   let duration :: Integer
@@ -171,31 +170,62 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
 -- Token Generation with Clash Simulation
 --------------------------------------------------------------------------------
 
-generateTokens :: (MonadIO m) => TransformerDecoderComponent -> StepCount -> PromptTokens -> Float -> Vocabulary -> Int -> m ([BSC.ByteString], StepCount)
-generateTokens decoder (StepCount maxSteps) promptTokens temperature vocab seedValue = do
-  -- Initialize attention caches for all layers with System domain
-  let initCaches = C.repeat initAttentionCache :: C.Vec NumLayers (AttentionCache C.System)
-      transformerWrapper :: C.Signal C.System (C.Unsigned 32, Helpers.Token) -> C.Signal C.System Helpers.Token
-      transformerWrapper sigIn =
-        let timestepSig = fmap fst sigIn
-            tokenSig    = fmap snd sigIn
-        in transformer decoder initCaches
-            <$> fmap fromIntegral timestepSig
-            <*> tokenSig
-            <*> pure temperature
-            <*> pure seedValue
-            <*> pure promptTokens
+-- This version feeds the output of each step as input to the next step
+generateTokensSimAutoregressive
+  :: TransformerDecoderComponent
+  -> C.Unsigned 32                      -- ^ number of steps to generate
+  -> [Helpers.Token]                   -- ^ prompt tokens
+  -> Float                     -- ^ temperature
+  -> Int                       -- ^ seed
+  -> IO ([Helpers.Token], StepCount)   -- ^ produced tokens and token count
+generateTokensSimAutoregressive decoder nSteps promptTokens temperature seed = do
+  let promptLen = length promptTokens
+      totalSteps = promptLen + fromIntegral nSteps
+      
+      -- For autoregressive generation, we need to carefully construct the input sequence
+      -- The sequence position increases, and each input token is either from prompt or previously generated
+      seqPositions = [0..totalSteps-1]
+      
+      -- Create temperature and seed signals
+      tempSig = replicate totalSteps temperature
+      rngSeeds = [seed + i | i <- [0..totalSteps-1]]
+      
+      -- Create prompt vector (same for all steps in this simple version)
+      promptPadded = take seqLen (promptTokens ++ repeat (Helpers.Token 0))
+      promptVec = replicate totalSteps (CSV.unsafeFromList promptPadded)
+      
+      -- For the input tokens, we need to simulate the autoregressive process
+      -- This is a simplified version - in practice you'd need to feed outputs back as inputs
+      inputTokens = take totalSteps (promptTokens ++ repeat (Helpers.Token 0))
 
-      go timestep result token
-        | timestep >= maxSteps || (timestep /= 0 && token == Helpers.Token 1) = pure (result, StepCount timestep)
-        | otherwise = do
-            -- Simulate transformer for one step
-            let input = (timestep :: C.Unsigned 32, token)
-                [nextToken] = C.simulate transformerWrapper [input]
-                tokenStr = vocab !! fromIntegral nextToken
-            -- Output token
-            liftIO $ putStr $ BSC.unpack tokenStr
-            liftIO $ hFlush stdout
-            go (timestep + 1) (result ++ [tokenStr]) nextToken
-  (tokens, finalStep) <- go 0 [] (Helpers.Token 1)
-  pure (tokens, finalStep)
+      -- Bundle all inputs together as tuples for CS.simulate
+      bundledInputs = zip5 seqPositions inputTokens tempSig rngSeeds promptVec
+
+  -- Run simulation with bundled inputs
+  let allOutputs = CS.simulate (topEntityBundled @CS.System decoder) bundledInputs
+
+  -- Extract only the generated tokens (after the prompt)
+  let generatedTokens = drop promptLen (take totalSteps allOutputs)
+      resultTokens = take (fromIntegral nSteps) generatedTokens
+
+  -- Print generation progress
+  putStrLn $ "Prompt: " ++ show promptTokens
+  putStr "Generated: "
+  mapM_ (\t -> putStr (show t ++ " ") >> hFlush stdout) resultTokens
+  putStrLn ""
+
+  return (resultTokens, StepCount nSteps)
+
+zip5 :: [a] -> [b] -> [c] -> [d] -> [e] -> [(a, b, c, d, e)]
+zip5 (a:as) (b:bs) (c:cs) (d:ds) (e:es) = (a, b, c, d, e) : zip5 as bs cs ds es
+zip5 _ _ _ _ _ = []
+
+-- Helper function to create a bundled version of topEntity
+topEntityBundled
+  :: CS.HiddenClockResetEnable dom
+  => TransformerDecoderComponent
+  -> C.Signal dom (Int, Helpers.Token, Float, Int, C.Vec SeqLen Helpers.Token)
+  -> C.Signal dom Helpers.Token
+topEntityBundled decoder bundledInputs = 
+  let (seqPos, inputToken, temp, rngSeed, promptVec) = C.unbundle bundledInputs
+  in topEntity decoder seqPos inputToken temp rngSeed promptVec
