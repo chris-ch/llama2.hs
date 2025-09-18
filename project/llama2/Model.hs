@@ -1,4 +1,4 @@
-module Model (topEntity) where
+module Model (topEntity, multiCycleTransformer, initAttentionCache, ProcessingState(..)) where
 
 import Clash.Prelude
 import qualified GHC.TypeNats
@@ -104,8 +104,7 @@ initAttentionCache = AttentionCache
 
 readCachedSequence
   :: forall dom
-   . HiddenClockResetEnable dom
-  => AttentionCache dom
+   . AttentionCache dom
   -> Index NumLayers
   -> Index NumKeyValueHeads
   -> Signal dom Int
@@ -125,8 +124,7 @@ readCachedSequence cache layerIdx headIdx seqPosSig =
 
 writeToCacheSequence
   :: forall dom
-   . HiddenClockResetEnable dom
-  => AttentionCache dom
+   . AttentionCache dom
   -> Index NumLayers
   -> Index NumKeyValueHeads
   -> Signal dom Int
@@ -155,8 +153,7 @@ writeToCacheSequence cache layerIdx headIdx seqPosSig kvSig =
 
 multiCycleTransformerLayer
   :: forall dom
-   . HiddenClockResetEnable dom
-  => TransformerLayerComponent
+   . TransformerLayerComponent
   -> AttentionCache dom
   -> Index NumLayers
   -> Signal dom ProcessingState
@@ -266,9 +263,9 @@ multiCycleTransformer
   -> Signal dom Token
   -> Signal dom Float
   -> Signal dom Int
-  -> Signal dom Token
+  -> (Signal dom Token, Signal dom Bool)  -- NEW: token + ready flag
 multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
-  outputTokenSig
+  (outputTokenSig, readyFlagSig)
  where
   embedding = modelEmbedding decoder
   layers    = modelLayers decoder
@@ -298,6 +295,8 @@ multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
   sampledTokenSig = pickToken <$> logitsSig <*> temperatureSig <*> seedSig
   outputTokenSig  = sampledTokenSig
 
+  readyFlagSig = psTokenReady <$> finalStateSig
+
 -- ============================================================================
 -- Top Entity
 -- ============================================================================
@@ -310,7 +309,5 @@ topEntity
   -> Signal dom Token
   -> Signal dom Float
   -> Signal dom Int
-  -> Signal dom Token
-topEntity decoder _ = multiCycleTransformer decoder caches
- where
-  caches = repeat initAttentionCache
+  -> (Signal dom Token, Signal dom Bool)   -- token + ready
+topEntity decoder _ = multiCycleTransformer decoder (repeat initAttentionCache)

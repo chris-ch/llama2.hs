@@ -48,7 +48,8 @@ import Helpers
       ModelDim,
       vocabSize,
       FreqDim )
-import Model ( topEntity )
+import Model ( multiCycleTransformer, initAttentionCache, ProcessingState (..), topEntity )
+import Data.List (findIndex)
 
 type Vocabulary = [BSL.ByteString]
 type VocabularyScores = [Float]
@@ -206,7 +207,6 @@ readVec2D = do
         vecs = map CV.unsafeFromList chunks
     return $ CV.unsafeFromList vecs
   where
-    chunksOf :: Int -> [a] -> [[a]]
     chunksOf _ [] = []
     chunksOf k xs = take k xs : chunksOf k (drop k xs)
 
@@ -224,7 +224,6 @@ readVec3D = do
         middleVecs = map CV.unsafeFromList middleChunks
     return $ CV.unsafeFromList middleVecs
   where
-    chunksOf :: Int -> [a] -> [[a]]
     chunksOf _ [] = []
     chunksOf k xs = take k xs : chunksOf k (drop k xs)
 
@@ -245,7 +244,6 @@ readVec4D = do
         externVecs = map CV.unsafeFromList externChunks
     return $ CV.unsafeFromList externVecs
   where
-    chunksOf :: Int -> [a] -> [[a]]
     chunksOf _ [] = []
     chunksOf k xs = take k xs : chunksOf k (drop k xs)
 
@@ -258,7 +256,7 @@ parseModelConfigFile = do
   wq'                  <- readVec4D @NumLayers @NumQueryHeads @HeadDimension @ModelDim
   wk'                  <- readVec4D @NumLayers @NumKeyValueHeads @HeadDimension @ModelDim
   wv'                  <- readVec4D @NumLayers @NumKeyValueHeads @HeadDimension @ModelDim
-  wo'                  <- readVec4D @NumLayers @NumQueryHeads @ModelDim @HeadDimension 
+  wo'                  <- readVec4D @NumLayers @NumQueryHeads @ModelDim @HeadDimension
   rmsFfnWeight'        <- readVec2D @NumLayers @ModelDim
   w1'                  <- readVec3D @NumLayers @HiddenDim @ModelDim
   w2'                  <- readVec3D @NumLayers @ModelDim @HiddenDim
@@ -334,46 +332,52 @@ generateTokensSimAutoregressive
   -> Int                                -- ^ seed
   -> IO ([Token], StepCount)   -- ^ produced tokens and token count
 generateTokensSimAutoregressive decoder vocab nSteps promptTokens temperature seed = do
-  let promptLen  = length promptTokens
-      totalSteps = promptLen + fromIntegral nSteps
+  let promptLen = length promptTokens
+  let totalSteps = promptLen + fromIntegral nSteps
 
   putStrLn $ "Prompt: " ++ show promptTokens
   putStr "Generated: "
   hFlush stdout
 
-  -- We keep an accumulating list of all tokens seen so far
-  let go :: Int -> [Token] -> IO [Token]
-      go step acc
-        | step >= totalSteps = return (drop promptLen acc)  -- return only generated part
+  let go step acc
+        | step >= totalSteps = return (drop promptLen acc)
         | otherwise = do
             let seqPos    = step
-                -- last token produced or prompt token
                 inputToken | step < promptLen = promptTokens !! step
                            | otherwise        = last acc
                 rngSeed    = seed + step
-                -- Build promptVec padded/truncated to seqLen
-                bundledIn   = (seqPos, inputToken, temperature, rngSeed)
+                bundledIn  = (seqPos, inputToken, temperature, rngSeed)
 
-                -- run topEntity for exactly one clock tick
-                outToken    = head $ CS.simulate (topEntityBundled @CS.System decoder) [bundledIn]
+            -- run circuit repeatedly until tokenReady == True
+            let
+              outputs = CS.simulate (bundledOutputs decoder) (repeat bundledIn)
+              (outToken, readyFlags) = unzip outputs
+              readyIdx = fromMaybe 0 $ findIndex id readyFlags
+              tokenProduced = outToken !! readyIdx
 
-            -- print as we go
             when (step >= promptLen) $ do
-              putStr (show outToken ++ " ")
+              putStr (show tokenProduced ++ " ")
               hFlush stdout
 
-            go (step + 1) (acc ++ [outToken])
+            go (step+1) (acc ++ [tokenProduced])
 
   generated <- go 0 promptTokens
   putStrLn ""
   return (take (fromIntegral nSteps) generated, StepCount nSteps)
+
+bundledOutputs :: TransformerDecoderComponent -> CS.Signal CS.System (Int, Token, Float, Int) -> CS.Signal C.System (C.Unsigned 32, Bool)
+bundledOutputs decoder = CS.bundle . CS.exposeClockResetEnable
+    (topEntityBundled @CS.System decoder)
+    CS.systemClockGen
+    CS.resetGen
+    CS.enableGen
 
 -- Helper function to create a bundled version of topEntity
 topEntityBundled
   :: CS.HiddenClockResetEnable dom
   => TransformerDecoderComponent
   -> C.Signal dom (Int, Token, Float, Int)
-  -> C.Signal dom Token
-topEntityBundled decoder bundledInputs = topEntity decoder seqPos inputToken temp rngSeed where
-  (seqPos, inputToken, temp, rngSeed) = C.unbundle bundledInputs
-
+  -> (C.Signal dom Token, C.Signal dom Bool)
+topEntityBundled decoder bundledInputs = topEntity decoder seqPos inputToken temp rngSeed
+  where
+    (seqPos, inputToken, temp, rngSeed) = C.unbundle bundledInputs
