@@ -18,6 +18,8 @@ module Helpers (
   , StepCount(..)
   , CArray2D(..)
   , Token
+  , Temperature
+  , Seed
   , liftA5
   , runSingleHeadQKV
   , applyRotaryToHead
@@ -114,7 +116,8 @@ getRow :: forall n m. (KnownNat n) => StepCount -> CArray2D n m -> Vec m Float
 getRow (StepCount i) (CArray2D arr) = arr !! (fromIntegral i :: Index n)
 
 type Token = Unsigned 32
-
+type Temperature = Float
+type Seed = Unsigned 32
 newtype StepCount = StepCount (Unsigned 32) deriving (Show, Eq, Ord)
 
 -- Data definitions for LLM architecture

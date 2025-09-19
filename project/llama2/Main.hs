@@ -46,7 +46,7 @@ import Helpers
       HiddenDim,
       ModelDim,
       vocabSize,
-      FreqDim )
+      FreqDim, Temperature, Seed )
 import Model ( topEntity )
 
 type Vocabulary = [BSL.ByteString]
@@ -69,7 +69,7 @@ runModel :: BSL.ByteString -> BSL.ByteString -> Float -> Int -> Maybe String -> 
 runModel modelFileContent tokenizerFileContent temperature steps prompt seed = do
   currentTime <- getPOSIXTime
   let
-    seedValue = fromMaybe (round currentTime) seed
+    seedValue = fromIntegral $ fromMaybe (round currentTime) seed
     initModel :: BSL.ByteString -> TransformerDecoderComponent
     initModel = BG.runGet parseModelConfigFile
     config = initModel modelFileContent
@@ -342,8 +342,8 @@ generateTokensSimAutoregressive
   -> Vocabulary
   -> C.Unsigned 32
   -> [Token]
-  -> Float
-  -> Int
+  -> Temperature
+  -> Seed
   -> IO ([Token], StepCount)
 generateTokensSimAutoregressive decoder vocab nSteps promptTokens temperature seed = do
   let promptLen   = length promptTokens
@@ -408,7 +408,7 @@ generateTokensSimAutoregressive decoder vocab nSteps promptTokens temperature se
   let generated = take (fromIntegral nSteps) (drop promptLen sampledLimited)
   pure (generated, StepCount nSteps)
 
-bundledOutputs :: TransformerDecoderComponent -> CS.Signal CS.System (Token, Float, Int) -> CS.Signal C.System (C.Unsigned 32, Bool)
+bundledOutputs :: TransformerDecoderComponent -> CS.Signal CS.System (Token, Temperature, Seed) -> CS.Signal C.System (Token, Bool)
 bundledOutputs decoder = CS.bundle . CS.exposeClockResetEnable
     (topEntityBundled @CS.System decoder)
     CS.systemClockGen
@@ -419,7 +419,7 @@ bundledOutputs decoder = CS.bundle . CS.exposeClockResetEnable
 topEntityBundled
   :: CS.HiddenClockResetEnable dom
   => TransformerDecoderComponent
-  -> C.Signal dom (Token, Float, Int)
+  -> C.Signal dom (Token, Temperature, Seed)
   -> (C.Signal dom Token, C.Signal dom Bool)
 topEntityBundled decoder bundledInputs = topEntity decoder inputToken temp rngSeed
   where

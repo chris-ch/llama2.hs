@@ -9,7 +9,7 @@ import Helpers
   , MultiHeadAttentionComponent(..), EmbeddingComponent (..)
   , runSingleHeadQKV, applyRotaryToHead, StepCount (..)
   , computeFeedForward, transformerLogits, argMax, embed
-  , sampleFromProbs, liftA4, rmsNorm, softmax, matrixVectorMult, xorshift32
+  , sampleFromProbs, liftA4, rmsNorm, softmax, matrixVectorMult, xorshift32, Temperature, Seed
   )
 import GHC.Stack (HasCallStack)
 
@@ -505,8 +505,8 @@ multiCycleTransformer
   => TransformerDecoderComponent
   -> Vec NumLayers (AttentionCache dom)
   -> Signal dom Token
-  -> Signal dom Float -- temperature
-  -> Signal dom Int   -- seed
+  -> Signal dom Temperature
+  -> Signal dom Seed
   -> (Signal dom Token, Signal dom Bool)
 multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
   (outputTokenSig, readyPulseSig)
@@ -595,7 +595,7 @@ multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
   firstPulseSig = regEn True readyPulseSig (pure False)
 
   mixedSeedSig :: Signal dom (Unsigned 32)
-  mixedSeedSig = fromIntegral . (`xor` 0x9E3779B9) <$> seedSig
+  mixedSeedSig = (`xor` 0x9E3779B9) <$> seedSig
 
   prngStateSig :: Signal dom (Unsigned 32)
   prngStateSig =
@@ -631,7 +631,7 @@ topEntity
    . HiddenClockResetEnable dom
   => TransformerDecoderComponent
   -> Signal dom Token
-  -> Signal dom Float -- temperature
-  -> Signal dom Int   -- seed
+  -> Signal dom Temperature
+  -> Signal dom Seed
   -> (Signal dom Token, Signal dom Bool)
 topEntity decoder = multiCycleTransformer decoder (repeat initAttentionCache)
