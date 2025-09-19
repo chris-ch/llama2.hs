@@ -369,41 +369,62 @@ parseModelConfigFile = do
 generateTokensSimAutoregressive
   :: TransformerDecoderComponent
   -> Vocabulary
-  -> C.Unsigned 32                      -- ^ number of steps to generate
-  -> [Token]                    -- ^ prompt tokens
-  -> Float                              -- ^ temperature
-  -> Int                                -- ^ seed
-  -> IO ([Token], StepCount)   -- ^ produced tokens and token count
-generateTokensSimAutoregressive decoder vocab nSteps promptTokens temperature seed = do
-  let promptLen = length promptTokens
-  let totalSteps = promptLen + fromIntegral nSteps
-
+  -> C.Unsigned 32
+  -> [Token]
+  -> Float
+  -> Int
+  -> IO ([Token], StepCount)
+generateTokensSimAutoregressive decoder _vocab nSteps promptTokens temperature seed = do
   putStrLn $ "✅ Prompt: " ++ show promptTokens
   putStr "Generated: "
   hFlush stdout
 
-  let
-    go step acc
-      | step >= totalSteps = return (drop promptLen acc)
-      | otherwise = do
-          let seqPos = step
-              inputToken | step < promptLen = promptTokens !! step
-                        | otherwise = last acc
-              bundledIn = (seqPos, inputToken, temperature, seed)
-          putStrLn $ "Step " ++ show step ++ ": seqPos=" ++ show seqPos ++ ", inputToken=" ++ show inputToken ++ ", rngSeed=" ++ show seed
-          let outputs = CS.simulate (bundledOutputs decoder) (repeat bundledIn)
-              (outToken, readyFlags) = unzip outputs
-              readyIdx = fromMaybe 0 $ findIndex id readyFlags
-              tokenProduced = outToken !! readyIdx
-          putStrLn $ "Output token: " ++ show tokenProduced ++ ", readyIdx: " ++ show readyIdx
-          when (step >= promptLen) $ do
-            putStr (show tokenProduced ++ " ")
-            hFlush stdout
-          go (step+1) (acc ++ [tokenProduced])
+  let promptLen = length promptTokens
+  
+      -- Infinite streams for temp/seed/seqPos (seqPos is ignored by topEntity)
+      temps   = repeat temperature
+      seeds   = repeat seed
+      seqPosS = [0..] :: [Int]
 
-  generated <- go 0 promptTokens
+      -- Outputs of the circuit over time (one element per hardware cycle)
+      outputs :: [(Token, Bool)]
+      outputs = CS.simulate (bundledOutputs decoder) inputs
+
+      outTokens :: [Token]
+      readyFlags :: [Bool]
+      (outTokens, readyFlags) = unzip outputs
+
+      -- Co-recursive token driver:
+      -- cur is the token visible to the circuit this cycle
+      -- ps is the remaining prompt tokens to consume at each ready pulse
+      tokenStream :: [Token]
+      tokenStream = drive (head promptTokens) (tail promptTokens) readyFlags outTokens
+        where
+          drive :: Token -> [Token] -> [Bool] -> [Token] -> [Token]
+          drive cur ps (r:rs) (o:os) =
+            cur : (if r then (case ps of
+                     (p:ps') -> drive p  ps'  rs os        -- still forcing the prompt
+                     []      -> drive o  []    rs os) else drive cur ps rs os)        -- switch to model output
+          drive cur _ [] _ = repeat cur  -- shouldn't happen; just be total
+          drive cur _ _ [] = repeat cur
+
+      -- Bundle inputs once, the circuit will pick up 'tokenStream' as needed
+      inputs :: [(Int, Token, Float, Int)]
+      inputs = DL.zip4 seqPosS tokenStream temps seeds
+
+      -- Collect tokens at ready pulses; drop promptLen of them, then take nSteps
+      produced :: [Token]
+      produced =
+        [ t
+        | (t, r) <- outputs
+        , r
+        ]
+      generated = take (fromIntegral nSteps) (drop promptLen produced)
+
+  -- Print as we go (optional)
+  mapM_ (\tok -> putStr (show tok ++ " ") >> hFlush stdout) generated
   putStrLn ""
-  return (take (fromIntegral nSteps) generated, StepCount nSteps)
+  pure (generated, StepCount nSteps)
 
 bundledOutputs :: TransformerDecoderComponent -> CS.Signal CS.System (Int, Token, Float, Int) -> CS.Signal C.System (C.Unsigned 32, Bool)
 bundledOutputs decoder = CS.bundle . CS.exposeClockResetEnable
