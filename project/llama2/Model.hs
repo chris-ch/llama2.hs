@@ -1,3 +1,5 @@
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+{-# HLINT ignore "Use void" #-}
 module Model (topEntity, multiCycleTransformer, initAttentionCache, ProcessingState(..)) where
 
 import Clash.Prelude
@@ -199,7 +201,7 @@ writeToCacheSequence cache l h seqPosSig kvSig enSig =
   dCnt :: Signal dom (Index HeadDimension)
   dCnt = register 0 nextD
   nextD = mux enSig
-              (liftA (\d -> if d == maxBound then 0 else succ d) dCnt)
+              (P.fmap (\d -> if d == maxBound then 0 else succ d) dCnt)
               dCnt
 
   -- clamp sequence position to [0 .. SeqLen-1]
@@ -232,7 +234,7 @@ writeToCacheSequence cache l h seqPosSig kvSig enSig =
   _vQ = valueRam vAddrSig vWriteSig
 
   -- force usage to avoid being optimized away
-  sinkSig = (() <$ (_kQ + _vQ))
+  sinkSig = () <$ (_kQ + _vQ)
 
 liftA5 :: Applicative g => (a -> b -> c -> d -> e -> f) -> g a -> g b -> g c -> g d -> g e -> g f
 liftA5 f fa fb fc fd fe = f <$> fa <*> fb <*> fc <*> fd <*> fe
