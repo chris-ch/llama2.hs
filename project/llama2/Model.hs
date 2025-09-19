@@ -10,7 +10,7 @@ import Helpers
   , MultiHeadAttentionComponent(..), EmbeddingComponent (..)
   , runSingleHeadQKV, applyRotaryToHead, StepCount (..)
   , computeFeedForward, transformerLogits, argMax, embed
-  , drawSample, computeMultiHeadAttention, seqLen, liftA4
+  , drawSample, computeMultiHeadAttention, seqLen, liftA4, liftA5
   )
 import GHC.Stack (HasCallStack)
 
@@ -44,7 +44,29 @@ data ProcessingState = ProcessingState
   } deriving (Show, Generic, NFDataX)
 
 initialProcessingState :: ProcessingState
-initialProcessingState = ProcessingState { psStage = Cycle1_ReadCache, psLayer = 0, psSeqPos = 0, psTokenReady = False }
+initialProcessingState = ProcessingState
+  { psStage = Cycle1_ReadCache
+  , psLayer = 0
+  , psSeqPos = 0
+  , psTokenReady = False
+  }
+
+-- Single state transition function (one step)
+nextState :: ProcessingState -> ProcessingState
+nextState st = case psStage st of
+  Cycle1_ReadCache   -> st { psStage = Cycle2_ComputeQKV }
+  Cycle2_ComputeQKV  -> st { psStage = Cycle3_ComputeAttn }
+  Cycle3_ComputeAttn -> st { psStage = Cycle4_WriteCache }
+  Cycle4_WriteCache  -> st { psStage = Cycle5_ComputeFFN }
+  Cycle5_ComputeFFN ->
+    if psLayer st == maxBound
+      then st { psStage = Cycle1_ReadCache
+              , psLayer = 0
+              , psSeqPos = succ (psSeqPos st)  -- wraps as Index
+              , psTokenReady = True }
+      else st { psStage = Cycle1_ReadCache
+              , psLayer = succ (psLayer st)
+              , psTokenReady = False }
 
 -- ============================================================================
 -- Intermediate data storage
@@ -112,9 +134,9 @@ readCachedSequenceWith
   => (Signal dom CacheAddr -> Signal dom (Maybe (CacheAddr, Float)) -> Signal dom Float) -- ^ BRAM port (keyCache or valueCache)
   -> Index NumLayers
   -> Index NumKeyValueHeads
-  -> Signal dom (Index SeqLen)                             -- ^ pos (causal horizon)
-  -> Signal dom (Vec SeqLen (Vec HeadDimension Float))     -- ^ buffer filled over time
-readCachedSequenceWith ram l h posSig = bufSig
+  -> Signal dom (Index SeqLen)                               -- ^ pos (causal horizon) - not used to mask here
+  -> Signal dom (Vec SeqLen (Vec HeadDimension Float))       -- ^ buffer filled over time
+readCachedSequenceWith ram l h _posSig = bufSig
  where
   -- 2D counters over (t,d)
   nextTD :: (Index SeqLen, Index HeadDimension) -> (Index SeqLen, Index HeadDimension)
@@ -140,7 +162,6 @@ readCachedSequenceWith ram l h posSig = bufSig
   -- due to BRAM latency, capture previous indices
   tPrevSig = register 0 tSig
   dPrevSig = register 0 dSig
-  posPrevSig = register 0 posSig
 
   -- local buffer register, updated 1 element/cycle
   bufInit :: Vec SeqLen (Vec HeadDimension Float)
@@ -149,15 +170,11 @@ readCachedSequenceWith ram l h posSig = bufSig
   bufNext
     :: Signal dom (Vec SeqLen (Vec HeadDimension Float))
     -> Signal dom (Vec SeqLen (Vec HeadDimension Float))
-  bufNext bufS =
-    liftA5
-      (\buf tPrev dPrev _ q ->
-        -- Do not mask here. Keep the cache values as-is; apply causal mask at logits.
-        let
-          oldRow  = buf !! tPrev
-          newRow  = replace dPrev q oldRow
-         in replace tPrev newRow buf)
-      bufS tPrevSig dPrevSig posPrevSig qSig
+  bufNext bufS = liftA4 (\buf tPrev dPrev q ->
+        let oldRow  = buf !! tPrev
+            newRow  = replace dPrev q oldRow
+        in replace tPrev newRow buf)
+      bufS tPrevSig dPrevSig qSig
 
   bufSig = register bufInit (bufNext bufSig)
 
@@ -177,30 +194,37 @@ readCachedVals
 readCachedVals cache = readCachedSequenceWith (valueCache cache)
 
 -- Sequential writer: one element of K and one element of V per cycle.
--- Gated by explicit 'enSig' so you can assert it only in Cycle4_WriteCache
--- of the active layer. Writes to 'seqPosSig' row, sweeping 'd' across time.
+-- Enable is asserted for the whole stage; done pulses on last element.
 writeToCacheSequence
   :: forall dom
    . HiddenClockResetEnable dom
   => AttentionCache dom
   -> Index NumLayers
   -> Index NumKeyValueHeads
-  -> Signal dom (Index SeqLen)                                   -- ^ sequence position (Int, clamped)
+  -> Signal dom (Index SeqLen)                                   -- ^ sequence position
   -> Signal dom (Vec HeadDimension Float, Vec HeadDimension Float) -- ^ current (K,V) vectors
-  -> Signal dom Bool                                  -- ^ enable pulse/level
-  -> Signal dom ()                                    -- ^ dummy sink
+  -> Signal dom Bool                                             -- ^ enable (high across stage)
+  -> Signal dom Bool                                             -- ^ done (1-cycle pulse)
 writeToCacheSequence cache l h seqPosSig kvSig enSig =
-  sinkSig
+  doneSig
  where
   keyRam   = keyCache cache
   valueRam = valueCache cache
 
-  -- dimension counter, increments only when enabled
+  -- dimension counter; increments only when enabled, resets to 0 otherwise
   dCnt :: Signal dom (Index HeadDimension)
   dCnt = register 0 nextD
   nextD = mux enSig
               (P.fmap (\d -> if d == maxBound then 0 else succ d) dCnt)
-              dCnt
+              (pure 0)
+
+  -- last element this cycle?
+  lastElemSig :: Signal dom Bool
+  lastElemSig = (== maxBound) <$> dCnt
+
+  -- done when enabled and writing the last element
+  doneSig :: Signal dom Bool
+  doneSig = (&&) <$> enSig <*> lastElemSig
 
   -- select the K,V element for current dimension
   kElemSig :: Signal dom Float
@@ -220,15 +244,9 @@ writeToCacheSequence cache l h seqPosSig kvSig enSig =
   vWriteSig :: Signal dom (Maybe (CacheAddr, Float))
   vWriteSig = mux enSig (Just <$> bundle (vAddrSig, vElemSig)) (pure Nothing)
 
-  -- perform writes; tie off read addresses (dummy) to keep the ports alive
-  _kQ = keyRam kAddrSig kWriteSig
+  -- perform writes; tie off reads
+  _kQ = keyRam   kAddrSig kWriteSig
   _vQ = valueRam vAddrSig vWriteSig
-
-  -- force usage to avoid being optimized away
-  sinkSig = () <$ (_kQ + _vQ)
-
-liftA5 :: Applicative g => (a -> b -> c -> d -> e -> f) -> g a -> g b -> g c -> g d -> g e -> g f
-liftA5 f fa fb fc fd fe = f <$> fa <*> fb <*> fc <*> fd <*> fe
 
 -- ============================================================================
 -- Multi-Cycle Transformer Layer
@@ -236,23 +254,23 @@ liftA5 f fa fb fc fd fe = f <$> fa <*> fb <*> fc <*> fd <*> fe
 
 multiCycleTransformerLayer
   :: forall dom
-  . HiddenClockResetEnable dom => TransformerLayerComponent
+   . HiddenClockResetEnable dom
+  => TransformerLayerComponent
   -> AttentionCache dom
   -> Index NumLayers
   -> Signal dom ProcessingState
   -> Signal dom IntermediateData
-  -> (Signal dom ProcessingState, Signal dom IntermediateData)
+  -> (Signal dom IntermediateData, Signal dom Bool)  -- (nextData, writeDone)
 multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
-  (nextStateSig, nextDataSig)
+  (nextDataSig, writeDoneThisLayerSig)
  where
   mha = multiHeadAttention layer
   ffn = feedforwardNetwork layer
-  nextStateSig = fmap nextState stateSig
 
   -- Cache reads for all heads
   cachedKeysPerHead :: Vec NumKeyValueHeads (Signal dom (Vec SeqLen (Vec HeadDimension Float)))
   cachedKeysPerHead =
-    map (\hIdx -> readCachedKeys cache layerIdx hIdx (fmap psSeqPos stateSig)) indicesI
+    map (\hIdx -> readCachedKeys cache layerIdx hIdx (psSeqPos <$> stateSig)) indicesI
 
   cachedValsPerHead :: Vec NumKeyValueHeads (Signal dom (Vec SeqLen (Vec HeadDimension Float)))
   cachedValsPerHead =
@@ -266,15 +284,15 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
   cachedValsSig = sequenceA cachedValsPerHead
 
   writeEnableSig :: Signal dom Bool
-  writeEnableSig = liftA2 (\st lidx -> psStage st == Cycle4_WriteCache && psLayer st == lidx)
-                          stateSig (pure layerIdx)
+  writeEnableSig =
+    (\st -> psStage st == Cycle4_WriteCache && psLayer st == layerIdx) <$> stateSig
 
-  -- Per-head KV signals and write effects, sequenced so they are kept alive
+  -- Per-head KV signals and write effects
   kvAllHeadsSig :: Signal dom (Vec NumKeyValueHeads (Vec HeadDimension Float, Vec HeadDimension Float))
   kvAllHeadsSig = liftA2 (zipWith (,)) (idKeys <$> dataSig) (idValues <$> dataSig)
 
-  writeOps :: Vec NumKeyValueHeads (Signal dom ())
-  writeOps =
+  writeDonePerHead :: Vec NumKeyValueHeads (Signal dom Bool)
+  writeDonePerHead =
     map (\hIdx ->
            writeToCacheSequence cache layerIdx hIdx
              (psSeqPos <$> stateSig)
@@ -282,14 +300,19 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
              writeEnableSig)
         indicesI
 
-  writeOpsSig :: Signal dom ()
-  writeOpsSig = () <$ sequenceA writeOps
+  -- all heads complete this row
+  writeDoneAllHeads :: Signal dom Bool
+  writeDoneAllHeads = fmap and (sequenceA writeDonePerHead)
+
+  -- only the active layer reports done; others remain False
+  writeDoneThisLayerSig :: Signal dom Bool
+  writeDoneThisLayerSig =
+    (\st doneH -> (psStage st == Cycle4_WriteCache && psLayer st == layerIdx) && doneH)
+      <$> stateSig <*> writeDoneAllHeads
 
   -- Combine everything in processCycle
   baseNextDataSig = liftA4 processCycle stateSig dataSig cachedKeysSig cachedValsSig
-
-  -- Wire in the write operations to ensure they happen
-  nextDataSig = liftA2 P.const baseNextDataSig writeOpsSig
+  nextDataSig     = baseNextDataSig
 
   processCycle
     :: ProcessingState
@@ -305,41 +328,45 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
       case psStage state of
         Cycle1_ReadCache ->
           idata { idCachedKeys = keysNow, idCachedVals = valsNow }
+
         Cycle2_ComputeQKV ->
-            -- Compute keys and values for NumKeyValueHeads
-            let
-              input = idInputVec idata
-              -- Compute queries for all NumQueryHeads
-              queries = imap (\hIdx _ ->
-                let headComp = heads mha !! hIdx
-                    (q, _, _) = runSingleHeadQKV headComp input
-                    (q_rot, _) = applyRotaryToHead headComp (StepCount $ P.fromIntegral $ psSeqPos state) (q, repeat 0)
-                in q_rot
-                ) indicesI
-
-              -- Compute keys and values for NumKeyValueHeads
-              headsPerGroupI :: Int
-              headsPerGroupI = natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads
-
-              toIndexClamped :: forall n. KnownNat n => Int -> Index n
-              toIndexClamped i =
-                let hi = natToNum @n - 1
-                    j  = max 0 (min hi i)
-                in toEnum j
-              keysAndValues = imap (\hIdx _ ->
-                let qIdx :: Index NumQueryHeads
-                    qIdx = toIndexClamped @NumQueryHeads (fromEnum hIdx * headsPerGroupI)
-                    headComp = heads mha !! qIdx
-                    (_, k, v) = runSingleHeadQKV headComp input
-                    (_, k_rot) = applyRotaryToHead headComp (StepCount $ P.fromIntegral $ psSeqPos state) (repeat 0, k)
-                in (k_rot, v)
-                ) indicesI
-              (keys, values) = unzip keysAndValues
-          in idata { idQueries = queries, idKeys = keys, idValues = values }
-        Cycle3_ComputeAttn ->
-          -- Include the just-computed (K,V) at the current position 'pos' by
-          -- overlaying them on top of the streamed cache before attention.
           let
+            input = idInputVec idata
+            -- Compute queries for all NumQueryHeads
+            queries = imap (\hIdx _ ->
+              let headComp = heads mha !! hIdx
+                  (q, _, _) = runSingleHeadQKV headComp input
+                  (q_rot, _) = applyRotaryToHead headComp (StepCount $ fromIntegral $ psSeqPos state) (q, repeat 0)
+              in q_rot
+              ) indicesI
+
+            -- Compute keys and values for NumKeyValueHeads
+            headsPerGroupI :: Int
+            headsPerGroupI = natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads
+
+            toIndexClamped :: forall n. KnownNat n => Int -> Index n
+            toIndexClamped i =
+              let hi = natToNum @n - 1
+                  j  = max 0 (min hi i)
+              in toEnum j
+
+            keysAndValues = imap (\hIdx _ ->
+              let qIdx :: Index NumQueryHeads
+                  qIdx = toIndexClamped @NumQueryHeads (fromEnum hIdx * headsPerGroupI)
+                  headComp = heads mha !! qIdx
+                  (_, k, v) = runSingleHeadQKV headComp input
+                  (_, k_rot) = applyRotaryToHead headComp (StepCount $ fromIntegral $ psSeqPos state) (repeat 0, k)
+              in (k_rot, v)
+              ) indicesI
+
+            (keys, values) = unzip keysAndValues
+          in idata { idQueries = queries, idKeys = keys, idValues = values }
+
+        Cycle3_ComputeAttn ->
+          let
+            posIdx :: Index SeqLen
+            posIdx = psSeqPos state
+
             -- Current K,V per KV head from Cycle2_ComputeQKV
             curK :: Vec NumKeyValueHeads (Vec HeadDimension Float)
             curK = idKeys idata
@@ -348,10 +375,10 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
 
             -- Overlay row 'posIdx' with current K,V for each KV head
             keysForAttn :: Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
-            keysForAttn = imap (\h kCache -> replace (psSeqPos state) (curK !! h) kCache) keysNow
+            keysForAttn = imap (\h kCache -> replace posIdx (curK !! h) kCache) keysNow
 
             valsForAttn :: Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
-            valsForAttn = imap (\h vCache -> replace (psSeqPos state) (curV !! h) vCache) valsNow
+            valsForAttn = imap (\h vCache -> replace posIdx (curV !! h) vCache) valsNow
 
             attnOut = computeMultiHeadAttention
                         mha
@@ -359,34 +386,19 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
                         (idQueries idata)
                         keysForAttn
                         valsForAttn
-                        (psSeqPos state)
+                        (psSeqPos state)  -- Helpers expects Int
           in idata { idAttnOutput = attnOut }
+
         Cycle5_ComputeFFN ->
           let ffnOut = computeFeedForward ffn (idAttnOutput idata)
           in idata { idFFNOutput = ffnOut }
+
         Cycle4_WriteCache ->
           idata
 
 -- ============================================================================
--- Multi-Cycle Full Transformer
+-- Multi-Cycle Full Transformer (advance on stageDone)
 -- ============================================================================
-
--- Single state transition function
-nextState :: ProcessingState -> ProcessingState
-nextState st = case psStage st of
-  Cycle1_ReadCache   -> st { psStage = Cycle2_ComputeQKV }
-  Cycle2_ComputeQKV  -> st { psStage = Cycle3_ComputeAttn }
-  Cycle3_ComputeAttn -> st { psStage = Cycle4_WriteCache }
-  Cycle4_WriteCache  -> st { psStage = Cycle5_ComputeFFN }
-  Cycle5_ComputeFFN ->
-    if psLayer st == maxBound
-      then st { psStage = Cycle1_ReadCache
-              , psLayer = 0
-              , psSeqPos = psSeqPos st + 1
-              , psTokenReady = True }
-      else st { psStage = Cycle1_ReadCache
-              , psLayer = psLayer st + 1
-              , psTokenReady = False }
 
 multiCycleTransformer
   :: forall dom
@@ -398,66 +410,81 @@ multiCycleTransformer
   -> Signal dom Int
   -> (Signal dom Token, Signal dom Bool)
 multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
-  (outputTokenSig, readyPulse)
+  (outputTokenSig, readyPulseSig)
  where
-  embedding = modelEmbedding decoder
-  layers    = modelLayers decoder
-  inputVecSig = embed (vocabulary embedding) <$> tokenSig
+  embedding    = modelEmbedding decoder
+  layers       = modelLayers decoder
+  inputVecSig  = embed (vocabulary embedding) <$> tokenSig
 
-  -- controller state: advance exactly once per cycle
-  procStateSig   = register initialProcessingState (nextState <$> procStateSig)
+  -- Global controller: advance only when current stageDone is asserted
+  advance st done = if done then nextState st else st
+  procStateSig = register initialProcessingState (advance <$> procStateSig <*> stageDoneSig)
+
+  -- Intermediate data register
   currentDataSig = register initialIntermediateData nextDataSig
 
-  -- Input loading only at the start of a token
-  inputLoadedSig = liftA3 (\state currentData inputVec ->
-    if psStage state == Cycle1_ReadCache && psLayer state == 0
-    then currentData { idInputVec = inputVec }
-    else currentData) procStateSig currentDataSig inputVecSig
+  -- Load input at token start
+  inputLoadedSig = liftA3 (\st cur inp ->
+                      if psStage st == Cycle1_ReadCache && psLayer st == 0
+                        then cur { idInputVec = inp } else cur)
+                    procStateSig currentDataSig inputVecSig
 
-  -- Process through all layers; layers do NOT modify the state
-  (_, nextDataSig) =
-    foldl
-      (\(_, dataSig) (layer, cache, layerIdx) ->
-         let (_ignored, newDataSig) = multiCycleTransformerLayer layer cache layerIdx procStateSig dataSig
-             conditionalDataSig = liftA3 (\state oldData newData ->
-               if psLayer state == layerIdx then newData else oldData)
-               procStateSig dataSig newDataSig
-         in ((), conditionalDataSig))
-      ((), inputLoadedSig)
-      (zip3 layers caches indicesI)
+  -- Run layers; gather writeDone pulses
+  foldStep
+    :: (Signal dom IntermediateData, Vec NumLayers (Signal dom Bool))
+    -> (TransformerLayerComponent, AttentionCache dom, Index NumLayers)
+    -> (Signal dom IntermediateData, Vec NumLayers (Signal dom Bool))
+  foldStep (dSig, dones) (layer, cache, lidx) =
+    let (newD, writeDoneL) = multiCycleTransformerLayer layer cache lidx procStateSig dSig
+        dSel = liftA3 (\st old new -> if psLayer st == lidx then new else old) procStateSig dSig newD
+        dones' = replace lidx writeDoneL dones
+    in (dSel, dones')
 
-  -- final-stage detect (last layer, FFN stage)
-  isFinalStage :: ProcessingState -> Bool
-  isFinalStage st = psStage st == Cycle5_ComputeFFN && psLayer st == maxBound
+  (nextDataSig, writeDoneVec) =
+    foldl foldStep (inputLoadedSig, repeat (pure False)) (zip3 layers caches indicesI)
 
-  readyNow :: Signal dom Bool
-  readyNow = isFinalStage <$> procStateSig
+  -- Stage done signals
+  -- Stage done signals
+  writeDoneAny :: Signal dom Bool
+  writeDoneAny = fmap or (sequenceA writeDoneVec)
 
-  -- 1-cycle pulse on rising edge of readyNow
-  readyPrev :: Signal dom Bool
-  readyPrev = register False readyNow
+  -- For now, other stages complete in a single cycle
+  readDoneSig  = pure True
+  qkvDoneSig   = pure True
+  attnDoneSig  = pure True
+  ffnDoneSig   = pure True
 
-  readyPulse :: Signal dom Bool
-  readyPulse = liftA2 (\now prev -> now && not prev) readyNow readyPrev
+  -- Helper: current stage as a Signal
+  stgSig :: Signal dom CycleStage
+  stgSig = psStage <$> procStateSig
 
-  -- Compute logits from the current FFN output; latch on readyPulse
-  logitsRawSig :: Signal dom (Vec VocabSize Float)
-  logitsRawSig = transformerLogits decoder . idFFNOutput <$> nextDataSig
+  -- Helper: lift (==) to Signal domain
+  is :: CycleStage -> Signal dom Bool
+  is c = liftA2 (==) stgSig (pure c)
 
-  latchedLogitsSig :: Signal dom (Vec VocabSize Float)
-  latchedLogitsSig = regEn (repeat 0) readyPulse logitsRawSig
+  -- Select done for the current stage
+  stageDoneSig :: Signal dom Bool
+  stageDoneSig =
+    mux (is Cycle1_ReadCache)   readDoneSig  $
+    mux (is Cycle2_ComputeQKV)  qkvDoneSig   $
+    mux (is Cycle3_ComputeAttn) attnDoneSig  $
+    mux (is Cycle4_WriteCache)  writeDoneAny $
+    mux (is Cycle5_ComputeFFN)  ffnDoneSig   $
+    pure False
 
-  -- Sample exactly once per pulse; hold token stable between pulses
-  pickToken :: Vec VocabSize Float -> Float -> Int -> Token
-  pickToken probs temp seed
+  -- Ready pulse at last layer FFN completion (rising edge)
+  isLastFFN  = liftA2 (\st _ -> psStage st == Cycle5_ComputeFFN && psLayer st == maxBound)
+                      procStateSig (pure ())
+  readyPulseSig = liftA2 (\now prev -> now && not prev) isLastFFN (register False isLastFFN)
+
+  logitsNow = transformerLogits decoder . idFFNOutput <$> nextDataSig
+  latchedLogits = regEn (repeat 0) readyPulseSig logitsNow
+
+  pick probs temp seed
     | temp == 0.0 = argMax probs
     | otherwise   = drawSample seed (map (/ temp) probs)
 
-  sampledTokenNow :: Signal dom Token
-  sampledTokenNow = pickToken <$> latchedLogitsSig <*> temperatureSig <*> seedSig
-
-  outputTokenSig :: Signal dom Token
-  outputTokenSig = regEn (0 :: Token) readyPulse sampledTokenNow
+  outputTokenSig = regEn 0 readyPulseSig (pick <$> latchedLogits <*> temperatureSig <*> seedSig)
 
 -- ============================================================================
 -- Top Entity
