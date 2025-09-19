@@ -15,7 +15,6 @@ import qualified Clash.Prelude as C
 import qualified Clash.Signal as CS
 
 import GHC.IO (unsafePerformIO)
-import GHC.Base (when)
 import Data.Maybe (fromMaybe)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import GHC.Unicode (isSpace)
@@ -48,9 +47,7 @@ import Helpers
       ModelDim,
       vocabSize,
       FreqDim )
-import Model ( multiCycleTransformer, initAttentionCache, ProcessingState (..), topEntity )
-import Data.List (findIndex)
-import Debug.Trace (trace)
+import Model ( topEntity )
 
 type Vocabulary = [BSL.ByteString]
 type VocabularyScores = [Float]
@@ -67,6 +64,31 @@ main = do
   modelFileContent <- BSL.readFile modelFile
   tokenizerFileContent <- BSL.readFile tokenizerFile
   runModel modelFileContent tokenizerFileContent (realToFrac temperature) steps prompt seed
+
+runModel :: BSL.ByteString -> BSL.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
+runModel modelFileContent tokenizerFileContent temperature steps prompt seed = do
+  currentTime <- getPOSIXTime
+  let
+    seedValue = fromMaybe (round currentTime) seed
+    initModel :: BSL.ByteString -> TransformerDecoderComponent
+    initModel = BG.runGet parseModelConfigFile
+    config = initModel modelFileContent
+    prompt' = fromMaybe "" prompt
+    (promptTokens, vocab) = tokenizerInit tokenizerFileContent vocabSize (BSC.pack prompt')
+
+  putStrLn "✅ model loaded successfully"
+  putStrLn "<s>"
+  startTime <- getPOSIXTime
+
+  (_, StepCount countTokens) <- generateTokensSimAutoregressive config vocab (fromIntegral steps) promptTokens temperature seedValue
+
+  endTime <- getPOSIXTime
+  let duration :: Integer
+      duration = round (endTime - startTime)
+      tokensPerSec :: Float
+      tokensPerSec = fromIntegral countTokens / fromIntegral duration
+  printf "\nduration: %ds - (%.02f tokens/s)\n" duration tokensPerSec
+  return ()
 
 --------------------------------------------------------------------------------
 -- Options
@@ -155,30 +177,18 @@ bpeEncode prompt vocab vocabScores =
         ) (BSL.unpack prompt)
    in applyBPEMerges initialTokens vocab vocabScores
 
-runModel :: BSL.ByteString -> BSL.ByteString -> Float -> Int -> Maybe String -> Maybe Int -> IO ()
-runModel modelFileContent tokenizerFileContent temperature steps prompt seed = do
-  currentTime <- getPOSIXTime
-  let
-    seedValue = fromMaybe (round currentTime) seed
-    initModel :: BSL.ByteString -> TransformerDecoderComponent
-    initModel = BG.runGet parseModelConfigFile
-    config = initModel modelFileContent
-    prompt' = fromMaybe "" prompt
-    (promptTokens, vocab) = tokenizerInit tokenizerFileContent vocabSize (BSC.pack prompt')
-
-  putStrLn "✅ model loaded successfully"
-  putStrLn "<s>"
-  startTime <- getPOSIXTime
-
-  (_, StepCount countTokens) <- generateTokensSimAutoregressive config vocab (fromIntegral steps) promptTokens temperature seedValue
-
-  endTime <- getPOSIXTime
-  let duration :: Integer
-      duration = round (endTime - startTime)
-      tokensPerSec :: Float
-      tokensPerSec = fromIntegral countTokens / fromIntegral duration
-  printf "\nduration: %ds - (%.02f tokens/s)\n" duration tokensPerSec
-  return ()
+-- piece = vocab[next]; if prev==1 and piece starts with whitespace, drop that space.
+decodePieceHS :: Vocabulary -> Token -> Token -> BSL.ByteString
+decodePieceHS vocab prev tok =
+  let piece =
+        if tok >= (0 :: Token) && fromIntegral tok < length vocab
+          then vocab !! fromIntegral tok
+          else BSL.empty
+  in if prev == 1
+        then case BSC.uncons piece of
+               Just (c, rest) | isSpace c -> rest
+               _                           -> piece
+        else piece
 
 -- ============================================================================
 -- File Parsing
@@ -257,57 +267,18 @@ parseModelConfigFile :: BG.Get TransformerDecoderComponent
 parseModelConfigFile = do
   replicateM_ 7 BG.getInt32le
   tokenEmbeddingTable' <- readVec2D @VocabSize @ModelDim
-  let tokenShape = (length (C.toList tokenEmbeddingTable'), length (C.toList (C.head tokenEmbeddingTable')))
-      expectedTokenShape = (C.natToNum @VocabSize, C.natToNum @ModelDim)
-  trace ("parseModelConfigFile: tokenEmbeddingTable shape=" ++ show tokenShape ++ ", expected=" ++ show expectedTokenShape) return ()
   rmsAttWeight' <- readVec2D @NumLayers @ModelDim
-  let rmsAttShape = (length (C.toList rmsAttWeight'), length (C.toList (C.head rmsAttWeight')))
-      expectedRmsAttShape = (C.natToNum @NumLayers, C.natToNum @ModelDim)
-  trace ("parseModelConfigFile: rmsAttWeight shape=" ++ show rmsAttShape ++ ", expected=" ++ show expectedRmsAttShape) return ()
   wq' <- readVec4D @NumLayers @NumQueryHeads @HeadDimension @ModelDim
-  let wqShape = (length (C.toList wq'), length (C.toList (C.head wq')), length (C.toList (C.head (C.head wq'))), length (C.toList (C.head (C.head (C.head wq')))))
-      expectedWqShape = (C.natToNum @NumLayers, C.natToNum @NumQueryHeads, C.natToNum @HeadDimension, C.natToNum @ModelDim)
-  trace ("parseModelConfigFile: wq shape=" ++ show wqShape ++ ", expected=" ++ show expectedWqShape) return ()
   wk' <- readVec4D @NumLayers @NumKeyValueHeads @HeadDimension @ModelDim
-  let wkShape = (length (C.toList wk'), length (C.toList (C.head wk')), length (C.toList (C.head (C.head wk'))), length (C.toList (C.head (C.head (C.head wk')))))
-      expectedWkShape = (C.natToNum @NumLayers, C.natToNum @NumKeyValueHeads, C.natToNum @HeadDimension, C.natToNum @ModelDim)
-  trace ("parseModelConfigFile: wk shape=" ++ show wkShape ++ ", expected=" ++ show expectedWkShape) return ()
   wv' <- readVec4D @NumLayers @NumKeyValueHeads @HeadDimension @ModelDim
-  let wvShape = (length (C.toList wv'), length (C.toList (C.head wv')), length (C.toList (C.head (C.head wv'))), length (C.toList (C.head (C.head (C.head wv')))))
-      expectedWvShape = (C.natToNum @NumLayers, C.natToNum @NumKeyValueHeads, C.natToNum @HeadDimension, C.natToNum @ModelDim)
-  trace ("parseModelConfigFile: wv shape=" ++ show wvShape ++ ", expected=" ++ show expectedWvShape) return ()
   wo' <- readVec4D @NumLayers @NumQueryHeads @ModelDim @HeadDimension
-  let woShape = (length (C.toList wo'), length (C.toList (C.head wo')), length (C.toList (C.head (C.head wo'))), length (C.toList (C.head (C.head (C.head wo')))))
-      expectedWoShape = (C.natToNum @NumLayers, C.natToNum @NumQueryHeads, C.natToNum @ModelDim, C.natToNum @HeadDimension)
-  trace ("parseModelConfigFile: wo shape=" ++ show woShape ++ ", expected=" ++ show expectedWoShape) return ()
   rmsFfnWeight' <- readVec2D @NumLayers @ModelDim
-  let rmsFfnShape = (length (C.toList rmsFfnWeight'), length (C.toList (C.head rmsFfnWeight')))
-      expectedRmsFfnShape = (C.natToNum @NumLayers, C.natToNum @ModelDim)
-  trace ("parseModelConfigFile: rmsFfnWeight shape=" ++ show rmsFfnShape ++ ", expected=" ++ show expectedRmsFfnShape) return ()
   w1' <- readVec3D @NumLayers @HiddenDim @ModelDim
-  let w1Shape = (length (C.toList w1'), length (C.toList (C.head w1')), length (C.toList (C.head (C.head w1'))))
-      expectedW1Shape = (C.natToNum @NumLayers, C.natToNum @HiddenDim, C.natToNum @ModelDim)
-  trace ("parseModelConfigFile: w1 shape=" ++ show w1Shape ++ ", expected=" ++ show expectedW1Shape) return ()
   w2' <- readVec3D @NumLayers @ModelDim @HiddenDim
-  let w2Shape = (length (C.toList w2'), length (C.toList (C.head w2')), length (C.toList (C.head (C.head w2'))))
-      expectedW2Shape = (C.natToNum @NumLayers, C.natToNum @ModelDim, C.natToNum @HiddenDim)
-  trace ("parseModelConfigFile: w2 shape=" ++ show w2Shape ++ ", expected=" ++ show expectedW2Shape) return ()
   w3' <- readVec3D @NumLayers @HiddenDim @ModelDim
-  let w3Shape = (length (C.toList w3'), length (C.toList (C.head w3')), length (C.toList (C.head (C.head w3'))))
-      expectedW3Shape = (C.natToNum @NumLayers, C.natToNum @HiddenDim, C.natToNum @ModelDim)
-  trace ("parseModelConfigFile: w3 shape=" ++ show w3Shape ++ ", expected=" ++ show expectedW3Shape) return ()
   rmsFinalWeight' <- readVec1D @ModelDim
-  let rmsFinalShape = length (C.toList rmsFinalWeight')
-      expectedRmsFinalShape = C.natToNum @ModelDim
-  trace ("parseModelConfigFile: rmsFinalWeight shape=" ++ show rmsFinalShape ++ ", expected=" ++ show expectedRmsFinalShape) return ()
   freqCisReal' <- readVec2D @SeqLen @FreqDim
-  let freqCisRealShape = (length (C.toList freqCisReal'), length (C.toList (C.head freqCisReal')))
-      expectedFreqCisRealShape = (C.natToNum @SeqLen, C.natToNum @FreqDim)
-  trace ("parseModelConfigFile: freqCisReal shape=" ++ show freqCisRealShape ++ ", expected=" ++ show expectedFreqCisRealShape) return ()
   freqCisImag' <- readVec2D @SeqLen @FreqDim
-  let freqCisImagShape = (length (C.toList freqCisImag'), length (C.toList (C.head freqCisImag')))
-      expectedFreqCisImagShape = (C.natToNum @SeqLen, C.natToNum @FreqDim)
-  trace ("parseModelConfigFile: freqCisImag shape=" ++ show freqCisImagShape ++ ", expected=" ++ show expectedFreqCisImagShape) return ()
   let
     embedding = EmbeddingComponent
       { vocabulary     = CArray2D tokenEmbeddingTable'
@@ -374,59 +345,70 @@ generateTokensSimAutoregressive
   -> Float
   -> Int
   -> IO ([Token], StepCount)
-generateTokensSimAutoregressive decoder _vocab nSteps promptTokens temperature seed = do
+generateTokensSimAutoregressive decoder vocab nSteps promptTokens temperature seed = do
+  let promptLen   = length promptTokens
+      totalWanted = promptLen + fromIntegral nSteps
+
   putStrLn $ "✅ Prompt: " ++ show promptTokens
+  putStr "<s>\n"
   putStr "Generated: "
   hFlush stdout
 
-  let promptLen = length promptTokens
-  
-      -- Infinite streams for temp/seed/seqPos (seqPos is ignored by topEntity)
-      temps   = repeat temperature
+  -- Constant input streams
+  let temps   = repeat temperature
       seeds   = repeat seed
-      seqPosS = [0..] :: [Int]
 
-      -- Outputs of the circuit over time (one element per hardware cycle)
-      outputs :: [(Token, Bool)]
-      outputs = CS.simulate (bundledOutputs decoder) inputs
+  -- One simulation run; inputs depend on the token stream,
+  -- which depends on outputs (knot-tying).
+  let outputs :: [(Token, Bool)]
+      outputs = CS.simulate (bundledOutputs decoder) (DL.zip3 tokenStream temps seeds)
 
-      outTokens :: [Token]
-      readyFlags :: [Bool]
       (outTokens, readyFlags) = unzip outputs
 
-      -- Co-recursive token driver:
-      -- cur is the token visible to the circuit this cycle
-      -- ps is the remaining prompt tokens to consume at each ready pulse
+      -- Drive the input token:
+      -- Hold current token until a ready pulse.
+      -- On ready: consume next prompt token if any, else feed back the last sampled token.
       tokenStream :: [Token]
-      tokenStream = drive (head promptTokens) (tail promptTokens) readyFlags outTokens
+      tokenStream =
+        let (cur0, restPrompt) =
+              case promptTokens of
+                (t0:ts) -> (t0, ts)
+                []      -> (1, []) -- start from BOS if no prompt
+        in drive cur0 restPrompt readyFlags outTokens
         where
           drive :: Token -> [Token] -> [Bool] -> [Token] -> [Token]
           drive cur ps (r:rs) (o:os) =
-            cur : (if r then (case ps of
-                     (p:ps') -> drive p  ps'  rs os        -- still forcing the prompt
-                     []      -> drive o  []    rs os) else drive cur ps rs os)        -- switch to model output
-          drive cur _ [] _ = repeat cur  -- shouldn't happen; just be total
-          drive cur _ _ [] = repeat cur
+            cur : if not r
+                    then drive cur ps rs os
+                    else case ps of
+                           (p:ps') -> drive p  ps'  rs os
+                           []      -> drive o  []    rs os
+          drive cur _ _ _ = repeat cur  -- totality guard
 
-      -- Bundle inputs once, the circuit will pick up 'tokenStream' as needed
-      inputs :: [(Int, Token, Float, Int)]
-      inputs = DL.zip4 seqPosS tokenStream temps seeds
+      -- Tokens sampled at ready pulses (includes prompt-forced outputs first)
+      sampledAll :: [Token]
+      sampledAll = [ t | (t,r) <- outputs, r ]
 
-      -- Collect tokens at ready pulses; drop promptLen of them, then take nSteps
-      produced :: [Token]
-      produced =
-        [ t
-        | (t, r) <- outputs
-        , r
-        ]
-      generated = take (fromIntegral nSteps) (drop promptLen produced)
+      -- Limit to the tokens we actually want to print/return
+      sampledLimited :: [Token]
+      sampledLimited = take totalWanted sampledAll
 
-  -- Print as we go (optional)
-  mapM_ (\tok -> putStr (show tok ++ " ") >> hFlush stdout) generated
+      -- For printing, we need prev token context; start with BOS (1)
+      prevs :: [Token]
+      prevs = 1 : sampledLimited
+
+      pairs :: [(Token, Token)]
+      pairs = zip prevs sampledLimited
+
+  -- Print each produced token's piece using the pure decoder rule
+  mapM_ (\(prev,tok) -> BSC.putStr (decodePieceHS vocab prev tok) >> hFlush stdout) pairs
   putStrLn ""
+
+  -- Return only the generated tokens (drop the prompt-length prefix)
+  let generated = take (fromIntegral nSteps) (drop promptLen sampledLimited)
   pure (generated, StepCount nSteps)
 
-bundledOutputs :: TransformerDecoderComponent -> CS.Signal CS.System (Int, Token, Float, Int) -> CS.Signal C.System (C.Unsigned 32, Bool)
+bundledOutputs :: TransformerDecoderComponent -> CS.Signal CS.System (Token, Float, Int) -> CS.Signal C.System (C.Unsigned 32, Bool)
 bundledOutputs decoder = CS.bundle . CS.exposeClockResetEnable
     (topEntityBundled @CS.System decoder)
     CS.systemClockGen
@@ -437,8 +419,8 @@ bundledOutputs decoder = CS.bundle . CS.exposeClockResetEnable
 topEntityBundled
   :: CS.HiddenClockResetEnable dom
   => TransformerDecoderComponent
-  -> C.Signal dom (Int, Token, Float, Int)
+  -> C.Signal dom (Token, Float, Int)
   -> (C.Signal dom Token, C.Signal dom Bool)
-topEntityBundled decoder bundledInputs = topEntity decoder seqPos inputToken temp rngSeed
+topEntityBundled decoder bundledInputs = topEntity decoder inputToken temp rngSeed
   where
-    (seqPos, inputToken, temp, rngSeed) = C.unbundle bundledInputs
+    (inputToken, temp, rngSeed) = C.unbundle bundledInputs

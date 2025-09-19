@@ -43,7 +43,7 @@ import Clash.Prelude
 
 import qualified Clash.Sized.Vector as CV
 import Data.Maybe (fromMaybe)
-
+{- 
 -- model config 260K
 type ModelDim = 64
 type HiddenDim = 172
@@ -58,8 +58,8 @@ vocabSize = natToNum @VocabSize
 type SeqLen         = 512
 seqLen :: Int
 seqLen = natToNum @SeqLen
+ -}
 
-{- 
 -- model config 15M
 type ModelDim = 288
 type HiddenDim = 768
@@ -74,7 +74,7 @@ vocabSize = natToNum @VocabSize
 type SeqLen         = 256
 seqLen :: Int
 seqLen = natToNum @SeqLen
- -}
+
 {-
 -- model config 110M
 type ModelDim = 768

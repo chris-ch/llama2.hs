@@ -4,12 +4,12 @@ import Clash.Prelude
 import qualified Prelude as P
 import qualified GHC.TypeNats
 import Helpers
-  ( NumQueryHeads, NumKeyValueHeads, NumLayers, SeqLen, HeadDimension, ModelDim, VocabSize
+  ( NumQueryHeads, NumKeyValueHeads, NumLayers, SeqLen, HeadDimension, ModelDim
   , Token, TransformerLayerComponent(..), TransformerDecoderComponent (..)
   , MultiHeadAttentionComponent(..), EmbeddingComponent (..)
   , runSingleHeadQKV, applyRotaryToHead, StepCount (..)
   , computeFeedForward, transformerLogits, argMax, embed
-  , sampleFromProbs, computeMultiHeadAttention, seqLen, liftA4, liftA5, rmsNorm, softmax, matrixVectorMult, xorshift32
+  , sampleFromProbs, liftA4, rmsNorm, softmax, matrixVectorMult, xorshift32
   )
 import GHC.Stack (HasCallStack)
 
@@ -505,8 +505,8 @@ multiCycleTransformer
   => TransformerDecoderComponent
   -> Vec NumLayers (AttentionCache dom)
   -> Signal dom Token
-  -> Signal dom Float
-  -> Signal dom Int
+  -> Signal dom Float -- temperature
+  -> Signal dom Int   -- seed
   -> (Signal dom Token, Signal dom Bool)
 multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
   (outputTokenSig, readyPulseSig)
@@ -611,11 +611,11 @@ multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
   sampledTokenOnPulse :: Signal dom (Unsigned 32)
   sampledTokenOnPulse =
     liftA3
-      (\temp logs u ->
-         if temp <= 0.0
+      (\temperature logs u ->
+         if temperature <= 0.0
            then argMax logs
            else
-             let probs = softmax temp logs
+             let probs = softmax temperature logs
              in sampleFromProbs u probs
       )
       temperatureSig latchedLogits uniform01Sig
@@ -630,9 +630,8 @@ topEntity
   :: forall dom
    . HiddenClockResetEnable dom
   => TransformerDecoderComponent
-  -> Signal dom Int
   -> Signal dom Token
-  -> Signal dom Float
-  -> Signal dom Int
+  -> Signal dom Float -- temperature
+  -> Signal dom Int   -- seed
   -> (Signal dom Token, Signal dom Bool)
-topEntity decoder _ = multiCycleTransformer decoder (repeat initAttentionCache)
+topEntity decoder = multiCycleTransformer decoder (repeat initAttentionCache)
