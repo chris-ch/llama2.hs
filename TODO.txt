@@ -1,3 +1,38 @@
+
+Remove mirrored caches and simplify Cycle1
+
+    R1. Delete idCachedKeys/idCachedVals from IntermediateData and initialIntermediateData.
+    R2. Remove readCachedKeysGated/readCachedValsGated calls and all “cached*Sig” wiring.
+    R3. Make Cycle1 a no‑op (or a lightweight “prepare” stage). Set readDoneThisLayerSig = pure True.
+    R4. Update stageDoneSig so Cycle1 uses readDoneAny = True.
+
+Collapse many BRAMs into one owner per layer (true dual‑port)
+
+    B1. Introduce a KVRamOwner module (per layer)
+        Inside: two trueDualPortBlockRam (keys, values).
+        Expose a scheduled interface:
+            Read port A: rdStart, rdHeadKV, rdT, rdD -> rdQK/rdQV, rdValid
+            Write port B: wrHeadKV, wrPos, wrD, wrEn, wrDataK, wrDataV
+            busy/done (optional; your stage FSM can infer from counters).
+    B2. Replace AttentionCache dom with KVRamOwner (one per layer)
+        In multiCycleTransformer, pass Vec NumLayers of owners instead of caches.
+        In Cycle3, drive port A from the streamHeadAttention (or a tiny shim) instead of calling blockRam per head.
+        In Cycle4, drive port B from writeToCacheSequence (or fold that writer into the owner).
+
+QKV/FFN micro‑FSMs (later, if you need area/timing)
+
+    Q1. Time‑multiplex matrixVectorMult for Q/K/V and W_O
+        One MAC lane accumulates over HeadDimension/ModelDim with a “done” pulse.
+        Turn qkvDoneSig/ffnDoneSig from True into the real pulses.
+
+Hazard/overlap (once TDP is in place)
+
+    H1. Overlap reads and writes
+        While port A streams reads for t = 0..pos, port B writes K,V for row pos.
+        Keep the t==pos bypass in streamHeadAttention to avoid read‑during‑write issues.
+
+
+
 Short answer: it’s a good first sketch, but as written it will not synthesize into a correct or practical LLaMA‑2 decoder in Clash.
 There are several functional bugs (one of them fatal) and a few Clash/HDL pitfalls that will either make the design incorrect,
  unsynthesizable, or explode into a huge amount of hardware.

@@ -518,20 +518,33 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
          in headOut
       )
       indicesI
+  -- Vec NumQueryHeads (Signal (Vec ModelDim Float))
+  perHeadProjectedVec :: Vec NumQueryHeads (Signal dom (Vec ModelDim Float))
+  perHeadProjectedVec =
+    zipWith (\wo h -> matrixVectorMult wo <$> h) (mWo mha) headsOutSigsVec
 
-  -- Project each head with its W_O, sum across heads, and add residual x
-  perHeadProjectedSigs :: Vec NumQueryHeads (Signal dom (Vec ModelDim Float))
-  perHeadProjectedSigs =
-    imap (\qIdx hOutS -> matrixVectorMult (mWo mha !! qIdx) <$> hOutS) headsOutSigsVec
+  -- Signal (Vec NumQueryHeads (Vec ModelDim Float))
+  perHeadProjectedSig :: Signal dom (Vec NumQueryHeads (Vec ModelDim Float))
+  perHeadProjectedSig = sequenceA perHeadProjectedVec
 
+  -- Signal (Vec ModelDim Float)
+  attnSumSig :: Signal dom (Vec ModelDim Float)
+  attnSumSig = fmap (foldl1 (zipWith (+))) perHeadProjectedSig
+
+  -- Residual: x + sum_h W_O h_out
+  -- Signal (Vec ModelDim Float)
   attnOutSig :: Signal dom (Vec ModelDim Float)
-  attnOutSig =
-    liftA2
-      (\x perHeadVecs ->
-         let woSum = foldl1 (zipWith (+)) perHeadVecs
-         in zipWith (+) x woSum)
-      (idInputVec <$> dataSig)
-      (sequenceA perHeadProjectedSigs)
+  attnOutSig = zipWith (+) <$> (idInputVec <$> dataSig) <*> attnSumSig
+
+  -- Commit idAttnOutput only when this layer’s attention finishes
+  nextDataSig :: Signal dom IntermediateData
+  nextDataSig =
+    liftA4
+      (\st cur attOut done ->
+         if psLayer st == layerIdx && psStage st == Cycle3_ComputeAttn && done
+           then cur { idAttnOutput = attOut }
+           else cur)
+      stateSig baseNextDataSig attnOutSig attnDoneThisLayerSig
 
   -- Writes to KV cache (unchanged)
   writeEnableSig = wrStart
@@ -557,15 +570,6 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
 
   -- Compute body: no combinational write in Cycle3
   baseNextDataSig = liftA4 processCycle stateSig dataSig cachedKeysSig cachedValsSig
-
-  -- Commit streaming attention result on the layer's attn done pulse
-  nextDataSig =
-    liftA4
-      (\st cur attOut done ->
-         if psLayer st == layerIdx && psStage st == Cycle3_ComputeAttn && done
-           then cur { idAttnOutput = attOut }
-           else cur)
-      stateSig baseNextDataSig attnOutSig attnDoneThisLayerSig
 
   processCycle st idata keysNow valsNow
     | psLayer st /= layerIdx = idata
