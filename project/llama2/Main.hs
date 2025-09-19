@@ -389,9 +389,8 @@ generateTokensSimAutoregressive decoder vocab nSteps promptTokens temperature se
           let seqPos = step
               inputToken | step < promptLen = promptTokens !! step
                         | otherwise = last acc
-              rngSeed = seed + step
-              bundledIn = (seqPos, inputToken, temperature, rngSeed)
-          putStrLn $ "Step " ++ show step ++ ": seqPos=" ++ show seqPos ++ ", inputToken=" ++ show inputToken ++ ", rngSeed=" ++ show rngSeed
+              bundledIn = (seqPos, inputToken, temperature, seed)
+          putStrLn $ "Step " ++ show step ++ ": seqPos=" ++ show seqPos ++ ", inputToken=" ++ show inputToken ++ ", rngSeed=" ++ show seed
           let outputs = CS.simulate (bundledOutputs decoder) (repeat bundledIn)
               (outToken, readyFlags) = unzip outputs
               readyIdx = fromMaybe 0 $ findIndex id readyFlags
