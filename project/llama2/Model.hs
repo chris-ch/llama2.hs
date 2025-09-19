@@ -10,7 +10,7 @@ import Helpers
   , MultiHeadAttentionComponent(..), EmbeddingComponent (..)
   , runSingleHeadQKV, applyRotaryToHead, StepCount (..)
   , computeFeedForward, transformerLogits, argMax, embed
-  , drawSample, computeMultiHeadAttention, seqLen, liftA4, liftA5
+  , drawSample, computeMultiHeadAttention, seqLen, liftA4, liftA5, rmsNorm
   )
 import GHC.Stack (HasCallStack)
 
@@ -40,7 +40,6 @@ data ProcessingState = ProcessingState
   { psStage      :: CycleStage
   , psLayer      :: Index NumLayers
   , psSeqPos     :: Index SeqLen
-  , psTokenReady :: Bool
   } deriving (Show, Generic, NFDataX)
 
 initialProcessingState :: ProcessingState
@@ -48,7 +47,6 @@ initialProcessingState = ProcessingState
   { psStage = Cycle1_ReadCache
   , psLayer = 0
   , psSeqPos = 0
-  , psTokenReady = False
   }
 
 -- Single state transition function (one step)
@@ -63,10 +61,10 @@ nextState st = case psStage st of
       then st { psStage = Cycle1_ReadCache
               , psLayer = 0
               , psSeqPos = succ (psSeqPos st)  -- wraps as Index
-              , psTokenReady = True }
+              }
       else st { psStage = Cycle1_ReadCache
               , psLayer = succ (psLayer st)
-              , psTokenReady = False }
+              }
 
 -- ============================================================================
 -- Intermediate data storage
@@ -331,16 +329,20 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
 
         Cycle2_ComputeQKV ->
           let
-            input = idInputVec idata
-            -- Compute queries for all NumQueryHeads
+            -- pre-norm input for attention
+            xHat = rmsNorm (idInputVec idata) (rmsAtt mha)
+
+            -- queries for all NumQueryHeads from x̂, with RoPE
             queries = imap (\hIdx _ ->
               let headComp = heads mha !! hIdx
-                  (q, _, _) = runSingleHeadQKV headComp input
-                  (q_rot, _) = applyRotaryToHead headComp (StepCount $ fromIntegral $ psSeqPos state) (q, repeat 0)
+                  (q, _, _) = runSingleHeadQKV headComp xHat
+                  (q_rot, _) = applyRotaryToHead headComp
+                                  (StepCount $ fromIntegral $ psSeqPos state)
+                                  (q, repeat 0)
               in q_rot
               ) indicesI
 
-            -- Compute keys and values for NumKeyValueHeads
+            -- keys/values for NumKeyValueHeads from x̂, with RoPE on K
             headsPerGroupI :: Int
             headsPerGroupI = natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads
 
@@ -350,13 +352,16 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
                   j  = max 0 (min hi i)
               in toEnum j
 
-            keysAndValues = imap (\hIdx _ ->
-              let qIdx :: Index NumQueryHeads
-                  qIdx = toIndexClamped @NumQueryHeads (fromEnum hIdx * headsPerGroupI)
-                  headComp = heads mha !! qIdx
-                  (_, k, v) = runSingleHeadQKV headComp input
-                  (_, k_rot) = applyRotaryToHead headComp (StepCount $ fromIntegral $ psSeqPos state) (repeat 0, k)
-              in (k_rot, v)
+            keysAndValues =
+              imap (\hIdx _ ->
+                let qIdx :: Index NumQueryHeads
+                    qIdx = toIndexClamped @NumQueryHeads (fromEnum hIdx * headsPerGroupI)
+                    headComp = heads mha !! qIdx
+                    (_, k, v) = runSingleHeadQKV headComp xHat
+                    (_, k_rot) = applyRotaryToHead headComp
+                                  (StepCount $ fromIntegral $ psSeqPos state)
+                                  (repeat 0, k)
+                in (k_rot, v)
               ) indicesI
 
             (keys, values) = unzip keysAndValues
@@ -443,7 +448,6 @@ multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
   (nextDataSig, writeDoneVec) =
     foldl foldStep (inputLoadedSig, repeat (pure False)) (zip3 layers caches indicesI)
 
-  -- Stage done signals
   -- Stage done signals
   writeDoneAny :: Signal dom Bool
   writeDoneAny = fmap or (sequenceA writeDoneVec)

@@ -221,17 +221,16 @@ applyRotaryPositionEncoding inputVec cosVec sinVec =
             rotatedImag = realComponent * sinValue + imagComponent * cosValue
 
 runFeedForward :: FeedForwardNetworkComponent -> Vec ModelDim Float -> Vec ModelDim Float
-runFeedForward feedForwardNetwork inputToken = feedforwardNetworkOutput' where
-    rmsFfnWeights = fRMSFfn feedForwardNetwork
-    w1 = fW1 feedForwardNetwork
-    w2 = fW2 feedForwardNetwork
-    w3 = fW3 feedForwardNetwork
-    normalizedInput = rmsNorm inputToken rmsFfnWeights
-    gateOutput' = matrixVectorMult w1 normalizedInput
-    upProjectionOutput' = matrixVectorMult w3 normalizedInput
-    gateOutput = map sigmoidLinearUnit gateOutput'
-
-    feedforwardNetworkOutput' = matrixVectorMult w2 (zipWith (*) gateOutput upProjectionOutput')
+runFeedForward ffn xHat =
+  let
+    w1 = fW1 ffn
+    w2 = fW2 ffn
+    w3 = fW3 ffn
+    gatePre   = matrixVectorMult w1 xHat
+    upPre     = matrixVectorMult w3 xHat
+    gate      = map sigmoidLinearUnit gatePre
+  in
+    matrixVectorMult w2 (zipWith (*) gate upPre)
 
 -- QKV per head - should return HeadDimension vectors, not ModelDim
 runSingleHeadQKV :: SingleHeadComponent -> Vec ModelDim Float -> (Vec HeadDimension Float, Vec HeadDimension Float, Vec HeadDimension Float)
@@ -329,64 +328,43 @@ computeMultiHeadAttention
   -> Vec ModelDim Float
 computeMultiHeadAttention mha input queries keysPerHead valuesPerHead posIn =
   let
-    -- helpers
-    clamp :: Int -> Int -> Int -> Int
-    clamp lo hi x = max lo (min hi x)
-
-    big :: Float
-    big = 1.0e9
-
-    -- Compute the number of query heads per key/value head
-    headsPerGroup :: Int
-    headsPerGroup = natToNum @NumQueryHeads `div` natToNum @NumKeyValueHeads
-
-    -- Map each query head to its corresponding key/value head
-    getKVIndex :: Index NumQueryHeads -> Index NumKeyValueHeads
-    getKVIndex qIdx =
-      let qi  = fromEnum qIdx
-          idx = qi `div` headsPerGroup
-          hi  = natToNum @NumKeyValueHeads - 1
-      in toEnum (clamp 0 hi idx)
-
-    -- Mask scores: keep t <= pos, push t > pos to ~-Inf
-    maskScores :: forall n. KnownNat n => Index SeqLen -> Vec n Float -> Vec n Float
-    maskScores p = imap (\t s -> if fromEnum t <= fromIntegral p then s else s - big)
-
-    -- Per-head outputs (HeadDimension each)
+    -- headOutputs, perHeadProjected as before ...
     headOutputs :: Vec NumQueryHeads (Vec HeadDimension Float)
     headOutputs = imap
       (\qIdx q ->
-         let kvIdx   = getKVIndex qIdx
-             ks      = keysPerHead   !! kvIdx     -- Vec SeqLen (Vec HeadDimension Float)
-             vs      = valuesPerHead !! kvIdx     -- Vec SeqLen (Vec HeadDimension Float)
-             scores  = computeAttentionScores q ks            -- Vec SeqLen Float
-             weights = computeAttentionWeights (maskScores posIn scores) -- Vec SeqLen Float
-         in computeAttentionOutput weights vs)                 -- Vec HeadDimension Float
+         let headsPerGroup :: Int
+             headsPerGroup = natToNum @NumQueryHeads `div` natToNum @NumKeyValueHeads
+             kvIdx :: Index NumKeyValueHeads
+             kvIdx =
+               let qi  = fromEnum qIdx
+                   idx = qi `div` headsPerGroup
+                   hi  = natToNum @NumKeyValueHeads - 1
+               in toEnum (max 0 (min hi idx))
+             ks = keysPerHead   !! kvIdx
+             vs = valuesPerHead !! kvIdx
+             scores  = computeAttentionScores q ks
+             weights = computeAttentionWeights (imap (\t s ->
+                               if fromEnum t <= fromIntegral posIn then s else s - 1.0e9) scores)
+         in computeAttentionOutput weights vs)
       queries
 
-    -- Project each head’s output via its own W_O
     perHeadProjected :: Vec NumQueryHeads (Vec ModelDim Float)
     perHeadProjected = zipWith matrixVectorMult (mWo mha) headOutputs
 
-    -- Sum across heads (elementwise over ModelDim)
     summedOutput :: Vec ModelDim Float
     summedOutput = foldl1 (zipWith (+)) perHeadProjected
-
-    -- Residual connection with pre-attention RMSNorm
-    normalizedInput :: Vec ModelDim Float
-    normalizedInput = rmsNorm input (rmsAtt mha)
   in
-    zipWith (+) normalizedInput summedOutput
+    zipWith (+) input summedOutput
 
 -- Pure feed-forward computation
 computeFeedForward
   :: FeedForwardNetworkComponent
   -> Vec ModelDim Float
   -> Vec ModelDim Float
-computeFeedForward ffn input =
-  let normalizedInput = rmsNorm input (fRMSFfn ffn)
-      ffnOutput = runFeedForward ffn normalizedInput
-  in zipWith (+) input ffnOutput
+computeFeedForward ffn x =
+  let xHat     = rmsNorm x (fRMSFfn ffn)                  -- single pre-norm here
+      ffnCore  = runFeedForward ffn xHat                  -- no extra norm inside
+  in zipWith (+) x ffnCore
 
 liftA5 :: Applicative g => (a -> b -> c -> d -> e -> f) -> g a -> g b -> g c -> g d -> g e -> g f
 liftA5 f fa fb fc fd fe = f <$> fa <*> fb <*> fc <*> fd <*> fe
