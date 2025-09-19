@@ -1,0 +1,219 @@
+Short answer: it’s a good first sketch, but as written it will not synthesize into a correct or practical LLaMA‑2 decoder in Clash.
+There are several functional bugs (one of them fatal) and a few Clash/HDL pitfalls that will either make the design incorrect,
+ unsynthesizable, or explode into a huge amount of hardware.
+
+What’s good
+
+    Clear separation of decoder components and a multi‑cycle layer FSM.
+    Type‑level sizes for heads, head dimension, layers, seq len, etc. This is exactly what Clash is great at.
+    Multi‑Query Attention mapping (NumQueryHeads/NumKeyValueHeads) is considered and RoPE is applied per head.
+    KV cache is per layer (good).
+
+Critical issues to fix
+
+    Global state machine is advanced NumLayers times per cycle (fatal)
+
+    In multiCycleTransformer you fold over all layers and each multiCycleTransformerLayer does nextStateSig = fmap advanceState stateSig.
+    Because you feed the newStateSig of layer i into layer i+1, the state advances once per layer, i.e., NumLayers steps every clock.
+    Result: psStage and psLayer will race through stages/layers and your ready flag will be wrong.
+
+Fix
+
+    Compute next state once at the top level, not inside each layer; layers should be pure functions of the current state.
+    Or gate the advancement so only the active layer advances the stage.
+    Also make psTokenReady a 1‑cycle pulse, not a sticky level.
+
+Sketch:
+
+-- top-level controller: advances exactly once per cycle
+nextState :: ProcessingState -> ProcessingState
+nextState st = case psStage st of
+  Cycle1_ReadCache   -> st { psStage = Cycle2_ComputeQKV }
+  Cycle2_ComputeQKV  -> st { psStage = Cycle3_ComputeAttn }
+  Cycle3_ComputeAttn -> st { psStage = Cycle4_WriteCache }
+  Cycle4_WriteCache  -> st { psStage = Cycle5_ComputeFFN }
+  Cycle5_ComputeFFN ->
+    if psLayer st == maxBound
+      then st { psStage = Cycle1_ReadCache
+              , psLayer = 0
+              , psSeqPos = psSeqPos st + 1
+              , psTokenReady = True }
+      else st { psStage = Cycle1_ReadCache
+              , psLayer = psLayer st + 1
+              , psTokenReady = False }
+
+procStateSig = register initialProcessingState (nextState <$> procStateSig)
+
+Then, in the fold over layers, do not change the state; just compute data for the matching layer.
+
+2. KV cache reads/writes misuse blockRam (unsynthesizable/huge resource blow‑up)
+
+    readCachedSequence creates an entire Vec SeqLen (Vec HeadDimension Float) by calling the same RAM function many times in parallel. In Clash this either:
+        infers one RAM per parallel access (duplicating memory massively), or
+        is outright illegal if ports exceed what the primitive supports.
+    writeToCacheSequence similarly issues many writes in one cycle by mapping over HeadDimension; with a single‑port RAM that’s impossible. The “forcedSig” fold doesn’t make these writes legal; there is no “side‑effect forcing” in hardware.
+
+Fix
+
+    Use a true dual‑port RAM (Clash has trueDualPortBlockRam) and schedule accesses over multiple cycles.
+    Provide a small RAM access micro‑FSM that:
+        in Cycle2 writes current K,V one element per cycle (or per a few elements with a wider datapath) at address (layer, headKV, pos, d);
+        in Cycle3 scans t=0..pos (and d=0..HeadDimension-1) to compute the dot products sequentially.
+    API should return one element per cycle, not a whole Vec.
+
+Sketch (single element read/write):
+
+data KvReq = KvReq
+  { rdEn   :: Bool
+  , rdAddr :: CacheAddr
+  , wrEn   :: Bool
+  , wrAddr :: CacheAddr
+  , wrData :: Float }
+
+kvRam :: HiddenClockResetEnable dom
+      => Vec CacheDepth Float
+      -> Signal dom KvReq
+      -> Signal dom Float
+kvRam init req = trueDualPortBlockRam init
+                   (rdAddr <$> req, Nothing) -- port A read-only
+                   (wrAddr <$> req, mux (wrEn <$> req) (Just . (,) <$> wrAddr <*> wrData $ req) (pure Nothing))
+
+Then sequence addressing with counters inside Cycle2/3/4, rather than map over indicesI.
+
+3. You never read the value cache
+
+    readCachedSequence always uses keyCache; cachedValsPerHead calls it too, so you’re reading keys for both K and V.
+
+Fix
+
+    Implement readCachedSequenceKey and readCachedSequenceVal (or parameterize over the RAM function) and use valueCache for values.
+
+4. Wrong stage order; current K,V aren’t included in attention at pos
+
+    C reference computes K,V at pos, writes/uses them immediately, and the attention loop includes t=0..pos (inclusive).
+    Your pipeline: Cycle1 reads cache, Cycle2 computes Q/K/V, Cycle3 computes attention using keysNow/valsNow captured in Cycle1 (so it excludes current K,V), Cycle4 writes the new K,V. That changes the model.
+
+Fix
+
+    Either write K,V before attention and then read them (two-port RAM helps), or feed the just‑computed (K,V) alongside the streamed cache to the attention block and include t=pos there.
+
+5. Causal masking is incorrect
+
+    You “mask” by zeroing K rows for t > pos. That makes q⋅k for those t equal to 0, not −∞, and softmax will allocate probability mass to them.
+    C code softmaxes only 0..pos.
+
+Fix
+
+    Compute attention logits only for t in [0..pos] (sequential scan), then softmax over exactly pos+1 entries.
+    Alternatively, subtract a large constant (e.g. 1e9) from scores with t > pos before softmax.
+
+6. RMSNorm consistency for Q,K,V
+
+    In LLaMA2, Q/K/V are computed from x̂ = rmsnorm(x, rms_att_weight[l]). Your code computes Q/K/V using runSingleHeadQKV headComp input without showing where normalization occurs.
+    If computeMultiHeadAttention expects ready‑made Q and cached K,V, runSingleHeadQKV must internally use the normalized x̂. If the norm is instead inside computeMultiHeadAttention, then you must not precompute Q/K/V here.
+
+Action
+
+    Decide: either
+        pre‑norm before Q/K/V in Cycle2 (and store x̂ if needed by attention path), or
+        move all Q/K/V creation inside computeMultiHeadAttention from x̂ so there’s one source of truth.
+    Whatever you choose, Q and K for a given pos must use the same x̂.
+
+7. Final RMSNorm and classifier
+
+    The C path does: after last layer, rmsnorm(x, rms_final_weight) then logits = x Wcls.
+    You call transformerLogits decoder (idFFNOutput finalData). Ensure transformerLogits includes the final RMSNorm; if not, you’re missing it.
+
+8. Ready/valid protocol
+
+    psTokenReady stays True across many cycles until you clear it later; logitsSig will be recomputed and sampled repeatedly.
+    Emit a 1‑cycle valid pulse; for example, keep a registered copy and detect rising edge, or explicitly set psTokenReady False in the very next Cycle1_ReadCache.
+
+9. Types and indices
+
+    psSeqPos should be Index SeqLen, not Int. That avoids negative checks and spurious fromIntegral and will naturally wrap/saturate as desired.
+    cacheAddr arithmetic is fine, but consider using sized arithmetic (Unsigned) to avoid large fromIntegral chains.
+
+10. Numeric realism
+
+    Using Float throughout with sin/cos/exp/softmax will not synthesize efficiently. For a hardware decoder you’ll want:
+        Fixed‑point or bfloat16 datapath.
+        RoPE via LUT or CORDIC.
+        Softmax via two‑pass streaming log‑sum‑exp or a stable single‑pass approximation.
+        Dot products accumulated sequentially to keep area reasonable.
+    Clash supports Float, but resource usage will be enormous unless you scale model sizes way down.
+
+What to change at a high level
+
+A workable 5‑stage per‑layer micro‑architecture (each stage can itself iterate):
+
+    S1: Pre‑norm and Q/K/V
+        x̂ = RMSNorm_att(x)
+        Q/K/V matmuls for the heads needed at this layer (MQA: compute K,V once per KV head group)
+        Apply RoPE to Q and K at pos
+        Write K,V[pos] to KV RAM
+
+    S2: Score pass (sequential)
+        For each head: stream K[t] for t=0..pos; accumulate s[t] = dot(Q, K[t]) * inv_sqrt_d
+        Track max per head for softmax stability
+
+    S3: Softmax and value pass (sequential)
+        Re‑scan t=0..pos: a[t] = exp(s[t]−max)/sum; accumulate O_head += a[t]*V[t]
+
+    S4: Output projection + residual
+        O = concat_heads(O_head) · Wo
+        x ← x + O
+
+    S5: FFN (pre‑norm + SwiGLU + projection) + residual
+        ŷ = RMSNorm_ffn(x)
+        h1 = SiLU(ŷ·W1); h3 = ŷ·W3; z = (h1 ⊙ h3) · W2
+        x ← x + z
+
+After last layer: x ← RMSNorm_final(x); logits ← x · Wcls
+
+Memory interface sketch (per layer)
+
+    1 true dual‑port KV RAM per layer and KV head:
+        Port A: read stream for attention passes
+        Port B: write K,V at current pos in S1
+    Address is a packed (pos, dim) counter; KV head and layer are statically selected by hierarchy.
+
+Small concrete fixes you can apply now
+
+    Fix cached values read:
+
+readCachedSequenceKV :: AttentionCache dom -> ... -> Signal dom (Vec SeqLen (Vec HeadDimension Float))
+readCachedSequenceKV cache layerIdx headIdx seqPosSig =
+  -- as now, but parameterize RAM function
+  ...
+cachedKeysPerHead = map (\h -> readCachedSequenceKey cache layerIdx h (psSeqPos <$> stateSig)) indicesI
+cachedValsPerHead = map (\h -> readCachedSequenceVal cache layerIdx h (psSeqPos <$> stateSig)) indicesI
+
+    Stop advancing state in multiCycleTransformerLayer. Make it pure:
+
+multiCycleTransformerLayer ... stateSig dataSig =
+  (stateSig, nextDataSig)  -- do not modify stateSig here
+
+    Make psSeqPos an Index SeqLen and psTokenReady a pulse:
+
+data ProcessingState = ProcessingState
+  { psStage :: CycleStage
+  , psLayer :: Index NumLayers
+  , psSeqPos :: Index SeqLen
+  , psTokenReady :: Bool
+  }
+
+validSig = psTokenReady <$> procStateSig
+validPulse = validSig .&&. (not <$> register False validSig)
+
+    Change masking: don’t zero K; limit the loops in computeMultiHeadAttention to 0..pos.
+
+    Replace Int with Unsigned/Natural where appropriate; avoid fromIntegral chains in cacheAddr.
+
+    Remove “forcedSig” tricks. They don’t impose evaluation order in hardware; schedule via counters and registers.
+
+Bottom line
+
+    Functionally, you’re close in spirit to the C reference (QKV, RoPE, MQA, attention, FFN), but the ordering, masking, and normalization need to be made identical.
+    Architecturally, you must rework the KV RAM access around a sequential datapath (one or two values per cycle) and fix the single‑update controller, otherwise the design will either be incorrect or will infer an impractical number of memories.
+    With those changes, plus numeric pragmatism (fixed/bfloat16, LUT RoPE, streaming softmax), this can become a sound Clash decoder. If you share the Helpers module signatures, I can propose concrete, type‑checked replacements for the RAM interface, the controller, and the S2/S3 streaming attention loops.
