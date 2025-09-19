@@ -20,7 +20,7 @@ import Data.Maybe (fromMaybe)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import GHC.Unicode (isSpace)
 import System.IO (hFlush, stdout)
-import Control.Monad (replicateM, replicateM_)
+import Control.Monad (replicateM, replicateM_, unless)
 import Text.Printf (printf)
 
 import Helpers
@@ -339,27 +339,25 @@ generateTokensSimAutoregressive decoder vocab nSteps promptTokens temperature se
   putStr "Generated: "
   hFlush stdout
 
-  let go step acc
-        | step >= totalSteps = return (drop promptLen acc)
-        | otherwise = do
-            let seqPos    = step
-                inputToken | step < promptLen = promptTokens !! step
-                           | otherwise        = last acc
-                rngSeed    = seed + step
-                bundledIn  = (seqPos, inputToken, temperature, rngSeed)
-
-            -- run circuit repeatedly until tokenReady == True
-            let
-              outputs = CS.simulate (bundledOutputs decoder) (repeat bundledIn)
+  let
+    go step acc
+      | step >= totalSteps = return (drop promptLen acc)
+      | otherwise = do
+          let seqPos = step
+              inputToken | step < promptLen = promptTokens !! step
+                        | otherwise = last acc
+              rngSeed = seed + step
+              bundledIn = (seqPos, inputToken, temperature, rngSeed)
+          putStrLn $ "Step " ++ show step ++ ": seqPos=" ++ show seqPos ++ ", inputToken=" ++ show inputToken ++ ", rngSeed=" ++ show rngSeed
+          let outputs = CS.simulate (bundledOutputs decoder) (repeat bundledIn)
               (outToken, readyFlags) = unzip outputs
               readyIdx = fromMaybe 0 $ findIndex id readyFlags
               tokenProduced = outToken !! readyIdx
-
-            when (step >= promptLen) $ do
-              putStr (show tokenProduced ++ " ")
-              hFlush stdout
-
-            go (step+1) (acc ++ [tokenProduced])
+          putStrLn $ "Output token: " ++ show tokenProduced ++ ", readyIdx: " ++ show readyIdx
+          when (step >= promptLen) $ do
+            putStr (show tokenProduced ++ " ")
+            hFlush stdout
+          go (step+1) (acc ++ [tokenProduced])
 
   generated <- go 0 promptTokens
   putStrLn ""

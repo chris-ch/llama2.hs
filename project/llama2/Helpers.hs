@@ -62,10 +62,10 @@ seqLen = natToNum @SeqLen
 type ModelDim = 288
 type HiddenDim = 768
 type NumLayers = 6
-type NumAttentionHeads = 6
+type NumQueryHeads = 6
 type NumKeyValueHeads = 6
 type HeadDimension  = 48
-type FreqDim = 16
+type FreqDim = 24
 type VocabSize = 32000 :: Nat
 vocabSize :: Int
 vocabSize = natToNum @VocabSize
@@ -73,13 +73,12 @@ type SeqLen         = 256
 seqLen :: Int
 seqLen = natToNum @SeqLen
  -}
-
 {-
 -- model config 110M
 type ModelDim = 768
 type HiddenDim = 2048
 type NumLayers = 12
-type NumAttentionHeads = 12
+type NumQueryHeads = 12
 type NumKeyValueHeads = 12
 type HeadDimension  = 64
 type FreqDim = 32
@@ -97,8 +96,9 @@ seqLen = natToNum @SeqLen
 modelDim 512
 hiddenDim 1376
 numLayers 8
-numAttentionHeads 8
+NumQueryHeads 8
 headDimension 64
+FreqDim 32
 numKeyValueHeads 8
 vocabSize 32000
 seqLen 1024
