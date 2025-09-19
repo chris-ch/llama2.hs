@@ -271,7 +271,7 @@ parseModelConfigFile = do
   wq' <- readVec4D @NumLayers @NumQueryHeads @HeadDimension @ModelDim
   wk' <- readVec4D @NumLayers @NumKeyValueHeads @HeadDimension @ModelDim
   wv' <- readVec4D @NumLayers @NumKeyValueHeads @HeadDimension @ModelDim
-  wo' <- readVec4D @NumLayers @NumQueryHeads @ModelDim @HeadDimension
+  wo' <- readVec3D @NumLayers @ModelDim @ModelDim
   rmsFfnWeight' <- readVec2D @NumLayers @ModelDim
   w1' <- readVec3D @NumLayers @HiddenDim @ModelDim
   w2' <- readVec3D @NumLayers @ModelDim @HiddenDim
@@ -305,11 +305,22 @@ parseModelConfigFile = do
                    , freqSin = CArray2D freqCisImag'
                    }
                }
+        woLayer :: C.Vec ModelDim (C.Vec ModelDim Float)
+        woLayer = wo' C.!! lIdx
+        headBlock :: C.Index NumQueryHeads -> CArray2D ModelDim HeadDimension
+        headBlock hIdx =
+          let base :: Int
+              base = fromIntegral hIdx * C.snatToNum (C.SNat @HeadDimension)
+              -- for each output row (0..modelDim-1), pick the headDim columns:
+              rowSlice :: C.Vec ModelDim Float -> C.Vec HeadDimension Float
+              rowSlice row =
+                C.map
+                  (\off -> row C.!! (toEnum (base + fromIntegral off) :: C.Index ModelDim))
+                  (C.indicesI @HeadDimension)
+          in CArray2D (C.map rowSlice woLayer)
 
         mWoVec :: C.Vec NumQueryHeads (CArray2D ModelDim HeadDimension)
-        mWoVec = C.map
-            (\hIdx -> CArray2D $ (wo' C.!! lIdx) C.!! hIdx)
-            (C.indicesI @NumQueryHeads)
+        mWoVec = C.map headBlock (C.indicesI @NumQueryHeads)
 
       in TransformerLayerComponent
            { multiHeadAttention = MultiHeadAttentionComponent

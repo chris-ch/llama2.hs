@@ -114,8 +114,11 @@ streamHeadAttention cache l h startSig posSig qSig curKSig curVSig =
       (mux isLastD (pure 0) partialDot)
       dotAcc
 
+  invSqrtHd :: Float
+  invSqrtHd = 1.0 / sqrt (snatToNum (SNat @HeadDimension) :: Float)
+
   dotBoundary = (&&) <$> isDot <*> isLastD
-  scoreThisT  = regEn 0 dotBoundary partialDot
+  scoreThisT  = regEn 0 dotBoundary (partialDot * pure invSqrtHd)
 
   -- online softmax accumulators
   mAcc   = regEn (- (1 / 0)) en mNext
@@ -449,7 +452,7 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
           then cur { idAttnOutput = attOut }
           else cur)
       stateSig dataSig attnOutSig attnDoneThisLayerSig
-  
+
   -- Cycle1 no-op; QKV/FFN unchanged;
   baseNextDataSig :: Signal dom IntermediateData
   baseNextDataSig = liftA2 processCycle stateSig dataSig
