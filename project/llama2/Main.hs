@@ -357,8 +357,6 @@ generateTokensSimAutoregressive
   -> Seed
   -> IO ([Token], StepCount)
 generateTokensSimAutoregressive decoder vocab nSteps promptTokens temperature seed = do
-  let promptLen   = length promptTokens
-      totalWanted = promptLen + fromIntegral nSteps
 
   putStrLn $ "✅ Prompt: " ++ show promptTokens
   putStr "<s>\n"
@@ -396,28 +394,35 @@ generateTokensSimAutoregressive decoder vocab nSteps promptTokens temperature se
                            []      -> drive o  []    rs os
           drive cur _ _ _ = repeat cur  -- totality guard
 
-      -- Tokens sampled at ready pulses (includes prompt-forced outputs first)
+      -- Tokens produced by the DUT at ready pulses
       sampledAll :: [Token]
       sampledAll = [ t | (t,r) <- outputs, r ]
 
-      -- Limit to the tokens we actually want to print/return
-      sampledLimited :: [Token]
-      sampledLimited = take totalWanted sampledAll
+  -- What we actually want to EMIT to match the C/pure harness:
+  -- while consuming the prompt, emit the prompt’s next tokens;
+  -- afterwards, emit the model samples.
+  let promptTail     = drop 1 promptTokens              -- tokens we "print" during prompt forcing
+      nPromptToEmit  = length promptTail
+      emittedAll     = take nPromptToEmit promptTail
+                    ++ drop nPromptToEmit sampledAll
 
-      -- For printing, we need prev token context; start with BOS (1)
+      -- limit to what we actually want to show/return
+      totalWanted    = nPromptToEmit + fromIntegral nSteps
+      emittedLimited = take totalWanted emittedAll
+
       prevs :: [Token]
-      prevs = 1 : sampledLimited
+      prevs = 1 : emittedLimited
 
       pairs :: [(Token, Token)]
-      pairs = zip prevs sampledLimited
+      pairs = zip prevs emittedLimited
 
-  -- Print each produced token's piece using the pure decoder rule
+  -- Print the emitted tokens (not the raw samples during the prompt phase)
   mapM_ (\(prev,tok) -> BSC.putStr (decodePieceHS vocab prev tok) >> hFlush stdout) pairs
   putStrLn ""
 
-  -- Return only the generated tokens (drop the prompt-length prefix)
-  let generated = take (fromIntegral nSteps) (drop promptLen sampledLimited)
-  pure (generated, StepCount nSteps)
+  -- Only generated tokens (exclude the prompt’s tail)
+  let generated = drop nPromptToEmit emittedLimited
+  pure (take (fromIntegral nSteps) generated, StepCount nSteps)
 
 bundledOutputs :: TransformerDecoderComponent -> CS.Signal CS.System (Token, Temperature, Seed) -> CS.Signal C.System (Token, Bool)
 bundledOutputs decoder = CS.bundle . CS.exposeClockResetEnable
