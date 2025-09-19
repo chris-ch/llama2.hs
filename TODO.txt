@@ -34,90 +34,58 @@ What’s good
 
 Critical issues to fix
 
-    Global state machine is advanced NumLayers times per cycle (fatal)
+2. KV cache RAM usage
 
-    In multiCycleTransformer you fold over all layers and each multiCycleTransformerLayer does nextStateSig = fmap advanceState stateSig.
-    Because you feed the newStateSig of layer i into layer i+1, the state advances once per layer, i.e., NumLayers steps every clock.
-    Result: psStage and psLayer will race through stages/layers and your ready flag will be wrong.
+You instantiate and access the same RAM many times in parallel:
+In Cycle3 you create one streamHeadAttention per query head, all calling cache.keyCache/valueCache in parallel.
+In Cycle4 you call writeToCacheSequence once per KV head, all in parallel. In Clash, every application of blockRam
+ creates a new physical RAM. You’ve accidentally duplicated the memory NumQueryHeads (read) + NumKeyValueHeads (write) times.
+  Also, a single-ported blockRam can’t serve multiple simultaneous readers/writers.
 
-Fix
+What to change
 
-    Compute next state once at the top level, not inside each layer; layers should be pure functions of the current state.
-    Or gate the advancement so only the active layer advances the stage.
-    Also make psTokenReady a 1‑cycle pulse, not a sticky level.
+Bank the memory by KV head and use trueDualPortBlockRam
 
-Then, in the fold over layers, do not change the state; just compute data for the matching layer.
+    One K RAM and one V RAM per KV head (so NumKeyValueHeads banks). Use trueDualPortBlockRam for each bank to allow up to 2 concurrent read streams per bank. With your config (NumQueryHeads / NumKeyValueHeads = 2), two Q heads share one KV bank, which fits 2 ports.
+    Only one writer per bank in Cycle4 (which you already have), using either port A or B while the other port services reads (or do writes in Cycle4 when Cycle3 is idle).
 
-2. KV cache reads/writes misuse blockRam (unsynthesizable/huge resource blow‑up)
+Sketch (per layer, per KV head)
 
-    readCachedSequence creates an entire Vec SeqLen (Vec HeadDimension Float) by calling the same RAM function many times in parallel. In Clash this either:
-        infers one RAM per parallel access (duplicating memory massively), or
-        is outright illegal if ports exceed what the primitive supports.
-    writeToCacheSequence similarly issues many writes in one cycle by mapping over HeadDimension; with a single‑port RAM that’s impossible. The “forcedSig” fold doesn’t make these writes legal; there is no “side‑effect forcing” in hardware.
+haskell
+-- depth per bank: SeqLen * HeadDimension
+type BankDepth = SeqLen * HeadDimension
+type BankAddr  = Index BankDepth
 
-Fix
+bankAddr :: Index SeqLen -> Index HeadDimension -> BankAddr
+bankAddr s d = toEnum (fromIntegral d + fromIntegral s * natToNum @HeadDimension)
 
-    Use a true dual‑port RAM (Clash has trueDualPortBlockRam) and schedule accesses over multiple cycles.
-    Provide a small RAM access micro‑FSM that:
-        in Cycle2 writes current K,V one element per cycle (or per a few elements with a wider datapath) at address (layer, headKV, pos, d);
-        in Cycle3 scans t=0..pos (and d=0..HeadDimension-1) to compute the dot products sequentially.
-    API should return one element per cycle, not a whole Vec.
+data KvBank dom = KvBank
+{ kAB :: ( Signal dom BankAddr, Signal dom (Maybe (BankAddr, Float))  -- Port A
+, Signal dom BankAddr, Signal dom (Maybe (BankAddr, Float))  -- Port B
+, Signal dom Float,    Signal dom Float)                      -- (qA, qB)
+, vAB :: ( Signal dom BankAddr, Signal dom (Maybe (BankAddr, Float))
+, Signal dom BankAddr, Signal dom (Maybe (BankAddr, Float))
+, Signal dom Float,    Signal dom Float)
+}
 
-Then sequence addressing with counters inside Cycle2/3/4, rather than map over indicesI.
+mkKvBank
+:: HiddenClockResetEnable dom
+=> KvBank dom
+mkKvBank =
+let (ka, kb) = trueDualPortBlockRam (replicate (SNat @BankDepth) 0)
+(va, vb) = trueDualPortBlockRam (replicate (SNat @BankDepth) 0)
+in KvBank
+{ kAB = ka
+, vAB = va
+}
 
-3. You never read the value cache
+-- Then make: Vec NumKeyValueHeads (KvBank dom) per layer.
+-- Route exactly two streamHeadAttention readers sharing a KV head to (kAB PortA/PortB).
+-- Route the Cycle4 writer for that KV head to either port during the write stage.
 
-    readCachedSequence always uses keyCache; cachedValsPerHead calls it too, so you’re reading keys for both K and V.
-
-Fix
-
-    Implement readCachedSequenceKey and readCachedSequenceVal (or parameterize over the RAM function) and use valueCache for values.
-
-4. Wrong stage order; current K,V aren’t included in attention at pos
-
-    C reference computes K,V at pos, writes/uses them immediately, and the attention loop includes t=0..pos (inclusive).
-    Your pipeline: Cycle1 reads cache, Cycle2 computes Q/K/V, Cycle3 computes attention using keysNow/valsNow captured in Cycle1 (so it excludes current K,V), Cycle4 writes the new K,V. That changes the model.
-
-Fix
-
-    Either write K,V before attention and then read them (two-port RAM helps), or feed the just‑computed (K,V) alongside the streamed cache to the attention block and include t=pos there.
-
-5. Causal masking is incorrect
-
-    You “mask” by zeroing K rows for t > pos. That makes q⋅k for those t equal to 0, not −∞, and softmax will allocate probability mass to them.
-    C code softmaxes only 0..pos.
-
-Fix
-
-    Compute attention logits only for t in [0..pos] (sequential scan), then softmax over exactly pos+1 entries.
-    Alternatively, subtract a large constant (e.g. 1e9) from scores with t > pos before softmax.
-
-6. RMSNorm consistency for Q,K,V
-
-    In LLaMA2, Q/K/V are computed from x̂ = rmsnorm(x, rms_att_weight[l]). Your code computes Q/K/V using runSingleHeadQKV headComp input without showing where normalization occurs.
-    If computeMultiHeadAttention expects ready‑made Q and cached K,V, runSingleHeadQKV must internally use the normalized x̂. If the norm is instead inside computeMultiHeadAttention, then you must not precompute Q/K/V here.
-
-Action
-
-    Decide: either
-        pre‑norm before Q/K/V in Cycle2 (and store x̂ if needed by attention path), or
-        move all Q/K/V creation inside computeMultiHeadAttention from x̂ so there’s one source of truth.
-    Whatever you choose, Q and K for a given pos must use the same x̂.
-
-7. Final RMSNorm and classifier
-
-    The C path does: after last layer, rmsnorm(x, rms_final_weight) then logits = x Wcls.
-    You call transformerLogits decoder (idFFNOutput finalData). Ensure transformerLogits includes the final RMSNorm; if not, you’re missing it.
-
-8. Ready/valid protocol
-
-    psTokenReady stays True across many cycles until you clear it later; logitsSig will be recomputed and sampled repeatedly.
-    Emit a 1‑cycle valid pulse; for example, keep a registered copy and detect rising edge, or explicitly set psTokenReady False in the very next Cycle1_ReadCache.
-
-9. Types and indices
-
-    psSeqPos should be Index SeqLen, not Int. That avoids negative checks and spurious fromIntegral and will naturally wrap/saturate as desired.
-    cacheAddr arithmetic is fine, but consider using sized arithmetic (Unsigned) to avoid large fromIntegral chains.
+And change AttentionCache to carry Vec NumKeyValueHeads of banks (not a single function). streamHeadAttention 
+must select its bank by kvIdx and take one of the two ports. writeToCacheSequence must select the same 
+bank and the other port during Cycle4.
 
 10. Numeric realism
 

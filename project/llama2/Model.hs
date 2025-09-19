@@ -522,11 +522,20 @@ multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
   -- Intermediate data register
   currentDataSig = register initialIntermediateData nextDataSig
 
-  -- Load input at token start
-  inputLoadedSig = liftA3 (\st cur inp ->
-                      if psStage st == Cycle1_ReadCache && psLayer st == 0
-                        then cur { idInputVec = inp } else cur)
-                    procStateSig currentDataSig inputVecSig
+  -- Load the layer input at Cycle1:
+  -- - layer 0 gets the token embedding
+  -- - layers >0 get the previous layer's FFN output
+  inputLoadedSig =
+    liftA3
+      (\st cur inp ->
+         if psStage st == Cycle1_ReadCache
+           then if psLayer st == 0
+                  -- layer 0: use embedding
+                  then cur { idInputVec = inp }
+                  -- layer >0: feed forward previous layer's output
+                  else cur { idInputVec = idFFNOutput cur }
+           else cur)
+      procStateSig currentDataSig inputVecSig
 
   -- Run layers; gather per-stage done pulses
   foldStep
@@ -555,7 +564,7 @@ multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
 
   (nextDataSig, writeDoneVec, attnDoneVec) =
     foldl foldStep (inputLoadedSig, repeat (pure False), repeat (pure False))
-                  (zip3 layers caches indicesI)
+                   (zip3 layers caches indicesI)
 
   writeDoneAny = fmap or (sequenceA writeDoneVec)
   attnDoneAny  = fmap or (sequenceA attnDoneVec)
