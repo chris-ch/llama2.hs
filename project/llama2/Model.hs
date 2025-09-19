@@ -10,7 +10,7 @@ import Helpers
   , MultiHeadAttentionComponent(..), EmbeddingComponent (..)
   , runSingleHeadQKV, applyRotaryToHead, StepCount (..)
   , computeFeedForward, transformerLogits, argMax, embed
-  , sampleFromProbs, computeMultiHeadAttention, seqLen, liftA4, liftA5, rmsNorm, softmax
+  , sampleFromProbs, computeMultiHeadAttention, seqLen, liftA4, liftA5, rmsNorm, softmax, matrixVectorMult
   )
 import GHC.Stack (HasCallStack)
 
@@ -487,6 +487,52 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
   -- Attention micro-FSM
   (_tCnt, _attBusy, attnDoneThisLayerSig) = cycle3AttnMicro attStart posSig
 
+  -- Streaming attention, one instance per query head
+  -- kvIdx = qIdx `div` headsPerGroup
+  headsPerGroupI :: Int
+  headsPerGroupI = natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads
+
+  kvIdxOf :: Index NumQueryHeads -> Index NumKeyValueHeads
+  kvIdxOf q =
+    let qi  = fromEnum q
+        idx = qi `P.div` headsPerGroupI
+        hi  = natToNum @NumKeyValueHeads - 1
+    in toEnum (max 0 (min hi idx))
+
+  -- For each query head:
+  --   start = attStart
+  --   pos   = psSeqPos
+  --   q     = (idQueries <$> dataSig) !! qIdx
+  --   curK  = (idKeys    <$> dataSig) !! kvIdx
+  --   curV  = (idValues  <$> dataSig) !! kvIdx
+  headsOutSigsVec :: Vec NumQueryHeads (Signal dom (Vec HeadDimension Float))
+  headsOutSigsVec =
+    imap
+      (\qIdx _ ->
+         let kvIx  = kvIdxOf qIdx
+             qS    = (!! qIdx) <$> (idQueries <$> dataSig)
+             curKS = (!! kvIx) <$> (idKeys    <$> dataSig)
+             curVS = (!! kvIx) <$> (idValues  <$> dataSig)
+             (headOut, _busyH, _doneH) =
+               streamHeadAttention cache layerIdx kvIx attStart posSig qS curKS curVS
+         in headOut
+      )
+      indicesI
+
+  -- Project each head with its W_O, sum across heads, and add residual x
+  perHeadProjectedSigs :: Vec NumQueryHeads (Signal dom (Vec ModelDim Float))
+  perHeadProjectedSigs =
+    imap (\qIdx hOutS -> matrixVectorMult (mWo mha !! qIdx) <$> hOutS) headsOutSigsVec
+
+  attnOutSig :: Signal dom (Vec ModelDim Float)
+  attnOutSig =
+    liftA2
+      (\x perHeadVecs ->
+         let woSum = foldl1 (zipWith (+)) perHeadVecs
+         in zipWith (+) x woSum)
+      (idInputVec <$> dataSig)
+      (sequenceA perHeadProjectedSigs)
+
   -- Writes to KV cache (unchanged)
   writeEnableSig = wrStart
   kvAllHeadsSig  = liftA2 (zipWith (,)) (idKeys <$> dataSig) (idValues <$> dataSig)
@@ -500,20 +546,6 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
   writeDoneThisLayerSig = (\st d -> psStage st == Cycle4_WriteCache && psLayer st == layerIdx && d)
                           <$> stateSig <*> fmap and (sequenceA writeDonePerHead)
 
-  -- Build attnOutSig once; commit is gated by attnDone pulse
-  attnOutSig :: Signal dom (Vec ModelDim Float)
-  attnOutSig =
-    liftA5
-      (\st inp qs kbuf vbuf ->
-         let posIdx = psSeqPos st
-             curK   = idKeys inp
-             curV   = idValues inp
-             keysForAttn = imap (\h kCache -> replace posIdx (curK !! h) kCache) kbuf
-             valsForAttn = imap (\h vCache -> replace posIdx (curV !! h) vCache) vbuf
-         in computeMultiHeadAttention (multiHeadAttention layer)
-                                      (idInputVec inp) qs keysForAttn valsForAttn posIdx)
-      stateSig dataSig (idQueries <$> dataSig) cachedKeysSig cachedValsSig
-
   commitCycle3 :: Signal dom IntermediateData
   commitCycle3 =
     liftA4
@@ -525,14 +557,26 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
 
   -- Compute body: no combinational write in Cycle3
   baseNextDataSig = liftA4 processCycle stateSig dataSig cachedKeysSig cachedValsSig
-  nextDataSig     = baseNextDataSig
+
+  -- Commit streaming attention result on the layer's attn done pulse
+  nextDataSig =
+    liftA4
+      (\st cur attOut done ->
+         if psLayer st == layerIdx && psStage st == Cycle3_ComputeAttn && done
+           then cur { idAttnOutput = attOut }
+           else cur)
+      stateSig baseNextDataSig attnOutSig attnDoneThisLayerSig
 
   processCycle st idata keysNow valsNow
     | psLayer st /= layerIdx = idata
     | otherwise =
         case psStage st of
-          Cycle1_ReadCache -> idata { idCachedKeys = keysNow, idCachedVals = valsNow }
+          Cycle1_ReadCache -> idata
+                                { idCachedKeys = keysNow
+                                , idCachedVals = valsNow
+                                }
           Cycle2_ComputeQKV ->
+            -- (unchanged) produce queries/keys/values with pre-norm and RoPE
             let
               xHat = rmsNorm (idInputVec idata) (rmsAtt mha)
               queries = imap (\hIdx _ ->
@@ -542,14 +586,17 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
                                     (StepCount $ fromIntegral $ psSeqPos st)
                                     (q, repeat 0)
                 in q_rot) indicesI
-              headsPerGroupI = natToNum @NumQueryHeads `div` natToNum @NumKeyValueHeads
+              headsPerGroupI' :: Int
+              headsPerGroupI' = natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads
               toIndexClamped :: forall n. KnownNat n => Int -> Index n
               toIndexClamped i =
-                let hi = natToNum @n - 1; j = max 0 (min hi i) in toEnum j
+                let hi = natToNum @n - 1
+                    j  = max 0 (min hi i)
+                in toEnum j
               keysAndValues =
                 imap (\hIdx _ ->
                   let qIdx :: Index NumQueryHeads
-                      qIdx = toIndexClamped @NumQueryHeads (fromEnum hIdx * headsPerGroupI)
+                      qIdx = toIndexClamped @NumQueryHeads (fromEnum hIdx * headsPerGroupI')
                       headComp = heads mha !! qIdx
                       (_, k, v) = runSingleHeadQKV headComp xHat
                       (_, k_rot) = applyRotaryToHead headComp
@@ -558,9 +605,13 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
                   in (k_rot, v)) indicesI
               (keys, values) = unzip keysAndValues
             in idata { idQueries = queries, idKeys = keys, idValues = values }
-          Cycle3_ComputeAttn -> idata               -- no write; commit happens via commitCycle3
-          Cycle4_WriteCache  -> idata
-          Cycle5_ComputeFFN  ->
+
+          Cycle3_ComputeAttn ->
+            -- streaming attention is computed outside and committed on attnDone
+            idata
+
+          Cycle4_WriteCache -> idata
+          Cycle5_ComputeFFN ->
             let ffnOut = computeFeedForward ffn (idAttnOutput idata)
             in idata { idFFNOutput = ffnOut }
 
