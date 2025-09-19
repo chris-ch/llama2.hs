@@ -151,11 +151,11 @@ readCachedSequenceWith ram l h posSig = bufSig
     -> Signal dom (Vec SeqLen (Vec HeadDimension Float))
   bufNext bufS =
     liftA5
-      (\buf tPrev dPrev posPrev q ->
-         -- causal masking: keep only t < posPrev, else write 0
-         let val     = if (fromIntegral tPrev :: Int) < posPrev then q else 0
-             oldRow  = buf !! tPrev
-             newRow  = replace dPrev val oldRow
+      (\buf tPrev dPrev _ q ->
+        -- Do not mask here. Keep the cache values as-is; apply causal mask at logits.
+        let
+          oldRow  = buf !! tPrev
+          newRow  = replace dPrev q oldRow
          in replace tPrev newRow buf)
       bufS tPrevSig dPrevSig posPrevSig qSig
 
@@ -278,7 +278,7 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
 
   -- Per-head KV signals and write effects, sequenced so they are kept alive
   kvAllHeadsSig :: Signal dom (Vec NumKeyValueHeads (Vec HeadDimension Float, Vec HeadDimension Float))
-  kvAllHeadsSig = liftA2 (zipWith (\k v -> (k, v))) (idKeys <$> dataSig) (idValues <$> dataSig)
+  kvAllHeadsSig = liftA2 (zipWith (,)) (idKeys <$> dataSig) (idValues <$> dataSig)
 
   writeOps :: Vec NumKeyValueHeads (Signal dom ())
   writeOps =
@@ -288,7 +288,7 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
              (((!!) <$> kvAllHeadsSig) <*> pure hIdx)
              writeEnableSig)
         indicesI
-        
+
   writeOpsSig :: Signal dom ()
   writeOpsSig = () <$ sequenceA writeOps
 
@@ -314,7 +314,7 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
           idata { idCachedKeys = keysNow, idCachedVals = valsNow }
         Cycle2_ComputeQKV ->
             -- Compute keys and values for NumKeyValueHeads
-            let 
+            let
               input = idInputVec idata
               -- Compute queries for all NumQueryHeads
               queries = imap (\hIdx _ ->
@@ -372,6 +372,7 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
                         (idQueries idata)
                         keysForAttn
                         valsForAttn
+                        (psSeqPos state)
           in idata { idAttnOutput = attnOut }
         Cycle5_ComputeFFN ->
           let ffnOut = computeFeedForward ffn (idAttnOutput idata)

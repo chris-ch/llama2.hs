@@ -325,40 +325,61 @@ computeMultiHeadAttention
   -> Vec NumQueryHeads (Vec HeadDimension Float)
   -> Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
   -> Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
+  -> Int
   -> Vec ModelDim Float
-computeMultiHeadAttention mha input queries keysPerHead valuesPerHead =
+computeMultiHeadAttention mha input queries keysPerHead valuesPerHead posIn =
   let
+    -- helpers
+    clamp :: Int -> Int -> Int -> Int
+    clamp lo hi x = max lo (min hi x)
+
+    posClamped :: Int
+    posClamped = clamp 0 (natToNum @SeqLen - 1) posIn
+
+    big :: Float
+    big = 1.0e9
+
     -- Compute the number of query heads per key/value head
     headsPerGroup :: Int
     headsPerGroup = natToNum @NumQueryHeads `div` natToNum @NumKeyValueHeads
 
     -- Map each query head to its corresponding key/value head
     getKVIndex :: Index NumQueryHeads -> Index NumKeyValueHeads
-    getKVIndex qIdx = fromIntegral (fromIntegral qIdx `div` headsPerGroup :: Int)
+    getKVIndex qIdx =
+      let qi  = fromEnum qIdx
+          idx = qi `div` headsPerGroup
+          hi  = natToNum @NumKeyValueHeads - 1
+      in toEnum (clamp 0 hi idx)
 
-    -- Compute per-head outputs (HeadDimension each)
+    -- Mask scores: keep t <= pos, push t > pos to ~-Inf
+    maskScores :: forall n. KnownNat n => Int -> Vec n Float -> Vec n Float
+    maskScores p = imap (\t s -> if fromEnum t <= p then s else s - big)
+
+    -- Per-head outputs (HeadDimension each)
     headOutputs :: Vec NumQueryHeads (Vec HeadDimension Float)
     headOutputs = imap
-        (\qIdx q ->
-           let kvIdx = getKVIndex qIdx
-               ks = keysPerHead !! kvIdx
-               vs = valuesPerHead !! kvIdx
-               scores = computeAttentionScores q ks
-               weights = computeAttentionWeights scores
-           in computeAttentionOutput weights vs)
-        queries
+      (\qIdx q ->
+         let kvIdx   = getKVIndex qIdx
+             ks      = keysPerHead   !! kvIdx     -- Vec SeqLen (Vec HeadDimension Float)
+             vs      = valuesPerHead !! kvIdx     -- Vec SeqLen (Vec HeadDimension Float)
+             scores  = computeAttentionScores q ks            -- Vec SeqLen Float
+             weights = computeAttentionWeights (maskScores posClamped scores) -- Vec SeqLen Float
+         in computeAttentionOutput weights vs)                 -- Vec HeadDimension Float
+      queries
 
     -- Project each head’s output via its own W_O
     perHeadProjected :: Vec NumQueryHeads (Vec ModelDim Float)
     perHeadProjected = zipWith matrixVectorMult (mWo mha) headOutputs
 
-    -- Sum across heads (elementwise sum across ModelDim)
+    -- Sum across heads (elementwise over ModelDim)
     summedOutput :: Vec ModelDim Float
     summedOutput = foldl1 (zipWith (+)) perHeadProjected
 
-    -- Residual connection
+    -- Residual connection with pre-attention RMSNorm
+    normalizedInput :: Vec ModelDim Float
     normalizedInput = rmsNorm input (rmsAtt mha)
-  in zipWith (+) normalizedInput summedOutput
+  in
+    zipWith (+) normalizedInput summedOutput
 
 -- Pure feed-forward computation
 computeFeedForward
