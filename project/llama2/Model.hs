@@ -398,7 +398,7 @@ multiCycleTransformer
   -> Signal dom Int
   -> (Signal dom Token, Signal dom Bool)
 multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
-  (outputTokenSig, readyFlagSig)
+  (outputTokenSig, readyPulse)
  where
   embedding = modelEmbedding decoder
   layers    = modelLayers decoder
@@ -426,20 +426,38 @@ multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
       ((), inputLoadedSig)
       (zip3 layers caches indicesI)
 
-  -- Use the single advanced state (procStateSig -> nextState step) for outputs
-  nextStateSig = nextState <$> procStateSig
+  -- final-stage detect (last layer, FFN stage)
+  isFinalStage :: ProcessingState -> Bool
+  isFinalStage st = psStage st == Cycle5_ComputeFFN && psLayer st == maxBound
 
-  logitsSig = liftA2 (\state finalData ->
-    if psTokenReady state
-    then transformerLogits decoder (idFFNOutput finalData)
-    else repeat 0 ) nextStateSig nextDataSig
+  readyNow :: Signal dom Bool
+  readyNow = isFinalStage <$> procStateSig
 
+  -- 1-cycle pulse on rising edge of readyNow
+  readyPrev :: Signal dom Bool
+  readyPrev = register False readyNow
+
+  readyPulse :: Signal dom Bool
+  readyPulse = liftA2 (\now prev -> now && not prev) readyNow readyPrev
+
+  -- Compute logits from the current FFN output; latch on readyPulse
+  logitsRawSig :: Signal dom (Vec VocabSize Float)
+  logitsRawSig = transformerLogits decoder . idFFNOutput <$> nextDataSig
+
+  latchedLogitsSig :: Signal dom (Vec VocabSize Float)
+  latchedLogitsSig = regEn (repeat 0) readyPulse logitsRawSig
+
+  -- Sample exactly once per pulse; hold token stable between pulses
+  pickToken :: Vec VocabSize Float -> Float -> Int -> Token
   pickToken probs temp seed
     | temp == 0.0 = argMax probs
     | otherwise   = drawSample seed (map (/ temp) probs)
 
-  readyFlagSig = psTokenReady <$> nextStateSig
-  outputTokenSig = pickToken <$> logitsSig <*> temperatureSig <*> seedSig
+  sampledTokenNow :: Signal dom Token
+  sampledTokenNow = pickToken <$> latchedLogitsSig <*> temperatureSig <*> seedSig
+
+  outputTokenSig :: Signal dom Token
+  outputTokenSig = regEn (0 :: Token) readyPulse sampledTokenNow
 
 -- ============================================================================
 -- Top Entity
