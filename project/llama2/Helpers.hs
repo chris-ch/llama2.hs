@@ -325,16 +325,13 @@ computeMultiHeadAttention
   -> Vec NumQueryHeads (Vec HeadDimension Float)
   -> Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
   -> Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
-  -> Int
+  -> Index SeqLen
   -> Vec ModelDim Float
 computeMultiHeadAttention mha input queries keysPerHead valuesPerHead posIn =
   let
     -- helpers
     clamp :: Int -> Int -> Int -> Int
     clamp lo hi x = max lo (min hi x)
-
-    posClamped :: Int
-    posClamped = clamp 0 (natToNum @SeqLen - 1) posIn
 
     big :: Float
     big = 1.0e9
@@ -352,8 +349,8 @@ computeMultiHeadAttention mha input queries keysPerHead valuesPerHead posIn =
       in toEnum (clamp 0 hi idx)
 
     -- Mask scores: keep t <= pos, push t > pos to ~-Inf
-    maskScores :: forall n. KnownNat n => Int -> Vec n Float -> Vec n Float
-    maskScores p = imap (\t s -> if fromEnum t <= p then s else s - big)
+    maskScores :: forall n. KnownNat n => Index SeqLen -> Vec n Float -> Vec n Float
+    maskScores p = imap (\t s -> if fromEnum t <= fromIntegral p then s else s - big)
 
     -- Per-head outputs (HeadDimension each)
     headOutputs :: Vec NumQueryHeads (Vec HeadDimension Float)
@@ -363,7 +360,7 @@ computeMultiHeadAttention mha input queries keysPerHead valuesPerHead posIn =
              ks      = keysPerHead   !! kvIdx     -- Vec SeqLen (Vec HeadDimension Float)
              vs      = valuesPerHead !! kvIdx     -- Vec SeqLen (Vec HeadDimension Float)
              scores  = computeAttentionScores q ks            -- Vec SeqLen Float
-             weights = computeAttentionWeights (maskScores posClamped scores) -- Vec SeqLen Float
+             weights = computeAttentionWeights (maskScores posIn scores) -- Vec SeqLen Float
          in computeAttentionOutput weights vs)                 -- Vec HeadDimension Float
       queries
 

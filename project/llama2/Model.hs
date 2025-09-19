@@ -39,7 +39,7 @@ instance NFDataX CycleStage where
 data ProcessingState = ProcessingState
   { psStage      :: CycleStage
   , psLayer      :: Index NumLayers
-  , psSeqPos     :: Int
+  , psSeqPos     :: Index SeqLen
   , psTokenReady :: Bool
   } deriving (Show, Generic, NFDataX)
 
@@ -112,7 +112,7 @@ readCachedSequenceWith
   => (Signal dom CacheAddr -> Signal dom (Maybe (CacheAddr, Float)) -> Signal dom Float) -- ^ BRAM port (keyCache or valueCache)
   -> Index NumLayers
   -> Index NumKeyValueHeads
-  -> Signal dom Int                                        -- ^ pos (causal horizon)
+  -> Signal dom (Index SeqLen)                             -- ^ pos (causal horizon)
   -> Signal dom (Vec SeqLen (Vec HeadDimension Float))     -- ^ buffer filled over time
 readCachedSequenceWith ram l h posSig = bufSig
  where
@@ -165,14 +165,14 @@ readCachedSequenceWith ram l h posSig = bufSig
 readCachedKeys
   :: forall dom. HiddenClockResetEnable dom
   => AttentionCache dom
-  -> Index NumLayers -> Index NumKeyValueHeads -> Signal dom Int
+  -> Index NumLayers -> Index NumKeyValueHeads -> Signal dom (Index SeqLen)
   -> Signal dom (Vec SeqLen (Vec HeadDimension Float))
 readCachedKeys cache = readCachedSequenceWith (keyCache cache)
 
 readCachedVals
   :: forall dom. HiddenClockResetEnable dom
   => AttentionCache dom
-  -> Index NumLayers -> Index NumKeyValueHeads -> Signal dom Int
+  -> Index NumLayers -> Index NumKeyValueHeads -> Signal dom (Index SeqLen)
   -> Signal dom (Vec SeqLen (Vec HeadDimension Float))
 readCachedVals cache = readCachedSequenceWith (valueCache cache)
 
@@ -185,7 +185,7 @@ writeToCacheSequence
   => AttentionCache dom
   -> Index NumLayers
   -> Index NumKeyValueHeads
-  -> Signal dom Int                                   -- ^ sequence position (Int, clamped)
+  -> Signal dom (Index SeqLen)                                   -- ^ sequence position (Int, clamped)
   -> Signal dom (Vec HeadDimension Float, Vec HeadDimension Float) -- ^ current (K,V) vectors
   -> Signal dom Bool                                  -- ^ enable pulse/level
   -> Signal dom ()                                    -- ^ dummy sink
@@ -202,13 +202,6 @@ writeToCacheSequence cache l h seqPosSig kvSig enSig =
               (P.fmap (\d -> if d == maxBound then 0 else succ d) dCnt)
               dCnt
 
-  -- clamp sequence position to [0 .. SeqLen-1]
-  clamp :: Int -> Int -> Int -> Int
-  clamp lo hi x = max lo (min hi x)
-
-  seqIdxSig :: Signal dom (Index SeqLen)
-  seqIdxSig = fmap (toEnum . clamp 0 (natToNum @SeqLen - 1)) seqPosSig
-
   -- select the K,V element for current dimension
   kElemSig :: Signal dom Float
   kElemSig = (\(k,_ ) d -> k !! d) <$> kvSig <*> dCnt
@@ -217,7 +210,7 @@ writeToCacheSequence cache l h seqPosSig kvSig enSig =
   vElemSig = (\(_ ,v) d -> v !! d) <$> kvSig <*> dCnt
 
   -- compute linear addresses
-  kAddrSig = cacheAddr l h <$> seqIdxSig <*> dCnt
+  kAddrSig = cacheAddr l h <$> seqPosSig <*> dCnt
   vAddrSig = kAddrSig  -- same addressing expression for value cache
 
   -- build write enables
@@ -259,7 +252,7 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
   -- Cache reads for all heads
   cachedKeysPerHead :: Vec NumKeyValueHeads (Signal dom (Vec SeqLen (Vec HeadDimension Float)))
   cachedKeysPerHead =
-    map (\hIdx -> readCachedKeys cache layerIdx hIdx (psSeqPos <$> stateSig)) indicesI
+    map (\hIdx -> readCachedKeys cache layerIdx hIdx (fmap psSeqPos stateSig)) indicesI
 
   cachedValsPerHead :: Vec NumKeyValueHeads (Signal dom (Vec SeqLen (Vec HeadDimension Float)))
   cachedValsPerHead =
@@ -347,12 +340,6 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
           -- Include the just-computed (K,V) at the current position 'pos' by
           -- overlaying them on top of the streamed cache before attention.
           let
-            -- clamp Int pos to Index SeqLen
-            clamp :: Int -> Int -> Int -> Int
-            clamp lo hi x = max lo (min hi x)
-            posIdx :: Index SeqLen
-            posIdx = toEnum (clamp 0 (natToNum @SeqLen - 1) (psSeqPos state))
-
             -- Current K,V per KV head from Cycle2_ComputeQKV
             curK :: Vec NumKeyValueHeads (Vec HeadDimension Float)
             curK = idKeys idata
@@ -361,10 +348,10 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
 
             -- Overlay row 'posIdx' with current K,V for each KV head
             keysForAttn :: Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
-            keysForAttn = imap (\h kCache -> replace posIdx (curK !! h) kCache) keysNow
+            keysForAttn = imap (\h kCache -> replace (psSeqPos state) (curK !! h) kCache) keysNow
 
             valsForAttn :: Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
-            valsForAttn = imap (\h vCache -> replace posIdx (curV !! h) vCache) valsNow
+            valsForAttn = imap (\h vCache -> replace (psSeqPos state) (curV !! h) vCache) valsNow
 
             attnOut = computeMultiHeadAttention
                         mha
