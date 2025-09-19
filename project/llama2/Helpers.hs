@@ -36,6 +36,7 @@ module Helpers (
   , liftA4
   , softmax
   , sampleFromProbs
+  , xorshift32
 ) where
 
 import Clash.Prelude
@@ -369,3 +370,11 @@ computeFeedForward ffn x =
 
 liftA5 :: Applicative g => (a -> b -> c -> d -> e -> f) -> g a -> g b -> g c -> g d -> g e -> g f
 liftA5 f fa fb fc fd fe = f <$> fa <*> fb <*> fc <*> fd <*> fe
+
+-- xorshift32 core (synthesizable, 1-cycle combinational)
+xorshift32 :: Unsigned 32 -> Unsigned 32
+xorshift32 s0 =
+  let s1 = s0 `xor` shiftL s0 13
+      s2 = s1 `xor` shiftR s1 17
+      s3 = s2 `xor` shiftL s2 5
+  in s3

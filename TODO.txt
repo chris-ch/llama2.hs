@@ -1,11 +1,4 @@
 
-Remove mirrored caches and simplify Cycle1
-
-    R1. Delete idCachedKeys/idCachedVals from IntermediateData and initialIntermediateData.
-    R2. Remove readCachedKeysGated/readCachedValsGated calls and all “cached*Sig” wiring.
-    R3. Make Cycle1 a no‑op (or a lightweight “prepare” stage). Set readDoneThisLayerSig = pure True.
-    R4. Update stageDoneSig so Cycle1 uses readDoneAny = True.
-
 Collapse many BRAMs into one owner per layer (true dual‑port)
 
     B1. Introduce a KVRamOwner module (per layer)
@@ -32,11 +25,6 @@ Hazard/overlap (once TDP is in place)
         Keep the t==pos bypass in streamHeadAttention to avoid read‑during‑write issues.
 
 
-
-Short answer: it’s a good first sketch, but as written it will not synthesize into a correct or practical LLaMA‑2 decoder in Clash.
-There are several functional bugs (one of them fatal) and a few Clash/HDL pitfalls that will either make the design incorrect,
- unsynthesizable, or explode into a huge amount of hardware.
-
 What’s good
 
     Clear separation of decoder components and a multi‑cycle layer FSM.
@@ -58,27 +46,6 @@ Fix
     Or gate the advancement so only the active layer advances the stage.
     Also make psTokenReady a 1‑cycle pulse, not a sticky level.
 
-Sketch:
-
--- top-level controller: advances exactly once per cycle
-nextState :: ProcessingState -> ProcessingState
-nextState st = case psStage st of
-  Cycle1_ReadCache   -> st { psStage = Cycle2_ComputeQKV }
-  Cycle2_ComputeQKV  -> st { psStage = Cycle3_ComputeAttn }
-  Cycle3_ComputeAttn -> st { psStage = Cycle4_WriteCache }
-  Cycle4_WriteCache  -> st { psStage = Cycle5_ComputeFFN }
-  Cycle5_ComputeFFN ->
-    if psLayer st == maxBound
-      then st { psStage = Cycle1_ReadCache
-              , psLayer = 0
-              , psSeqPos = psSeqPos st + 1
-              , psTokenReady = True }
-      else st { psStage = Cycle1_ReadCache
-              , psLayer = psLayer st + 1
-              , psTokenReady = False }
-
-procStateSig = register initialProcessingState (nextState <$> procStateSig)
-
 Then, in the fold over layers, do not change the state; just compute data for the matching layer.
 
 2. KV cache reads/writes misuse blockRam (unsynthesizable/huge resource blow‑up)
@@ -95,23 +62,6 @@ Fix
         in Cycle2 writes current K,V one element per cycle (or per a few elements with a wider datapath) at address (layer, headKV, pos, d);
         in Cycle3 scans t=0..pos (and d=0..HeadDimension-1) to compute the dot products sequentially.
     API should return one element per cycle, not a whole Vec.
-
-Sketch (single element read/write):
-
-data KvReq = KvReq
-  { rdEn   :: Bool
-  , rdAddr :: CacheAddr
-  , wrEn   :: Bool
-  , wrAddr :: CacheAddr
-  , wrData :: Float }
-
-kvRam :: HiddenClockResetEnable dom
-      => Vec CacheDepth Float
-      -> Signal dom KvReq
-      -> Signal dom Float
-kvRam init req = trueDualPortBlockRam init
-                   (rdAddr <$> req, Nothing) -- port A read-only
-                   (wrAddr <$> req, mux (wrEn <$> req) (Just . (,) <$> wrAddr <*> wrData $ req) (pure Nothing))
 
 Then sequence addressing with counters inside Cycle2/3/4, rather than map over indicesI.
 
@@ -213,42 +163,10 @@ Memory interface sketch (per layer)
         Port B: write K,V at current pos in S1
     Address is a packed (pos, dim) counter; KV head and layer are statically selected by hierarchy.
 
-Small concrete fixes you can apply now
 
-    Fix cached values read:
-
-readCachedSequenceKV :: AttentionCache dom -> ... -> Signal dom (Vec SeqLen (Vec HeadDimension Float))
-readCachedSequenceKV cache layerIdx headIdx seqPosSig =
-  -- as now, but parameterize RAM function
-  ...
-cachedKeysPerHead = map (\h -> readCachedSequenceKey cache layerIdx h (psSeqPos <$> stateSig)) indicesI
-cachedValsPerHead = map (\h -> readCachedSequenceVal cache layerIdx h (psSeqPos <$> stateSig)) indicesI
-
-    Stop advancing state in multiCycleTransformerLayer. Make it pure:
-
-multiCycleTransformerLayer ... stateSig dataSig =
-  (stateSig, nextDataSig)  -- do not modify stateSig here
-
-    Make psSeqPos an Index SeqLen and psTokenReady a pulse:
-
-data ProcessingState = ProcessingState
-  { psStage :: CycleStage
-  , psLayer :: Index NumLayers
-  , psSeqPos :: Index SeqLen
-  , psTokenReady :: Bool
-  }
-
-validSig = psTokenReady <$> procStateSig
-validPulse = validSig .&&. (not <$> register False validSig)
-
-    Change masking: don’t zero K; limit the loops in computeMultiHeadAttention to 0..pos.
-
-    Replace Int with Unsigned/Natural where appropriate; avoid fromIntegral chains in cacheAddr.
-
-    Remove “forcedSig” tricks. They don’t impose evaluation order in hardware; schedule via counters and registers.
-
-Bottom line
-
-    Functionally, you’re close in spirit to the C reference (QKV, RoPE, MQA, attention, FFN), but the ordering, masking, and normalization need to be made identical.
-    Architecturally, you must rework the KV RAM access around a sequential datapath (one or two values per cycle) and fix the single‑update controller, otherwise the design will either be incorrect or will infer an impractical number of memories.
-    With those changes, plus numeric pragmatism (fixed/bfloat16, LUT RoPE, streaming softmax), this can become a sound Clash decoder. If you share the Helpers module signatures, I can propose concrete, type‑checked replacements for the RAM interface, the controller, and the S2/S3 streaming attention loops.
+Functionally, you’re close in spirit to the C reference (QKV, RoPE, MQA, attention, FFN), but the ordering, 
+masking, and normalization need to be made identical.
+Architecturally, you must rework the KV RAM access around a sequential datapath (one or two values per cycle)
+and fix the single‑update controller, otherwise the design will either be incorrect or will infer an impractical number of memories.
+With those changes, plus numeric pragmatism (fixed/bfloat16, LUT RoPE, streaming softmax),
+this can become a sound Clash decoder.
