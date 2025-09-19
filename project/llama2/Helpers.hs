@@ -77,6 +77,22 @@ type SeqLen         = 256
 seqLen :: Int
 seqLen = natToNum @SeqLen
 
+{- 
+-- model config 42M
+type ModelDim = 512
+type HiddenDim = 1376
+type NumLayers = 8
+type NumQueryHeads = 8
+type NumKeyValueHeads = 8
+type HeadDimension  = 64
+type FreqDim = 32
+type VocabSize = 32000 :: Nat
+vocabSize :: Int
+vocabSize = natToNum @VocabSize
+type SeqLen         = 1024
+seqLen :: Int
+seqLen = natToNum @SeqLen
+ -}
 {-
 -- model config 110M
 type ModelDim = 768
@@ -93,21 +109,6 @@ type SeqLen         = 1024
 seqLen :: Int
 seqLen = natToNum @SeqLen
 -}
-
-{--------------------------------------------------- 
-
-42M
-modelDim 512
-hiddenDim 1376
-numLayers 8
-NumQueryHeads 8
-headDimension 64
-FreqDim 32
-numKeyValueHeads 8
-vocabSize 32000
-seqLen 1024
-
- ---------------------------------------------------}
 
 newtype CArray2D (n :: Nat) (m :: Nat) = CArray2D (Vec n (Vec m Float)) deriving (Show)
 

@@ -591,7 +591,6 @@ multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
 
   -- existing logits
   logitsNow      = transformerLogits decoder . idFFNOutput <$> nextDataSig
-  latchedLogits  = regEn (repeat 0) readyPulseSig logitsNow
 
   -- PRNG state: seed is mixed in on the first pulse; otherwise advance each pulse
   firstPulseSig :: Signal dom Bool
@@ -615,13 +614,9 @@ multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
   sampledTokenOnPulse =
     liftA3
       (\temperature logs u ->
-         if temperature <= 0.0
-           then argMax logs
-           else
-             let probs = softmax temperature logs
-             in sampleFromProbs u probs
-      )
-      temperatureSig latchedLogits uniform01Sig
+         if temperature <= 0.0 then argMax logs
+         else let probs = softmax temperature logs in sampleFromProbs u probs)
+      temperatureSig logitsNow uniform01Sig
 
   outputTokenSig = regEn 0 readyPulseSig sampledTokenOnPulse
 
