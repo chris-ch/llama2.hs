@@ -10,7 +10,7 @@ import Helpers
   , MultiHeadAttentionComponent(..), EmbeddingComponent (..)
   , runSingleHeadQKV, applyRotaryToHead, StepCount (..)
   , computeFeedForward, transformerLogits, argMax, embed
-  , drawSample, computeMultiHeadAttention, seqLen, liftA4, liftA5, rmsNorm
+  , sampleFromProbs, computeMultiHeadAttention, seqLen, liftA4, liftA5, rmsNorm, softmax
   )
 import GHC.Stack (HasCallStack)
 
@@ -405,6 +405,14 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
 -- Multi-Cycle Full Transformer (advance on stageDone)
 -- ============================================================================
 
+-- xorshift32 core (synthesizable, 1-cycle combinational)
+xorshift32 :: Unsigned 32 -> Unsigned 32
+xorshift32 s0 =
+  let s1 = s0 `xor` shiftL s0 13
+      s2 = s1 `xor` shiftR s1 17
+      s3 = s2 `xor` shiftL s2 5
+  in s3
+
 multiCycleTransformer
   :: forall dom
    . HiddenClockResetEnable dom
@@ -481,14 +489,41 @@ multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
                       procStateSig (pure ())
   readyPulseSig = liftA2 (\now prev -> now && not prev) isLastFFN (register False isLastFFN)
 
-  logitsNow = transformerLogits decoder . idFFNOutput <$> nextDataSig
-  latchedLogits = regEn (repeat 0) readyPulseSig logitsNow
+  -- existing logits
+  logitsNow      = transformerLogits decoder . idFFNOutput <$> nextDataSig
+  latchedLogits  = regEn (repeat 0) readyPulseSig logitsNow
 
-  pick probs temp seed
-    | temp == 0.0 = argMax probs
-    | otherwise   = drawSample seed (map (/ temp) probs)
+  -- PRNG state: seed is mixed in on the first pulse; otherwise advance each pulse
+  firstPulseSig :: Signal dom Bool
+  firstPulseSig = regEn True readyPulseSig (pure False)
 
-  outputTokenSig = regEn 0 readyPulseSig (pick <$> latchedLogits <*> temperatureSig <*> seedSig)
+  mixedSeedSig :: Signal dom (Unsigned 32)
+  mixedSeedSig = fromIntegral . (`xor` 0x9E3779B9) <$> seedSig
+
+  prngStateSig :: Signal dom (Unsigned 32)
+  prngStateSig =
+    let nextVal = mux firstPulseSig (xorshift32 <$> mixedSeedSig)
+                                    (xorshift32 <$> prngStateSig)
+    in regEn 2463534242 readyPulseSig nextVal  -- non-zero default
+
+  -- Convert to Float in [0,1). Use top 24 bits as mantissa fraction.
+  uniform01Sig :: Signal dom Float
+  uniform01Sig = (/ 16777216.0) . fromIntegral . (`shiftR` 8) <$> prngStateSig
+
+  -- Sampling on pulse:
+  sampledTokenOnPulse :: Signal dom (Unsigned 32)
+  sampledTokenOnPulse =
+    liftA3
+      (\temp logs u ->
+         if temp <= 0.0
+           then argMax logs
+           else
+             let probs = softmax temp logs
+             in sampleFromProbs u probs
+      )
+      temperatureSig latchedLogits uniform01Sig
+
+  outputTokenSig = regEn 0 readyPulseSig sampledTokenOnPulse
 
 -- ============================================================================
 -- Top Entity

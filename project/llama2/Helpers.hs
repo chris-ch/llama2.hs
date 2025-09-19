@@ -20,7 +20,7 @@ module Helpers (
   , Token
   , liftA5
   , runSingleHeadQKV
-  ,applyRotaryToHead
+  , applyRotaryToHead
   , rmsNorm
   , computeAttentionWeights
   , computeAttentionScores
@@ -30,15 +30,16 @@ module Helpers (
   , embed
   , transformerLogits
   , argMax
-  , drawSample
   , computeMultiHeadAttention
   , vocabSize
   , seqLen
   , liftA4
+  , softmax
+  , sampleFromProbs
 ) where
 
 import Clash.Prelude
-import qualified System.Random as R
+
 import qualified Clash.Sized.Vector as CV
 import Data.Maybe (fromMaybe)
 
@@ -267,28 +268,21 @@ argMax vec = fst $ foldl compareMax (0, head vec) (imap (\i x -> (fromIntegral i
 dotVec :: forall n. KnownNat n => Vec n Float -> Vec n Float -> Float
 dotVec xs ys = sum (zipWith (*) xs ys)
 
-softmaxVec :: forall n. KnownNat (n+1) => Vec (n+1) Float -> Vec (n+1) Float
-softmaxVec xs =
-  let m = maximum xs
-      exps = map (\x -> exp (x - m)) xs
-      s = sum exps
+softmax :: forall n. KnownNat (n + 1) => Float -> Vec (n + 1) Float -> Vec (n + 1) Float
+softmax t xs =
+  let
+    m    = maximum xs
+    exps = map (\x -> exp ((x - m) / t)) xs
+    s    = sum exps
   in map (/ s) exps
 
--- Pure deterministic sampling from probabilities
-drawSample :: Int -> Vec VocabSize Float -> Unsigned 32
-drawSample seed probabilities =
-    let gen = R.mkStdGen seed
-        (randomValue, _) = R.random gen :: (Float, R.StdGen)
-
-        -- cumulative sum using scanl1'
-        cumulativeDistribution :: Vec VocabSize Float
-        cumulativeDistribution = CV.scanl1 (+) probabilities
-
-        -- find first index where cumulative >= randomValue
-        selectedIndex :: Index VocabSize
-        selectedIndex = fromMaybe maxBound (findIndex (>= randomValue) cumulativeDistribution)
-
-    in fromIntegral (fromEnum selectedIndex)
+-- Pure, synthesizable categorical sampling from probabilities summing to ~1.0
+sampleFromProbs :: forall n. (KnownNat (n + 1), KnownNat n) => Float -> Vec (n + 1) Float -> Unsigned 32
+sampleFromProbs u probs =
+  let
+    cdf = CV.scanl1 (+) probs
+    idx = fromMaybe maxBound (findIndex (>= u) cdf)
+  in fromIntegral (fromEnum idx)
 
 -- Pure attention computation
 computeAttentionScores
@@ -300,11 +294,12 @@ computeAttentionScores query keys =
       scaling = sqrt (headDim :: Float)
   in map (\key -> dotVec query key / scaling) keys
 
--- Pure attention weights computation
-computeAttentionWeights
-  :: Vec SeqLen Float
-  -> Vec SeqLen Float
-computeAttentionWeights = softmaxVec
+computeAttentionWeights :: forall n. KnownNat (n+1) => Vec (n+1) Float -> Vec (n+1) Float
+computeAttentionWeights xs =
+  let m = maximum xs
+      exps = map (\x -> exp (x - m)) xs
+      s = sum exps
+  in map (/ s) exps
 
 -- Pure attention output computation
 computeAttentionOutput
