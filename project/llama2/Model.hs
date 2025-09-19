@@ -42,6 +42,141 @@ data ProcessingState = ProcessingState
   , psSeqPos     :: Index SeqLen
   } deriving (Show, Generic, NFDataX)
 
+-- One-head streaming attention core with online softmax accumulation.
+-- Reads K/V from BRAM (1-cycle latency), bypasses current-row K/V, and
+-- produces the head output vector when done pulses.
+
+data AttnPhase = PhaseDot | PhaseAcc | PhaseFinalize
+  deriving (Generic, NFDataX, Eq, Show)
+
+streamHeadAttention
+  :: HiddenClockResetEnable dom
+  => AttentionCache dom
+  -> Index NumLayers
+  -> Index NumKeyValueHeads
+  -> Signal dom Bool
+  -> Signal dom (Index SeqLen)
+  -> Signal dom (Vec HeadDimension Float)
+  -> Signal dom (Vec HeadDimension Float)
+  -> Signal dom (Vec HeadDimension Float)
+  -> ( Signal dom (Vec HeadDimension Float)
+     , Signal dom Bool
+     , Signal dom Bool )
+streamHeadAttention cache l h startSig posSig qSig curKSig curVSig =
+  (oOut, busySig, doneSig)
+ where
+  kQ = keyCache   cache kAddr (pure Nothing)
+  vQ = valueCache cache vAddr (pure Nothing)
+
+  startPrev  = register False startSig
+  startPulse = liftA2 (\n p -> n && not p) startSig startPrev
+
+  busySig = s where
+    s    = register False next
+    next = mux startPulse (pure True)
+         $ mux doneSig    (pure False) s
+
+  phase    = register PhaseDot phaseNext
+  isDot    = (== PhaseDot)      <$> phase
+  isAcc    = (== PhaseAcc)      <$> phase
+  isFin    = (== PhaseFinalize) <$> phase
+
+  en   = startPulse .||. busySig
+  tCnt = regEn 0 en tNext
+  dCnt = regEn 0 en dNext
+
+  isLastD = (== maxBound) <$> dCnt
+  isLastT = (==) <$> tCnt <*> posSig
+
+  dPrev = register 0 dCnt
+  tPrev = register 0 tCnt
+
+  kAddr = cacheAddr l h <$> tCnt <*> dCnt
+  vAddr = cacheAddr l h <$> tCnt <*> dCnt
+
+  kAligned = register 0 kQ
+  vAligned = register 0 vQ
+
+  useKBypass = (&&) <$> isDot <*> isLastT
+  useVBypass = (&&) <$> isAcc <*> isLastT
+
+  kBypass = (!!) <$> curKSig <*> dPrev
+  vBypass = (!!) <$> curVSig <*> dPrev
+
+  kElem = mux useKBypass kBypass kAligned
+  vElem = mux useVBypass vBypass vAligned
+
+  qElem = (!!) <$> qSig <*> dPrev
+
+  partialDot = (+) <$> dotAcc <*> ((*) <$> qElem <*> kElem)
+
+  dotAcc = regEn 0 en dotAccNext
+  dotAccNext =
+    mux isDot
+      (mux isLastD (pure 0) partialDot)
+      dotAcc
+
+  dotBoundary = (&&) <$> isDot <*> isLastD
+  scoreThisT  = regEn 0 dotBoundary partialDot
+
+  -- online softmax accumulators
+  mAcc   = regEn (- (1 / 0)) en mNext
+  sAcc   = regEn 0      en sNext
+
+  oNum   = regEn (repeat (0 :: Float) :: Vec HeadDimension Float) en oNumNext
+  oOut   = regEn (repeat (0 :: Float) :: Vec HeadDimension Float) en oOutNext
+
+  mNew     = max <$> mAcc <*> scoreThisT
+  scaleOld = exp <$> ((-) <$> mAcc      <*> mNew)
+  scaleNew = exp <$> ((-) <$> scoreThisT <*> mNew)
+  sNew     = (+) <$> ((* ) <$> sAcc <*> scaleOld) <*> scaleNew
+
+  mNext = mux dotBoundary mNew mAcc
+  sNext = mux dotBoundary sNew sAcc
+
+  oElemPrev = (!!) <$> oNum <*> dPrev
+  oElemUpd  = (\o v a b -> o * b + v * a) <$> oElemPrev <*> vElem <*> scaleNew <*> scaleOld
+
+  oNumNext =
+    mux isAcc
+      (replace <$> dPrev <*> oElemUpd <*> oNum)
+      oNum
+
+  oOutDivElem = (/ ) <$> oElemPrev <*> sNew
+  oOutNext =
+    mux isFin
+      (replace <$> dPrev <*> oOutDivElem <*> oOut)
+      oOut
+
+  phaseNext =
+    liftA4
+      (\ph dLast tLast accBound ->
+         case ph of
+           PhaseDot      -> if dLast then PhaseAcc else PhaseDot
+           PhaseAcc      -> if dLast then (if tLast then PhaseFinalize else PhaseDot) else PhaseAcc
+           PhaseFinalize -> if dLast then PhaseDot else PhaseFinalize)
+      phase isLastD isLastT ((&&) <$> isAcc <*> isLastD)
+
+  dNext =
+    liftA3
+      (\ph d dLast ->
+         case ph of
+           PhaseDot      -> if dLast then 0 else succ d
+           PhaseAcc      -> if dLast then 0 else succ d
+           PhaseFinalize -> if dLast then 0 else succ d)
+      phase dCnt isLastD
+
+  tNext =
+    liftA4
+      (\ph t dLast tLast ->
+         case ph of
+           PhaseDot      -> t
+           PhaseAcc      -> if dLast then (if tLast then 0 else succ t) else t
+           PhaseFinalize -> t)
+      phase tCnt isLastD isLastT
+
+  doneSig = register False $ (&&) <$> isFin <*> isLastD
+
 initialProcessingState :: ProcessingState
 initialProcessingState = ProcessingState
   { psStage = Cycle1_ReadCache
@@ -123,9 +258,8 @@ initAttentionCache = AttentionCache
 -- Cache Access (sequential, single-element per cycle)
 -- ============================================================================
 
-
 -- Read one element/cycle with explicit start, pos, busy, done.
--- Keeps your local buffer for now (item 4 will remove it).
+-- Keeps your local buffer for now.
 readCachedSequenceWithGated
   :: forall dom
    . HiddenClockResetEnable dom
@@ -289,7 +423,7 @@ cycle3AttnMicro startSig posSig = (tCnt, busySig, doneSig)
  where
   startPrev  = register False startSig
   startPulse = liftA2 (\now prev -> now && not prev) startSig startPrev
-  
+
   busySig = sig where
     sig = register False next
     next = liftA3 (\b sp dn -> (b && not dn) || sp) sig startPulse doneSig
@@ -439,18 +573,42 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
             in idata { idQueries = queries, idKeys = keys, idValues = values }
 
           Cycle3_ComputeAttn ->
-            let posIdx = psSeqPos st
-                curK   = idKeys idata
-                curV   = idValues idata
-                keysForAttn = imap (\h kCache -> replace posIdx (curK !! h) kCache) (idCachedKeys idata)
-                valsForAttn = imap (\h vCache -> replace posIdx (curV !! h) vCache) (idCachedVals idata)
-                attnOut = computeMultiHeadAttention
-                            mha
-                            (idInputVec idata)
-                            (idQueries idata)
-                            keysForAttn
-                            valsForAttn
-                            posIdx
+            let
+              -- compute once per cycle (pure), but only commit on attnDone
+              attnOutSig :: Signal dom (Vec ModelDim Float)
+              attnOutSig =
+                liftA5
+                  (\st inp qs kbuf vbuf ->
+                    let posIdx = psSeqPos st
+                        curK   = idKeys inp
+                        curV   = idValues inp
+                        keysForAttn = imap (\h kCache -> replace posIdx (curK !! h) kCache) kbuf
+                        valsForAttn = imap (\h vCache -> replace posIdx (curV !! h) vCache) vbuf
+                    in computeMultiHeadAttention (multiHeadAttention layer)
+                                                  (idInputVec inp) qs keysForAttn valsForAttn posIdx)
+                  stateSig dataSig (idQueries <$> dataSig) cachedKeysSig cachedValsSig
+
+              -- commit only when this layer’s attnDone pulses
+              commitCycle3 :: Signal dom IntermediateData
+              commitCycle3 =
+                liftA4
+                  (\st cur attOut done ->
+                    if psLayer st == layerIdx && psStage st == Cycle3_ComputeAttn && done
+                      then cur { idAttnOutput = attOut }
+                      else cur)
+                  stateSig dataSig attnOutSig attnDoneThisLayerSig
+              posIdx = psSeqPos st
+              curK   = idKeys idata
+              curV   = idValues idata
+              keysForAttn = imap (\h kCache -> replace posIdx (curK !! h) kCache) (idCachedKeys idata)
+              valsForAttn = imap (\h vCache -> replace posIdx (curV !! h) vCache) (idCachedVals idata)
+              attnOut = computeMultiHeadAttention
+                          mha
+                          (idInputVec idata)
+                          (idQueries idata)
+                          keysForAttn
+                          valsForAttn
+                          posIdx
             in idata { idAttnOutput = attnOut }
           Cycle4_WriteCache -> idata
           Cycle5_ComputeFFN ->
