@@ -210,7 +210,7 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
 
   -- Tie the writeOpsSig in so it’s not dropped
   nextDataSig = liftA2 const baseNextDataSig writeOpsSig
-
+  
   processCycle
     :: ProcessingState
     -> IntermediateData

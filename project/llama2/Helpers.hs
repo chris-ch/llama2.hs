@@ -37,7 +37,6 @@ module Helpers (
 ) where
 
 import Clash.Prelude
-
 import qualified System.Random as R
 import qualified Clash.Sized.Vector as CV
 import Data.Maybe (fromMaybe)

@@ -4,13 +4,10 @@ import Prelude
 
 import qualified Data.Binary.Get as BG
 import qualified Data.ByteString.Lazy as BSL
-import Data.Word (Word32)
-import Data.Bits (shiftL)
 import System.Environment (getArgs)
 import Text.Printf (printf)
 
 -- Import type-level constants from your Helpers.hs (adjust path if needed)
-import qualified Helpers
 import Foreign (Int32)
 import Control.Monad (replicateM)
 

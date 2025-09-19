@@ -20,7 +20,7 @@ import Data.Maybe (fromMaybe)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import GHC.Unicode (isSpace)
 import System.IO (hFlush, stdout)
-import Control.Monad (replicateM, replicateM_, unless)
+import Control.Monad (replicateM, replicateM_)
 import Text.Printf (printf)
 
 import Helpers
@@ -50,6 +50,7 @@ import Helpers
       FreqDim )
 import Model ( multiCycleTransformer, initAttentionCache, ProcessingState (..), topEntity )
 import Data.List (findIndex)
+import Debug.Trace (trace)
 
 type Vocabulary = [BSL.ByteString]
 type VocabularyScores = [Float]
@@ -165,6 +166,7 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
     prompt' = fromMaybe "" prompt
     (promptTokens, vocab) = tokenizerInit tokenizerFileContent vocabSize (BSC.pack prompt')
 
+  putStrLn "✅ model loaded successfully"
   putStrLn "<s>"
   startTime <- getPOSIXTime
 
@@ -236,13 +238,17 @@ readVec4D = do
         total = m * n * p * q
     vec <- readVector total
     let floatList = V.toList vec
-        innerChunks = chunksOf p floatList
+        -- First chunk into q-sized vectors
+        innerChunks = chunksOf q floatList
         innerVecs = map CV.unsafeFromList innerChunks
-        middleChunks = chunksOf n innerVecs
+        -- Then chunk into p groups of q-sized vectors
+        middleChunks = chunksOf p innerVecs
         middleVecs = map CV.unsafeFromList middleChunks
-        externChunks = chunksOf m middleVecs
-        externVecs = map CV.unsafeFromList externChunks
-    return $ CV.unsafeFromList externVecs
+        -- Then chunk into n groups of p×q-sized tensors
+        outerChunks = chunksOf n middleVecs
+        outerVecs = map CV.unsafeFromList outerChunks
+        -- Finally chunk into m groups
+    return $ CV.unsafeFromList outerVecs
   where
     chunksOf _ [] = []
     chunksOf k xs = take k xs : chunksOf k (drop k xs)
@@ -250,21 +256,58 @@ readVec4D = do
 parseModelConfigFile :: BG.Get TransformerDecoderComponent
 parseModelConfigFile = do
   replicateM_ 7 BG.getInt32le
-
   tokenEmbeddingTable' <- readVec2D @VocabSize @ModelDim
-  rmsAttWeight'        <- readVec2D @NumLayers @ModelDim
-  wq'                  <- readVec4D @NumLayers @NumQueryHeads @HeadDimension @ModelDim
-  wk'                  <- readVec4D @NumLayers @NumKeyValueHeads @HeadDimension @ModelDim
-  wv'                  <- readVec4D @NumLayers @NumKeyValueHeads @HeadDimension @ModelDim
-  wo'                  <- readVec4D @NumLayers @NumQueryHeads @ModelDim @HeadDimension
-  rmsFfnWeight'        <- readVec2D @NumLayers @ModelDim
-  w1'                  <- readVec3D @NumLayers @HiddenDim @ModelDim
-  w2'                  <- readVec3D @NumLayers @ModelDim @HiddenDim
-  w3'                  <- readVec3D @NumLayers @HiddenDim @ModelDim
-  rmsFinalWeight'      <- readVec1D @ModelDim
-  freqCisReal'         <- readVec2D @SeqLen @FreqDim
-  freqCisImag'         <- readVec2D @SeqLen @FreqDim
-
+  let tokenShape = (length (C.toList tokenEmbeddingTable'), length (C.toList (C.head tokenEmbeddingTable')))
+      expectedTokenShape = (C.natToNum @VocabSize, C.natToNum @ModelDim)
+  trace ("parseModelConfigFile: tokenEmbeddingTable shape=" ++ show tokenShape ++ ", expected=" ++ show expectedTokenShape) return ()
+  rmsAttWeight' <- readVec2D @NumLayers @ModelDim
+  let rmsAttShape = (length (C.toList rmsAttWeight'), length (C.toList (C.head rmsAttWeight')))
+      expectedRmsAttShape = (C.natToNum @NumLayers, C.natToNum @ModelDim)
+  trace ("parseModelConfigFile: rmsAttWeight shape=" ++ show rmsAttShape ++ ", expected=" ++ show expectedRmsAttShape) return ()
+  wq' <- readVec4D @NumLayers @NumQueryHeads @HeadDimension @ModelDim
+  let wqShape = (length (C.toList wq'), length (C.toList (C.head wq')), length (C.toList (C.head (C.head wq'))), length (C.toList (C.head (C.head (C.head wq')))))
+      expectedWqShape = (C.natToNum @NumLayers, C.natToNum @NumQueryHeads, C.natToNum @HeadDimension, C.natToNum @ModelDim)
+  trace ("parseModelConfigFile: wq shape=" ++ show wqShape ++ ", expected=" ++ show expectedWqShape) return ()
+  wk' <- readVec4D @NumLayers @NumKeyValueHeads @HeadDimension @ModelDim
+  let wkShape = (length (C.toList wk'), length (C.toList (C.head wk')), length (C.toList (C.head (C.head wk'))), length (C.toList (C.head (C.head (C.head wk')))))
+      expectedWkShape = (C.natToNum @NumLayers, C.natToNum @NumKeyValueHeads, C.natToNum @HeadDimension, C.natToNum @ModelDim)
+  trace ("parseModelConfigFile: wk shape=" ++ show wkShape ++ ", expected=" ++ show expectedWkShape) return ()
+  wv' <- readVec4D @NumLayers @NumKeyValueHeads @HeadDimension @ModelDim
+  let wvShape = (length (C.toList wv'), length (C.toList (C.head wv')), length (C.toList (C.head (C.head wv'))), length (C.toList (C.head (C.head (C.head wv')))))
+      expectedWvShape = (C.natToNum @NumLayers, C.natToNum @NumKeyValueHeads, C.natToNum @HeadDimension, C.natToNum @ModelDim)
+  trace ("parseModelConfigFile: wv shape=" ++ show wvShape ++ ", expected=" ++ show expectedWvShape) return ()
+  wo' <- readVec4D @NumLayers @NumQueryHeads @ModelDim @HeadDimension
+  let woShape = (length (C.toList wo'), length (C.toList (C.head wo')), length (C.toList (C.head (C.head wo'))), length (C.toList (C.head (C.head (C.head wo')))))
+      expectedWoShape = (C.natToNum @NumLayers, C.natToNum @NumQueryHeads, C.natToNum @ModelDim, C.natToNum @HeadDimension)
+  trace ("parseModelConfigFile: wo shape=" ++ show woShape ++ ", expected=" ++ show expectedWoShape) return ()
+  rmsFfnWeight' <- readVec2D @NumLayers @ModelDim
+  let rmsFfnShape = (length (C.toList rmsFfnWeight'), length (C.toList (C.head rmsFfnWeight')))
+      expectedRmsFfnShape = (C.natToNum @NumLayers, C.natToNum @ModelDim)
+  trace ("parseModelConfigFile: rmsFfnWeight shape=" ++ show rmsFfnShape ++ ", expected=" ++ show expectedRmsFfnShape) return ()
+  w1' <- readVec3D @NumLayers @HiddenDim @ModelDim
+  let w1Shape = (length (C.toList w1'), length (C.toList (C.head w1')), length (C.toList (C.head (C.head w1'))))
+      expectedW1Shape = (C.natToNum @NumLayers, C.natToNum @HiddenDim, C.natToNum @ModelDim)
+  trace ("parseModelConfigFile: w1 shape=" ++ show w1Shape ++ ", expected=" ++ show expectedW1Shape) return ()
+  w2' <- readVec3D @NumLayers @ModelDim @HiddenDim
+  let w2Shape = (length (C.toList w2'), length (C.toList (C.head w2')), length (C.toList (C.head (C.head w2'))))
+      expectedW2Shape = (C.natToNum @NumLayers, C.natToNum @ModelDim, C.natToNum @HiddenDim)
+  trace ("parseModelConfigFile: w2 shape=" ++ show w2Shape ++ ", expected=" ++ show expectedW2Shape) return ()
+  w3' <- readVec3D @NumLayers @HiddenDim @ModelDim
+  let w3Shape = (length (C.toList w3'), length (C.toList (C.head w3')), length (C.toList (C.head (C.head w3'))))
+      expectedW3Shape = (C.natToNum @NumLayers, C.natToNum @HiddenDim, C.natToNum @ModelDim)
+  trace ("parseModelConfigFile: w3 shape=" ++ show w3Shape ++ ", expected=" ++ show expectedW3Shape) return ()
+  rmsFinalWeight' <- readVec1D @ModelDim
+  let rmsFinalShape = length (C.toList rmsFinalWeight')
+      expectedRmsFinalShape = C.natToNum @ModelDim
+  trace ("parseModelConfigFile: rmsFinalWeight shape=" ++ show rmsFinalShape ++ ", expected=" ++ show expectedRmsFinalShape) return ()
+  freqCisReal' <- readVec2D @SeqLen @FreqDim
+  let freqCisRealShape = (length (C.toList freqCisReal'), length (C.toList (C.head freqCisReal')))
+      expectedFreqCisRealShape = (C.natToNum @SeqLen, C.natToNum @FreqDim)
+  trace ("parseModelConfigFile: freqCisReal shape=" ++ show freqCisRealShape ++ ", expected=" ++ show expectedFreqCisRealShape) return ()
+  freqCisImag' <- readVec2D @SeqLen @FreqDim
+  let freqCisImagShape = (length (C.toList freqCisImag'), length (C.toList (C.head freqCisImag')))
+      expectedFreqCisImagShape = (C.natToNum @SeqLen, C.natToNum @FreqDim)
+  trace ("parseModelConfigFile: freqCisImag shape=" ++ show freqCisImagShape ++ ", expected=" ++ show expectedFreqCisImagShape) return ()
   let
     embedding = EmbeddingComponent
       { vocabulary     = CArray2D tokenEmbeddingTable'
@@ -335,7 +378,7 @@ generateTokensSimAutoregressive decoder vocab nSteps promptTokens temperature se
   let promptLen = length promptTokens
   let totalSteps = promptLen + fromIntegral nSteps
 
-  putStrLn $ "Prompt: " ++ show promptTokens
+  putStrLn $ "✅ Prompt: " ++ show promptTokens
   putStr "Generated: "
   hFlush stdout
 
