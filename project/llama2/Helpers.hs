@@ -321,35 +321,41 @@ computeMultiHeadAttention
   -> Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
   -> Index SeqLen
   -> Vec ModelDim Float
-computeMultiHeadAttention mha input queries keysPerHead valuesPerHead posIn =
+computeMultiHeadAttention mha x qs kHeads vHeads pos =
   let
-    -- headOutputs, perHeadProjected as before ...
+    headsPerGroup :: Int
+    headsPerGroup = natToNum @NumQueryHeads `div` natToNum @NumKeyValueHeads
+
+    -- per-head attention outputs in HeadDimension
     headOutputs :: Vec NumQueryHeads (Vec HeadDimension Float)
     headOutputs = imap
-      (\qIdx q ->
-         let headsPerGroup :: Int
-             headsPerGroup = natToNum @NumQueryHeads `div` natToNum @NumKeyValueHeads
-             kvIdx :: Index NumKeyValueHeads
+      (\qIdx qVec ->
+         let kvIdx :: Index NumKeyValueHeads
              kvIdx =
                let qi  = fromEnum qIdx
                    idx = qi `div` headsPerGroup
                    hi  = natToNum @NumKeyValueHeads - 1
                in toEnum (max 0 (min hi idx))
-             ks = keysPerHead   !! kvIdx
-             vs = valuesPerHead !! kvIdx
-             scores  = computeAttentionScores q ks
-             weights = computeAttentionWeights (imap (\t s ->
-                               if fromEnum t <= fromIntegral posIn then s else s - 1.0e9) scores)
-         in computeAttentionOutput weights vs)
-      queries
 
+             ks = kHeads !! kvIdx
+             vs = vHeads !! kvIdx
+
+             scores  = computeAttentionScores qVec ks
+             -- causal mask: t > pos => subtract large number
+             weights = computeAttentionWeights
+                         (imap (\t s -> if fromEnum t <= fromIntegral pos
+                                          then s else s - 1.0e9) scores)
+         in computeAttentionOutput weights vs)
+      qs
+
+    -- apply W_O per query head, then sum across heads to ModelDim
     perHeadProjected :: Vec NumQueryHeads (Vec ModelDim Float)
     perHeadProjected = zipWith matrixVectorMult (mWo mha) headOutputs
 
-    summedOutput :: Vec ModelDim Float
-    summedOutput = foldl1 (zipWith (+)) perHeadProjected
+    woAttn :: Vec ModelDim Float
+    woAttn = foldl1 (zipWith (+)) perHeadProjected
   in
-    zipWith (+) input summedOutput
+    zipWith (+) x woAttn
 
 -- Pure feed-forward computation
 computeFeedForward
