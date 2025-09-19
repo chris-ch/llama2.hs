@@ -18,6 +18,7 @@ module Helpers (
   , StepCount(..)
   , CArray2D(..)
   , Token
+  , liftA5
   , runSingleHeadQKV
   ,applyRotaryToHead
   , rmsNorm
@@ -368,3 +369,6 @@ computeFeedForward ffn input =
   let normalizedInput = rmsNorm input (fRMSFfn ffn)
       ffnOutput = runFeedForward ffn normalizedInput
   in zipWith (+) input ffnOutput
+
+liftA5 :: Applicative g => (a -> b -> c -> d -> e -> f) -> g a -> g b -> g c -> g d -> g e -> g f
+liftA5 f fa fb fc fd fe = f <$> fa <*> fb <*> fc <*> fd <*> fe

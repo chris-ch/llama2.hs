@@ -1,5 +1,3 @@
-{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
-{-# HLINT ignore "Use void" #-}
 module Model (topEntity, multiCycleTransformer, initAttentionCache, ProcessingState(..)) where
 
 import Clash.Prelude
@@ -220,7 +218,7 @@ writeToCacheSequence cache l h seqPosSig kvSig enSig =
 
   -- compute linear addresses
   kAddrSig = cacheAddr l h <$> seqIdxSig <*> dCnt
-  vAddrSig = kAddrSig  -- same addressing for value cache
+  vAddrSig = kAddrSig  -- same addressing expression for value cache
 
   -- build write enables
   kWriteSig :: Signal dom (Maybe (CacheAddr, Float))
@@ -257,6 +255,7 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
   mha = multiHeadAttention layer
   ffn = feedforwardNetwork layer
   nextStateSig = fmap nextState stateSig
+
   -- Cache reads for all heads
   cachedKeysPerHead :: Vec NumKeyValueHeads (Signal dom (Vec SeqLen (Vec HeadDimension Float)))
   cachedKeysPerHead =
@@ -277,13 +276,21 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
   writeEnableSig = liftA2 (\st lidx -> psStage st == Cycle4_WriteCache && psLayer st == lidx)
                           stateSig (pure layerIdx)
 
+  -- Per-head KV signals and write effects, sequenced so they are kept alive
+  kvAllHeadsSig :: Signal dom (Vec NumKeyValueHeads (Vec HeadDimension Float, Vec HeadDimension Float))
+  kvAllHeadsSig = liftA2 (zipWith (\k v -> (k, v))) (idKeys <$> dataSig) (idValues <$> dataSig)
+
+  writeOps :: Vec NumKeyValueHeads (Signal dom ())
+  writeOps =
+    map (\hIdx ->
+           writeToCacheSequence cache layerIdx hIdx
+             (psSeqPos <$> stateSig)
+             (((!!) <$> kvAllHeadsSig) <*> pure hIdx)
+             writeEnableSig)
+        indicesI
+        
   writeOpsSig :: Signal dom ()
-  writeOpsSig =
-    let kvSig = liftA2 zip (fmap idKeys dataSig) (fmap idValues dataSig)
-    in bundle (traverse (imap (\hIdx kv ->
-         writeToCacheSequence cache layerIdx hIdx (psSeqPos <$> stateSig) (pure kv) writeEnableSig
-         )) kvSig)
-       $> ()
+  writeOpsSig = () <$ sequenceA writeOps
 
   -- Combine everything in processCycle
   baseNextDataSig = liftA4 processCycle stateSig dataSig cachedKeysSig cachedValsSig
@@ -306,7 +313,8 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
         Cycle1_ReadCache ->
           idata { idCachedKeys = keysNow, idCachedVals = valsNow }
         Cycle2_ComputeQKV ->
-            let
+            -- Compute keys and values for NumKeyValueHeads
+            let 
               input = idInputVec idata
               -- Compute queries for all NumQueryHeads
               queries = imap (\hIdx _ ->
@@ -315,10 +323,19 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
                     (q_rot, _) = applyRotaryToHead headComp (StepCount $ P.fromIntegral $ psSeqPos state) (q, repeat 0)
                 in q_rot
                 ) indicesI
+
               -- Compute keys and values for NumKeyValueHeads
-              headsPerGroup = natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads
+              headsPerGroupI :: Int
+              headsPerGroupI = natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads
+
+              toIndexClamped :: forall n. KnownNat n => Int -> Index n
+              toIndexClamped i =
+                let hi = natToNum @n - 1
+                    j  = max 0 (min hi i)
+                in toEnum j
               keysAndValues = imap (\hIdx _ ->
-                let qIdx = hIdx * headsPerGroup
+                let qIdx :: Index NumQueryHeads
+                    qIdx = toIndexClamped @NumQueryHeads (fromEnum hIdx * headsPerGroupI)
                     headComp = heads mha !! qIdx
                     (_, k, v) = runSingleHeadQKV headComp input
                     (_, k_rot) = applyRotaryToHead headComp (StepCount $ P.fromIntegral $ psSeqPos state) (repeat 0, k)
@@ -327,7 +344,34 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
               (keys, values) = unzip keysAndValues
           in idata { idQueries = queries, idKeys = keys, idValues = values }
         Cycle3_ComputeAttn ->
-          let attnOut = computeMultiHeadAttention mha (idInputVec idata) (idQueries idata) keysNow valsNow
+          -- Include the just-computed (K,V) at the current position 'pos' by
+          -- overlaying them on top of the streamed cache before attention.
+          let
+            -- clamp Int pos to Index SeqLen
+            clamp :: Int -> Int -> Int -> Int
+            clamp lo hi x = max lo (min hi x)
+            posIdx :: Index SeqLen
+            posIdx = toEnum (clamp 0 (natToNum @SeqLen - 1) (psSeqPos state))
+
+            -- Current K,V per KV head from Cycle2_ComputeQKV
+            curK :: Vec NumKeyValueHeads (Vec HeadDimension Float)
+            curK = idKeys idata
+            curV :: Vec NumKeyValueHeads (Vec HeadDimension Float)
+            curV = idValues idata
+
+            -- Overlay row 'posIdx' with current K,V for each KV head
+            keysForAttn :: Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
+            keysForAttn = imap (\h kCache -> replace posIdx (curK !! h) kCache) keysNow
+
+            valsForAttn :: Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float))
+            valsForAttn = imap (\h vCache -> replace posIdx (curV !! h) vCache) valsNow
+
+            attnOut = computeMultiHeadAttention
+                        mha
+                        (idInputVec idata)
+                        (idQueries idata)
+                        keysForAttn
+                        valsForAttn
           in idata { idAttnOutput = attnOut }
         Cycle5_ComputeFFN ->
           let ffnOut = computeFeedForward ffn (idAttnOutput idata)
