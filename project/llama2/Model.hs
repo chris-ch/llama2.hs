@@ -70,6 +70,40 @@ streamHeadAttention cache l h startSig posSig qSig curKSig curVSig =
   startPrev  = register False startSig
   startPulse = liftA2 (\n p -> n && not p) startSig startPrev
 
+  -- Add one-shot reset of accumulators on startPulse
+  invSqrtHd :: Float
+  invSqrtHd = 1.0 / sqrt (snatToNum (SNat @HeadDimension) :: Float)
+
+  dotAcc = regEn 0 en dotAccNext
+  dotAccNext =
+    mux startPulse (pure 0) $                        -- reset on new attention start
+    mux isDot
+      (mux isLastD (pure 0) partialDot)
+      dotAcc
+
+  scoreThisT  = regEn 0 dotBoundary (partialDot * pure invSqrtHd)
+
+  mAcc   = regEn (-(1/0)) en mNext
+  sAcc   = regEn 0        en sNext
+  oNum = regEn (repeat (0 :: Float) :: Vec HeadDimension Float) en oNumNext
+  oOut = regEn (repeat (0 :: Float) :: Vec HeadDimension Float) en oOutNext
+
+  mNext =
+    mux startPulse (pure (-(1/0))) $                 -- reset max on start
+    mux dotBoundary mNew mAcc
+
+  sNext =
+    mux startPulse (pure 0) $                        -- reset sum on start
+    mux dotBoundary sNew sAcc
+
+  oNumNext =
+    mux startPulse (pure (repeat 0)) $               -- reset numerator on start
+    mux isAcc (replace <$> dPrev <*> oElemUpd <*> oNum) oNum
+
+  oOutNext =
+    mux startPulse (pure (repeat 0)) $               -- clear output buffer on start
+    mux isFin (replace <$> dPrev <*> oOutDivElem <*> oOut) oOut
+
   busySig = s where
     s    = register False next
     next = mux startPulse (pure True)
@@ -108,46 +142,19 @@ streamHeadAttention cache l h startSig posSig qSig curKSig curVSig =
 
   partialDot = (+) <$> dotAcc <*> ((*) <$> qElem <*> kElem)
 
-  dotAcc = regEn 0 en dotAccNext
-  dotAccNext =
-    mux isDot
-      (mux isLastD (pure 0) partialDot)
-      dotAcc
-
-  invSqrtHd :: Float
-  invSqrtHd = 1.0 / sqrt (snatToNum (SNat @HeadDimension) :: Float)
-
   dotBoundary = (&&) <$> isDot <*> isLastD
-  scoreThisT  = regEn 0 dotBoundary (partialDot * pure invSqrtHd)
 
   -- online softmax accumulators
-  mAcc   = regEn (- (1 / 0)) en mNext
-  sAcc   = regEn 0      en sNext
-
-  oNum   = regEn (repeat (0 :: Float) :: Vec HeadDimension Float) en oNumNext
-  oOut   = regEn (repeat (0 :: Float) :: Vec HeadDimension Float) en oOutNext
-
   mNew     = max <$> mAcc <*> scoreThisT
   scaleOld = exp <$> ((-) <$> mAcc      <*> mNew)
   scaleNew = exp <$> ((-) <$> scoreThisT <*> mNew)
   sNew     = (+) <$> ((* ) <$> sAcc <*> scaleOld) <*> scaleNew
 
-  mNext = mux dotBoundary mNew mAcc
-  sNext = mux dotBoundary sNew sAcc
-
   oElemPrev = (!!) <$> oNum <*> dPrev
   oElemUpd  = (\o v a b -> o * b + v * a) <$> oElemPrev <*> vElem <*> scaleNew <*> scaleOld
 
-  oNumNext =
-    mux isAcc
-      (replace <$> dPrev <*> oElemUpd <*> oNum)
-      oNum
-
   oOutDivElem = (/ ) <$> oElemPrev <*> sNew
-  oOutNext =
-    mux isFin
-      (replace <$> dPrev <*> oOutDivElem <*> oOut)
-      oOut
+
 
   phaseNext =
     liftA3

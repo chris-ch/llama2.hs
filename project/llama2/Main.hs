@@ -398,31 +398,26 @@ generateTokensSimAutoregressive decoder vocab nSteps promptTokens temperature se
       sampledAll :: [Token]
       sampledAll = [ t | (t,r) <- outputs, r ]
 
-  -- What we actually want to EMIT to match the C/pure harness:
-  -- while consuming the prompt, emit the prompt’s next tokens;
-  -- afterwards, emit the model samples.
-  let promptTail     = drop 1 promptTokens              -- tokens we "print" during prompt forcing
-      nPromptToEmit  = length promptTail
-      emittedAll     = take nPromptToEmit promptTail
-                    ++ drop nPromptToEmit sampledAll
+  -- We want to EMIT: first the entire prompt (forced), then the samples.
+  let promptLen = length promptTokens
+      forcedEmitted = promptTokens                         -- emit full prompt
+      sampledAfterPrompt = drop promptLen sampledAll       -- then model outputs
+      emittedAll = forcedEmitted ++ sampledAfterPrompt
 
-      -- limit to what we actually want to show/return
-      totalWanted    = nPromptToEmit + fromIntegral nSteps
+      totalWanted = promptLen + fromIntegral nSteps
       emittedLimited = take totalWanted emittedAll
 
-      prevs :: [Token]
+      -- prev for decode: BOS for the first emitted token, then the previous emitted token
       prevs = 1 : emittedLimited
-
-      pairs :: [(Token, Token)]
       pairs = zip prevs emittedLimited
 
-  -- Print the emitted tokens (not the raw samples during the prompt phase)
+  -- Print
   mapM_ (\(prev,tok) -> BSC.putStr (decodePieceHS vocab prev tok) >> hFlush stdout) pairs
   putStrLn ""
 
-  -- Only generated tokens (exclude the prompt’s tail)
-  let generated = drop nPromptToEmit emittedLimited
-  pure (take (fromIntegral nSteps) generated, StepCount nSteps)
+  -- Only the generated tokens (exclude the prompt portion)
+  let generated = take (fromIntegral nSteps) (drop promptLen emittedLimited)
+  pure (generated, StepCount nSteps)
 
 bundledOutputs :: TransformerDecoderComponent -> CS.Signal CS.System (Token, Temperature, Seed) -> CS.Signal C.System (Token, Bool)
 bundledOutputs decoder = CS.bundle . CS.exposeClockResetEnable
