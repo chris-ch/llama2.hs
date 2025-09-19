@@ -1,6 +1,7 @@
 module Model (topEntity, multiCycleTransformer, initAttentionCache, ProcessingState(..)) where
 
 import Clash.Prelude
+import qualified Prelude as P
 import qualified GHC.TypeNats
 import Data.Functor (($>))
 import Helpers
@@ -178,7 +179,7 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
                    , psLayer = 0
                    , psSeqPos = psSeqPos state + 1
                    , psTokenReady = True }
-        else state { psStage = Cycle1_ReadCache, psLayer = psLayer state + 1 }
+        else state { psStage = Cycle1_ReadCache, psLayer = psLayer state + 1, psTokenReady = False }
 
   -- Cache reads for all heads
   cachedKeysPerHead :: Vec NumKeyValueHeads (Signal dom (Vec SeqLen (Vec HeadDimension Float)))
@@ -196,7 +197,7 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
   cachedValsSig :: Signal dom (Vec NumKeyValueHeads (Vec SeqLen (Vec HeadDimension Float)))
   cachedValsSig = sequenceA cachedValsPerHead
 
-  -- Write to cache on Cycle4
+  -- Write to cache on Cycle4 when we're processing this specific layer
   writeOpsSig :: Signal dom ()
   writeOpsSig =
     let kvSig = liftA2 zip (fmap idKeys dataSig) (fmap idValues dataSig)
@@ -210,7 +211,7 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
 
   -- Tie the writeOpsSig in so it’s not dropped
   nextDataSig = liftA2 const baseNextDataSig writeOpsSig
-  
+
   processCycle
     :: ProcessingState
     -> IntermediateData
@@ -220,24 +221,24 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
   processCycle state idata keysNow valsNow =
     case psStage state of
       Cycle1_ReadCache ->
-        idata { idCachedKeys = keysNow
-              , idCachedVals = valsNow }
+        idata { idCachedKeys = keysNow, idCachedVals = valsNow }
       Cycle2_ComputeQKV ->
-        let input = idInputVec idata
-            -- Compute queries for all NumAttentionHeads
+          let
+            input = idInputVec idata
+            -- Compute queries for all NumQueryHeads
             queries = imap (\hIdx _ ->
               let headComp = heads mha !! hIdx
                   (q, _, _) = runSingleHeadQKV headComp input
-                  (q_rot, _) = applyRotaryToHead headComp (StepCount $ fromIntegral $ psSeqPos state) (q, repeat 0)
+                  (q_rot, _) = applyRotaryToHead headComp (StepCount $ P.fromIntegral $ psSeqPos state) (q, repeat 0)
               in q_rot
               ) indicesI
             -- Compute keys and values for NumKeyValueHeads
-            headsPerGroup = natToNum @NumQueryHeads `div` natToNum @NumKeyValueHeads
+            headsPerGroup = natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads
             keysAndValues = imap (\hIdx _ ->
               let qIdx = hIdx * headsPerGroup
                   headComp = heads mha !! qIdx
                   (_, k, v) = runSingleHeadQKV headComp input
-                  (_, k_rot) = applyRotaryToHead headComp (StepCount $ fromIntegral $ psSeqPos state) (repeat 0, k)
+                  (_, k_rot) = applyRotaryToHead headComp (StepCount $ P.fromIntegral $ psSeqPos state) (repeat 0, k)
               in (k_rot, v)
               ) indicesI
             (keys, values) = unzip keysAndValues
@@ -245,11 +246,11 @@ multiCycleTransformerLayer layer cache layerIdx stateSig dataSig =
       Cycle3_ComputeAttn ->
         let attnOut = computeMultiHeadAttention mha (idInputVec idata) (idQueries idata) keysNow valsNow
         in idata { idAttnOutput = attnOut }
-      Cycle4_WriteCache ->
-        idata  -- writes happen via writeOpsSig side effect
       Cycle5_ComputeFFN ->
         let ffnOut = computeFeedForward ffn (idAttnOutput idata)
         in idata { idFFNOutput = ffnOut }
+      Cycle4_WriteCache ->
+        idata
 
 -- ============================================================================
 -- Multi-Cycle Full Transformer
@@ -271,31 +272,41 @@ multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
   layers    = modelLayers decoder
   inputVecSig = embed (vocabulary embedding) <$> tokenSig
 
-  procStateSig = register initialProcessingState (pure initialProcessingState)
-  intermDataSig = register initialIntermediateData $
-    fmap (\input -> initialIntermediateData { idInputVec = input }) inputVecSig
+  -- Create proper state feedback loop  -- Create proper state feedback loop
+  procStateSig = register initialProcessingState nextStateSig
 
-  (finalStateSig, finalDataSig) =
-    foldl
-      (\(stateSig, dataSig) (layer, cache, layerIdx) ->
-        multiCycleTransformerLayer layer cache layerIdx stateSig dataSig)
-      (procStateSig, intermDataSig)
-      (zip3 layers caches indicesI)
+  -- Token input loading: only load when starting a new sequence position
+  currentDataSig = register initialIntermediateData nextDataSig
 
-  finalOutputVecSig :: Signal dom (Vec ModelDim Float)
-  finalOutputVecSig =
-    register (repeat 0) (idFFNOutput <$> finalDataSig)
+  inputLoadedSig = liftA3 (\state currentData inputVec ->
+    if psStage state == Cycle1_ReadCache && psLayer state == 0
+    then currentData { idInputVec = inputVec }
+    else currentData ) procStateSig currentDataSig inputVecSig
 
-  logitsSig = transformerLogits decoder <$> finalOutputVecSig
+  -- Process through all layers - but only the current active layer does work
+  (nextStateSig, nextDataSig) =
+    foldl (\(stateSig, dataSig) (layer, cache, layerIdx) ->
+      let (newStateSig, newDataSig) = multiCycleTransformerLayer layer cache layerIdx stateSig dataSig
+          -- Only update data when processing this specific layer
+          conditionalDataSig = liftA3 (\state oldData newData ->
+            if psLayer state == layerIdx
+            then newData
+            else oldData ) stateSig dataSig newDataSig
+      in (newStateSig, conditionalDataSig)
+    ) (procStateSig, inputLoadedSig) (zip3 layers caches indicesI)
+
+  -- Output token generation - only when ready
+  logitsSig = liftA2 (\state finalData ->
+    if psTokenReady state
+    then transformerLogits decoder (idFFNOutput finalData)
+    else repeat 0 ) nextStateSig nextDataSig
 
   pickToken probs temp seed
     | temp == 0.0 = argMax probs
     | otherwise   = drawSample seed (map (/ temp) probs)
 
-  sampledTokenSig = pickToken <$> logitsSig <*> temperatureSig <*> seedSig
-  outputTokenSig  = sampledTokenSig
-
-  readyFlagSig = psTokenReady <$> finalStateSig
+  readyFlagSig = psTokenReady <$> nextStateSig
+  outputTokenSig = pickToken <$> logitsSig <*> temperatureSig <*> seedSig
 
 -- ============================================================================
 -- Top Entity
