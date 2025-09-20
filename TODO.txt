@@ -63,14 +63,148 @@ Make sure the K/V computed at Cycle2 are actually the ones written in Cycle4:
     Put an assertion or a dump around Cycle4 that prints a few K/V elements being written (for pos>0) and compare to the values you produced in Cycle2. If they’re zero at write time, you’re not latching the Cycle2 results into dataSig before Cycle4 uses them.
     Symptom of broken cache writes: generations look like shallow “bag of words,” because attention can only see the current token (you bypass t==pos correctly) but not previous timesteps (RAM returns zeros).
 
-4. RoPE source
-Your model loader reads freqCisReal/freqCisImag from the file and uses them. llama2.c’s latest code computes RoPE on the fly and skips those arrays in the checkpoint. If your .bin was produced by the new pipeline that doesn’t populate these anymore, reading them will return junk and your rotations will be wrong. Two safe options:
-
-    Ignore the stored freq_cis_* and compute cos/sin on-the-fly with the same formula as C: freq = 1 / pow(10000, (i/2) / HeadDim); angle = pos * freq; rotate pairs with cos/sin(angle).
-    Or verify the read freq arrays by recomputing a few values for small pos and i and comparing; if they don’t match, switch to on-the-fly computation.
-
 Actionable checklist to get to bit-for-bit parity
-
 
     Probe KV writes (Cycle4) and reads (Cycle3) as described to ensure the cache is populated with your Cycle2 K/V.
     If your checkpoint comes from the “skip RoPE tables” format, compute RoPE on-the-fly.
+
+--------------------------------- Bug fixing
+
+Summary of what we found and fixed
+
+    Tokenizer mismatch: Fixed. Your Haskell tokenizer now mirrors llama2.c, so inputs/outputs use the same token IDs.
+    W_O handling: Splitting W_O by per‑head column blocks and summing is mathematically equivalent to a single matmul with concat(heads). Not the root cause.
+    Real issue (fixed): Attention “done” timing. You were committing/observing the attention output on a micro‑FSM done that wasn’t aligned with the per‑head engines, so the concatenated head output was all zeros at pos 0. After switching to “done when all heads are done,” layer 0, pos 0 matches the C implementation (within expected FP noise).
+    RoPE: Switched to on‑the‑fly RoPE identical to C. It didn’t change the output, so RoPE was not the remaining issue.
+    Current status: Layer 0, pos 0 traces agree with C. Generated text still diverges for pos > 0, which points to something that matters only after timestep 0:
+        KV cache across timesteps (write in Cycle4, read in next token’s Cycle3).
+        Classifier tying vs unshared Wcls in the checkpoint (stories15M usually shares, but you should still detect the header flag).
+        Minor: stopping on BOS (=1) for apples‑to‑apples display with C (your Haskell driver doesn’t early-stop, which can make results look different even if early tokens match).
+
+What to check next (when you resume)
+
+    KV cache at pos 1:
+        Trace layer 0, pos 1 (same four taps: xHat, concat, W_O@concat, x_after) and compare with C. If they diverge at pos 1, examine the K/V written at pos 0 vs the K/V read at t=0 on pos 1.
+    Classifier sharing:
+        Parse the header’s vocab_size sign like C does. If negative, weights are unshared and you must load/ use a separate Wcls (dim × vocab) for logits; otherwise tie to the embedding.
+    Display parity:
+        Optional but helpful: stop printing when next==1 (BOS) to match the C program’s termination.
+
+How to re‑enable the Haskell trace (layer 0, pos 0)
+Below are minimal snippets to put the instrumentation back in. They’re the “known good” versions that avoid <<loop>> and align the done timing with the per‑head engines.
+
+    Add a small trace payload
+
+    In Model.hs:
+
+haskell
+data TracePack = TracePack
+{ trToken   :: Token
+, trXHat8   :: C.Vec 8 Float
+, trConcat8 :: C.Vec 8 Float
+, trWoTimes8:: C.Vec 8 Float
+, trXAfter8 :: C.Vec 8 Float
+} deriving (Show, Generic, NFDataX)
+
+2. Helper to concatenate heads
+
+    In Helpers.hs (and export it):
+
+haskell
+concatHeads :: C.Vec NumQueryHeads (C.Vec HeadDimension a) -> C.Vec ModelDim a
+concatHeads = CV.concat
+
+3. In Model.multiCycleTransformerLayer
+
+    Collect per‑head outputs and per‑head done flags from streamHeadAttentionAddrIO.
+    Create a layer “done” pulse when all heads are done.
+    Build the trace vectors and gate them with that pulse.
+
+Key pieces (sketch; integrate into your function where you already compute heads):
+
+haskell
+-- collect per-head outputs and dones (out: Vec NumQHeads (Signal (Vec HeadDim Float)), done: Vec NumQHeads (Signal Bool))
+(headsOutSigsVec, headDoneSigsVec) :: (C.Vec NumQueryHeads (C.Signal dom (C.Vec HeadDimension Float)), C.Vec NumQueryHeads (C.Signal dom Bool))
+-- ... fill them as you connect each head; headDoneSigsVec gets the 'done' from each head
+
+-- layer done = rising edge of AND across all head dones
+doneAllHeadsSig :: C.Signal dom Bool
+doneAllHeadsSig = fmap and (C.sequenceA headDoneSigsVec)
+doneAllPrev = C.register False doneAllHeadsSig
+attnDoneThisLayerSig = C.liftA2 (\n p -> n && not p) doneAllHeadsSig doneAllPrev
+
+-- recompute xHat for trace clarity
+xHatSig     = rmsNorm . idInputVec <$> dataSig <> pure (rmsAtt mha)
+concatHeadSig = concatHeads <$> C.sequenceA headsOutSigsVec
+woTimesSig  = attnSumSig                     -- your sum of per-head slices (W_O @ concat)
+xAfterSig   = zipWith (+) . idInputVec <$> dataSig <> woTimesSig
+
+let take8 = CV.take (C.SNat @8)
+packed = C.bundle ( take8 <$> xHatSig
+, take8 <$> concatHeadSig
+, take8 <$> woTimesSig
+, take8 <$> xAfterSig )
+traceValid = pure (layerIdx == 0) C..&&. ((== 0) <$> posSig) C..&&. attnDoneThisLayerSig
+rawTraceThisLayer :: C.Signal dom (Maybe (C.Vec 8 Float, C.Vec 8 Float, C.Vec 8 Float, C.Vec 8 Float))
+rawTraceThisLayer = C.mux traceValid (Just <$> packed) (pure Nothing)
+
+    Return rawTraceThisLayer from multiCycleTransformerLayer and thread it upward (combine different layers with (<|>) so only the first Just passes through). Attach the current token to produce TracePack:
+
+haskell
+tracePackSig :: C.Signal dom (Maybe TracePack)
+tracePackSig =
+let attach tok (Just (a,b,c,d)) = Just (TracePack tok a b c d)
+attach _   Nothing          = Nothing
+in attach <$> tokenSig <*> traceLayer0Sig
+
+    Change topEntity to return (token, ready, maybe TracePack).
+
+4. Avoid <<loop>>: finite “trace pass,” then normal generation
+
+    In Main.generateTokensSimAutoregressive, before your knot‑tied simulation, run a finite pass to collect and print the first trace:
+
+haskell
+-- Pass 1: finite trace capture (constant token t0)
+let t0 = case promptTokens of (x:) -> x; [] -> 1
+traceCycles = 10000
+traceInputs = replicate traceCycles (t0, temperature, seed)
+traceOutputs :: [(Token, Bool, Maybe TracePack)]
+traceOutputs = CS.simulate (bundledOutputs decoder) traceInputs
+mTrace = case [tr | (,,Just tr) <- traceOutputs] of
+(tr:) -> Just tr; [] -> Nothing
+case mTrace of
+Just tr -> do
+putStrLn "\n[TRACE] layer 0, pos 0"
+printVec :: (Show a) => [a] -> IO (); printVec = putStrLn . show
+putStrLn $ "token=" ++ show (trToken tr)
+printVec (CV.toList (trXHat8 tr))
+printVec (CV.toList (trConcat8 tr))
+printVec (CV.toList (trWoTimes8 tr))
+printVec (CV.toList (trXAfter8 tr))
+Nothing -> putStrLn "\n[TRACE] not observed in window."
+
+-- Pass 2: your usual knot‑tied autoregressive simulation (unchanged)
+
+5. Bundling
+
+    Ensure bundledOutputs/topEntityBundled expose the triple:
+
+haskell
+bundledOutputs
+:: TransformerDecoderComponent
+-> CS.Signal CS.System (Token, Temperature, Seed)
+-> CS.Signal C.System (Token, Bool, Maybe TracePack)
+
+topEntityBundled
+:: CS.HiddenClockResetEnable dom
+=> TransformerDecoderComponent
+-> C.Signal dom (Token, Temperature, Seed)
+-> (C.Signal dom Token, C.Signal dom Bool, C.Signal dom (Maybe TracePack))
+
+Remaining suspects for the “still different” text
+
+    KV cache across timesteps: if pos 1 trace diverges from C, inspect that you write K/V for pos 0 and then read exactly those at t=0 for pos 1 (bank addressing, bypass alignment, RAM latency).
+    Classifier sharing: parse the 7 Int32 config header like C; if vocab_size was negative, load a separate Wcls and use it in transformerLogits instead of tying to embeddings.
+    Stop on BOS (=1) for a fair visual comparison.
+
+If you keep these snippets handy, you can quickly re‑instrument, capture pos 1 traces from both C and Clash, and we can pinpoint any remaining mismatch in a few minutes next time.
