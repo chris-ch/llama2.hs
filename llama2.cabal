@@ -24,11 +24,13 @@ executable llama2
   main-is: Main.hs
   other-modules:
     Helpers,
+    Tokenizer,
     Model
   hs-source-dirs:
       project/llama2
   build-depends: base,
     clash-prelude,
+    containers,
     binary,
     bytestring,
     mtl,

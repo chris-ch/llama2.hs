@@ -50,3 +50,27 @@ A workable 5‑stage per‑layer micro‑architecture (each stage can itself ite
         ŷ = RMSNorm_ffn(x)
         h1 = SiLU(ŷ·W1); h3 = ŷ·W3; z = (h1 ⊙ h3) · W2
         x ← x + z
+
+
+-------------------------------------
+
+
+3. KV-cache write/read timing
+Make sure the K/V computed at Cycle2 are actually the ones written in Cycle4:
+
+    In Cycle4 you do writeSequencer isC4 pos (getK dataSig kv, getV dataSig kv).
+    dataSig at Cycle4 must contain the keys/values that were computed in Cycle2 for this same layer/pos. If the pipeline register that holds IntermediateData is only updated on certain stage boundaries, it’s easy to end up writing zeros (initial state) into RAM. Quick check:
+    Put an assertion or a dump around Cycle4 that prints a few K/V elements being written (for pos>0) and compare to the values you produced in Cycle2. If they’re zero at write time, you’re not latching the Cycle2 results into dataSig before Cycle4 uses them.
+    Symptom of broken cache writes: generations look like shallow “bag of words,” because attention can only see the current token (you bypass t==pos correctly) but not previous timesteps (RAM returns zeros).
+
+4. RoPE source
+Your model loader reads freqCisReal/freqCisImag from the file and uses them. llama2.c’s latest code computes RoPE on the fly and skips those arrays in the checkpoint. If your .bin was produced by the new pipeline that doesn’t populate these anymore, reading them will return junk and your rotations will be wrong. Two safe options:
+
+    Ignore the stored freq_cis_* and compute cos/sin on-the-fly with the same formula as C: freq = 1 / pow(10000, (i/2) / HeadDim); angle = pos * freq; rotate pairs with cos/sin(angle).
+    Or verify the read freq arrays by recomputing a few values for small pos and i and comparing; if they don’t match, switch to on-the-fly computation.
+
+Actionable checklist to get to bit-for-bit parity
+
+
+    Probe KV writes (Cycle4) and reads (Cycle3) as described to ensure the cache is populated with your Cycle2 K/V.
+    If your checkpoint comes from the “skip RoPE tables” format, compute RoPE on-the-fly.

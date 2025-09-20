@@ -17,9 +17,8 @@ import qualified Clash.Signal as CS
 import GHC.IO (unsafePerformIO)
 import Data.Maybe (fromMaybe)
 import Data.Time.Clock.POSIX (getPOSIXTime)
-import GHC.Unicode (isSpace)
 import System.IO (hFlush, stdout)
-import Control.Monad (replicateM, replicateM_)
+import Control.Monad (replicateM_)
 import Text.Printf (printf)
 
 import Helpers
@@ -48,10 +47,7 @@ import Helpers
       vocabSize,
       FreqDim, Temperature, Seed )
 import Model ( topEntity )
-
-type Vocabulary = [BSL.ByteString]
-type VocabularyScores = [Float]
-type PromptTokens = [Token]
+import qualified Tokenizer as T (buildTokenizer, encodeTokens, Tokenizer, decodePiece)
 
 --------------------------------------------------------------------------------
 -- Main entry point
@@ -70,17 +66,18 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
   currentTime <- getPOSIXTime
   let
     seedValue = fromIntegral $ fromMaybe (round currentTime) seed
-    initModel :: BSL.ByteString -> TransformerDecoderComponent
     initModel = BG.runGet parseModelConfigFile
-    config = initModel modelFileContent
-    prompt' = fromMaybe "" prompt
-    (promptTokens, vocab) = tokenizerInit tokenizerFileContent vocabSize (BSC.pack prompt')
+    config    = initModel modelFileContent
+    tokenizer = T.buildTokenizer tokenizerFileContent vocabSize
+    prompt'   = fromMaybe "" prompt
+    promptTokensI = T.encodeTokens tokenizer (BSC.pack prompt') True False
+    promptTokens  = map fromIntegral promptTokensI :: [Token]
 
   putStrLn "✅ model loaded successfully"
   putStrLn "<s>"
   startTime <- getPOSIXTime
 
-  (_, StepCount countTokens) <- generateTokensSimAutoregressive config vocab (fromIntegral steps) promptTokens temperature seedValue
+  (_, StepCount countTokens) <- generateTokensSimAutoregressive config tokenizer (fromIntegral steps) promptTokens temperature seedValue
 
   endTime <- getPOSIXTime
   let duration :: Integer
@@ -117,78 +114,6 @@ optionsParser =
 --------------------------------------------------------------------------------
 -- Tokenizer
 --------------------------------------------------------------------------------
-
-parseTokens :: BSL.ByteString -> Int -> (Vocabulary, VocabularyScores)
-parseTokens fileContent size = (vocab, vocabScores)
-  where
-    scoresTokens = BG.runGet scoresAndTokens fileContent
-    vocabScores = map fst scoresTokens
-    vocab = map snd scoresTokens
-
-    scoresAndTokens :: BG.Get [(Float, BSL.ByteString)]
-    scoresAndTokens = replicateM size readToken
-
-    readToken :: BG.Get (Float, BSL.ByteString)
-    readToken = do
-      score <- BG.getFloatle
-      tokenSize <- BG.getInt32le
-      token <- BG.getLazyByteString (fromIntegral tokenSize)
-      return (score, token)
-
-tokenizerInit :: BSL.ByteString -> Int -> BSL.ByteString -> (PromptTokens, Vocabulary)
-tokenizerInit file size prompt = (bpeEncode prompt vocab vocabScores, vocab)
-  where
-    (vocab, vocabScores) = parseTokens (BSL.drop 4 file) size
-
-strLookup :: BSL.ByteString -> Vocabulary -> Int
-strLookup occurrence = fromMaybe (-1) . DL.elemIndex occurrence
-
-applyBPEMerges :: [Token] -> Vocabulary -> VocabularyScores -> PromptTokens
-applyBPEMerges tokens vocab vocabScores = case findBestPair tokens of
-  Just (bestIndex, bestToken) ->
-    applyBPEMerges (mergePair bestIndex bestToken tokens) vocab vocabScores
-  Nothing ->
-    tokens
-  where
-    findBestPair :: [Token] -> Maybe (Int, Token)
-    findBestPair tokens' = foldr checkPair Nothing (zip [0 ..] (zip tokens' (drop 1 tokens')))
-      where
-        checkPair :: (Int, (Token, Token)) -> Maybe (Int, Token) -> Maybe (Int, Token)
-        checkPair (count, (tokenPrev, tokenNext)) acc =
-          case strLookup ((vocab !! fromIntegral tokenPrev) `BSL.append` (vocab !! fromIntegral tokenNext)) vocab of
-            pos | pos /= -1 && vocabScores !! pos > bestScore -> Just (count, fromIntegral pos)
-            _ -> acc
-
-        bestScore :: Float
-        bestScore = -1e10
-
-    mergePair :: Int -> Token -> [Token] -> [Token]
-    mergePair count token tokens' =
-      take count tokens' ++ [token] ++ drop (count + 2) tokens'
-
-bpeEncode :: BSL.ByteString -> Vocabulary -> VocabularyScores -> PromptTokens
-bpeEncode prompt vocab vocabScores =
-  let initialTokens = map (\byte ->
-        let byteStr = BSL.pack [byte]
-            maybeIdx = DL.elemIndex byteStr vocab
-        in case maybeIdx of
-             Just idx -> fromIntegral idx
-             Nothing  -> fromIntegral (fromEnum byte + 3)  -- Fallback to byte + 3
-        ) (BSL.unpack prompt)
-   in applyBPEMerges initialTokens vocab vocabScores
-
--- piece = vocab[next]; if prev==1 and piece starts with whitespace, drop that space.
-decodePieceHS :: Vocabulary -> Token -> Token -> BSL.ByteString
-decodePieceHS vocab prev tok =
-  let piece =
-        if tok >= (0 :: Token) && fromIntegral tok < length vocab
-          then vocab !! fromIntegral tok
-          else BSL.empty
-  in if prev == 1
-        then case BSC.uncons piece of
-               Just (c, rest) | isSpace c -> rest
-               _                           -> piece
-        else piece
 
 -- ============================================================================
 -- File Parsing
@@ -350,13 +275,13 @@ parseModelConfigFile = do
 -- | Autoregressive token generation, one token at a time.
 generateTokensSimAutoregressive
   :: TransformerDecoderComponent
-  -> Vocabulary
+  -> T.Tokenizer
   -> C.Unsigned 32
   -> [Token]
   -> Temperature
   -> Seed
   -> IO ([Token], StepCount)
-generateTokensSimAutoregressive decoder vocab nSteps promptTokens temperature seed = do
+generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperature seed = do
 
   putStrLn $ "✅ Prompt: " ++ show promptTokens
   putStr "<s>\n"
@@ -407,14 +332,17 @@ generateTokensSimAutoregressive decoder vocab nSteps promptTokens temperature se
       totalWanted = promptLen + fromIntegral nSteps
       emittedLimited = take totalWanted emittedAll
 
-      -- prev for decode: BOS for the first emitted token, then the previous emitted token
-      prevs = 1 : emittedLimited
-      pairs = zip prevs emittedLimited
-
   -- Print
-  mapM_ (\(prev,tok) -> BSC.putStr (decodePieceHS vocab prev tok) >> hFlush stdout) pairs
-  putStrLn ""
+  -- Build (prev,next) transitions like llama2.c
+  let emitted = emittedLimited
+      trans   = zip emitted (drop 1 emitted)
 
+  mapM_
+    (\(prev, nxt) ->
+        BSC.putStr (T.decodePiece tokenizer (fromIntegral prev) (fromIntegral nxt))
+        >> hFlush stdout)
+    trans
+  putStrLn ""
   -- Only the generated tokens (exclude the prompt portion)
   let generated = take (fromIntegral nSteps) (drop promptLen emittedLimited)
   pure (generated, StepCount nSteps)
