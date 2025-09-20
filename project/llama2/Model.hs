@@ -382,7 +382,12 @@ multiCycleTransformerLayer layer owner layerIdx stateSig dataSig =
   posSig = psSeqPos <$> stateSig
 
   -- Attention micro-FSM (unchanged)
-  (_tCnt, _attBusy, attnDoneThisLayerSig) = cycle3AttnMicro attStart posSig
+  (_tCnt, _attBusy, _) = cycle3AttnMicro attStart posSig
+
+  doneAllHeadsSig = fmap P.and (sequenceA headDoneSigsVec)
+
+  doneAllPrev = register False doneAllHeadsSig
+  attnDoneThisLayerSig = liftA2 (\n p -> n && not p) doneAllHeadsSig doneAllPrev
 
   banksThisLayer = kvBanks owner
 
@@ -393,15 +398,20 @@ multiCycleTransformerLayer layer owner layerIdx stateSig dataSig =
 
   -- For each KV bank, wire two heads (A and B) in Cycle3, or the writer on port B in Cycle4.
   -- Collect per-head outputs in a Vec NumQueryHeads of Signals
-  headsOutSigsVec =
+  -- Vec of per-head outputs and per-head done flags
+
+  (headsOutSigsVec, headDoneSigsVec) =
     let
-      initVec = repeat (pure (repeat 0))
+      initOut :: Vec NumQueryHeads (Signal dom (Vec HeadDimension Float))
+      initOut  = repeat (pure (repeat 0))
+      initDone :: Vec NumQueryHeads (Signal dom Bool)
+      initDone = repeat (pure (False :: Bool))
       headsPerGroupI :: Int
       headsPerGroupI = natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads
       qHi :: Int
       qHi = natToNum @NumQueryHeads - 1
 
-      fillOneBank acc kv =
+      fillOneBank (outAcc, doneAcc) kv =
         let
           bank  = banksThisLayer !! kv
           kRun  = runK bank
@@ -410,20 +420,18 @@ multiCycleTransformerLayer layer owner layerIdx stateSig dataSig =
           base  = fromEnum kv * headsPerGroupI
           q0i   = toEnum (min qHi base)         :: Index NumQueryHeads
           hasQ1 = base + 1 <= qHi
-          q1i   = if hasQ1 then toEnum (base + 1) else q0i  -- dummy, won’t be used when hasQ1 = False
+          q1i   = if hasQ1 then toEnum (base + 1) else q0i
 
           q0S  = getQ dataSig q0i
           kCur = getK dataSig kv
           vCur = getV dataSig kv
-
-          -- If present, second head uses q1i; otherwise ignore out1
           q1S  = if hasQ1 then getQ dataSig q1i else pure (repeat 0)
 
-          (addr0, out0, _busy0, _done0) = streamHeadAttentionAddrIO attStart posSig q0S kCur vCur kQ0 vQ0
-          (addr1, out1, _busy1, _done1) = streamHeadAttentionAddrIO attStart posSig q1S kCur vCur kQ1 vQ1
+          (addr0, out0, _busy0, done0) = streamHeadAttentionAddrIO attStart posSig q0S kCur vCur kQ0 vQ0
+          (addr1, out1, _busy1, done1) = streamHeadAttentionAddrIO attStart posSig q1S kCur vCur kQ1 vQ1
 
-          kvPairSig = liftA2 (,) kCur vCur
-          (wrAddr, kWr, vWr, _wrDone)   = writeSequencer isC4 posSig kvPairSig
+          kvPairSig                   = liftA2 (,) kCur vCur
+          (wrAddr, kWr, vWr, _wrDone) = writeSequencer isC4 posSig kvPairSig
 
           addrA = addr0
           wrA   = pure Nothing
@@ -437,10 +445,12 @@ multiCycleTransformerLayer layer owner layerIdx stateSig dataSig =
           kQ0 = kQA; vQ0 = vQA
           kQ1 = kQB; vQ1 = vQB
 
-          acc0 = replace q0i out0 acc
-          acc1 = if hasQ1 then replace q1i out1 acc0 else acc0
-        in acc1
-    in foldl fillOneBank initVec indicesI
+          outAcc0  = replace q0i out0 outAcc
+          doneAcc0 = replace q0i done0 doneAcc
+          outAcc1  = if hasQ1 then replace q1i out1 outAcc0 else outAcc0
+          doneAcc1 = if hasQ1 then replace q1i done1 doneAcc0 else doneAcc0
+        in (outAcc1, doneAcc1)
+    in P.foldl fillOneBank (initOut, initDone) indicesI
 
   -- Vec NumQueryHeads (Signal (Vec ModelDim Float))
   perHeadProjectedVec =
