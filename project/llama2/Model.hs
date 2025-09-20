@@ -28,7 +28,7 @@ toOp
 toOp addrSig wrSig =
   mux (isJust <$> wrSig) (uncurry RamWrite . fromJustX <$> wrSig) (RamRead <$> addrSig)
 
--- Bank geometry (unchanged idea, just local)
+-- Bank geometry
 type BankDepth = SeqLen GHC.TypeNats.* HeadDimension
 type BankAddr  = Index BankDepth
 

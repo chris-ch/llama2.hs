@@ -329,9 +329,9 @@ parseModelConfigFile = do
                , rmsAtt = rmsAttWeight' C.!! lIdx
                }
            , feedforwardNetwork = FeedForwardNetworkComponent
-               { fW1     = CArray2D $ w1' C.!! toInteger lIdx
-               , fW2     = CArray2D $ w2' C.!! toInteger lIdx
-               , fW3     = CArray2D $ w3' C.!! toInteger lIdx
+               { fW1     = CArray2D $ w1' C.!! lIdx
+               , fW2     = CArray2D $ w2' C.!! lIdx
+               , fW3     = CArray2D $ w3' C.!! lIdx
                , fRMSFfn = rmsFfnWeight' C.!! lIdx
                }
            }

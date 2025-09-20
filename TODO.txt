@@ -1,22 +1,10 @@
 
-Collapse many BRAMs into one owner per layer (true dual‑port)
-
-    B1. Introduce a KVRamOwner module (per layer)
-        Inside: two trueDualPortBlockRam (keys, values).
-        Expose a scheduled interface:
-            Read port A: rdStart, rdHeadKV, rdT, rdD -> rdQK/rdQV, rdValid
-            Write port B: wrHeadKV, wrPos, wrD, wrEn, wrDataK, wrDataV
-            busy/done (optional; your stage FSM can infer from counters).
-    B2. Replace AttentionCache dom with KVRamOwner (one per layer)
-        In multiCycleTransformer, pass Vec NumLayers of owners instead of caches.
-        In Cycle3, drive port A from the streamHeadAttention (or a tiny shim) instead of calling blockRam per head.
-        In Cycle4, drive port B from writeToCacheSequence (or fold that writer into the owner).
-
 QKV/FFN micro‑FSMs (later, if you need area/timing)
 
     Q1. Time‑multiplex matrixVectorMult for Q/K/V and W_O
         One MAC lane accumulates over HeadDimension/ModelDim with a “done” pulse.
         Turn qkvDoneSig/ffnDoneSig from True into the real pulses.
+
 
 Hazard/overlap (once TDP is in place)
 
@@ -25,69 +13,8 @@ Hazard/overlap (once TDP is in place)
         Keep the t==pos bypass in streamHeadAttention to avoid read‑during‑write issues.
 
 
-What’s good
 
-    Clear separation of decoder components and a multi‑cycle layer FSM.
-    Type‑level sizes for heads, head dimension, layers, seq len, etc. This is exactly what Clash is great at.
-    Multi‑Query Attention mapping (NumQueryHeads/NumKeyValueHeads) is considered and RoPE is applied per head.
-    KV cache is per layer (good).
-
-Critical issues to fix
-
-2. KV cache RAM usage
-
-You instantiate and access the same RAM many times in parallel:
-In Cycle3 you create one streamHeadAttention per query head, all calling cache.keyCache/valueCache in parallel.
-In Cycle4 you call writeToCacheSequence once per KV head, all in parallel. In Clash, every application of blockRam
- creates a new physical RAM. You’ve accidentally duplicated the memory NumQueryHeads (read) + NumKeyValueHeads (write) times.
-  Also, a single-ported blockRam can’t serve multiple simultaneous readers/writers.
-
-What to change
-
-Bank the memory by KV head and use trueDualPortBlockRam
-
-    One K RAM and one V RAM per KV head (so NumKeyValueHeads banks). Use trueDualPortBlockRam for each bank to allow up to 2 concurrent read streams per bank. With your config (NumQueryHeads / NumKeyValueHeads = 2), two Q heads share one KV bank, which fits 2 ports.
-    Only one writer per bank in Cycle4 (which you already have), using either port A or B while the other port services reads (or do writes in Cycle4 when Cycle3 is idle).
-
-Sketch (per layer, per KV head)
-
-haskell
--- depth per bank: SeqLen * HeadDimension
-type BankDepth = SeqLen * HeadDimension
-type BankAddr  = Index BankDepth
-
-bankAddr :: Index SeqLen -> Index HeadDimension -> BankAddr
-bankAddr s d = toEnum (fromIntegral d + fromIntegral s * natToNum @HeadDimension)
-
-data KvBank dom = KvBank
-{ kAB :: ( Signal dom BankAddr, Signal dom (Maybe (BankAddr, Float))  -- Port A
-, Signal dom BankAddr, Signal dom (Maybe (BankAddr, Float))  -- Port B
-, Signal dom Float,    Signal dom Float)                      -- (qA, qB)
-, vAB :: ( Signal dom BankAddr, Signal dom (Maybe (BankAddr, Float))
-, Signal dom BankAddr, Signal dom (Maybe (BankAddr, Float))
-, Signal dom Float,    Signal dom Float)
-}
-
-mkKvBank
-:: HiddenClockResetEnable dom
-=> KvBank dom
-mkKvBank =
-let (ka, kb) = trueDualPortBlockRam (replicate (SNat @BankDepth) 0)
-(va, vb) = trueDualPortBlockRam (replicate (SNat @BankDepth) 0)
-in KvBank
-{ kAB = ka
-, vAB = va
-}
-
--- Then make: Vec NumKeyValueHeads (KvBank dom) per layer.
--- Route exactly two streamHeadAttention readers sharing a KV head to (kAB PortA/PortB).
--- Route the Cycle4 writer for that KV head to either port during the write stage.
-
-And change AttentionCache to carry Vec NumKeyValueHeads of banks (not a single function). streamHeadAttention 
-must select its bank by kvIdx and take one of the two ports. writeToCacheSequence must select the same 
-bank and the other port during Cycle4.
-
-10. Numeric realism
+Numeric realism
 
     Using Float throughout with sin/cos/exp/softmax will not synthesize efficiently. For a hardware decoder you’ll want:
         Fixed‑point or bfloat16 datapath.
@@ -95,6 +22,8 @@ bank and the other port during Cycle4.
         Softmax via two‑pass streaming log‑sum‑exp or a stable single‑pass approximation.
         Dot products accumulated sequentially to keep area reasonable.
     Clash supports Float, but resource usage will be enormous unless you scale model sizes way down.
+
+
 
 What to change at a high level
 
@@ -121,20 +50,3 @@ A workable 5‑stage per‑layer micro‑architecture (each stage can itself ite
         ŷ = RMSNorm_ffn(x)
         h1 = SiLU(ŷ·W1); h3 = ŷ·W3; z = (h1 ⊙ h3) · W2
         x ← x + z
-
-After last layer: x ← RMSNorm_final(x); logits ← x · Wcls
-
-Memory interface sketch (per layer)
-
-    1 true dual‑port KV RAM per layer and KV head:
-        Port A: read stream for attention passes
-        Port B: write K,V at current pos in S1
-    Address is a packed (pos, dim) counter; KV head and layer are statically selected by hierarchy.
-
-
-Functionally, you’re close in spirit to the C reference (QKV, RoPE, MQA, attention, FFN), but the ordering, 
-masking, and normalization need to be made identical.
-Architecturally, you must rework the KV RAM access around a sequential datapath (one or two values per cycle)
-and fix the single‑update controller, otherwise the design will either be incorrect or will infer an impractical number of memories.
-With those changes, plus numeric pragmatism (fixed/bfloat16, LUT RoPE, streaming softmax),
-this can become a sound Clash decoder.
