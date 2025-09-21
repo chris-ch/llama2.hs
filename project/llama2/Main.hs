@@ -45,10 +45,10 @@ import Helpers
       HiddenDim,
       ModelDim,
       vocabSize,
-      FreqDim, Temperature, Seed, runSingleHeadQKV, applyRotaryToHead, matrixVectorMult, rmsNorm, dotProduct, computeAttentionScores, computeAttentionWeights, computeAttentionOutput, dotVec )
+      FreqDim, Temperature, Seed, runSingleHeadQKV, applyRotaryToHead, matrixVectorMult, rmsNorm, computeAttentionScores, computeAttentionWeights, computeAttentionOutput )
 import Model ( topEntity )
 import qualified Tokenizer as T (buildTokenizer, encodeTokens, Tokenizer, decodePiece)
-import GHC.Base (when)
+import DebugDump (dumpLayerSums)
 
 --------------------------------------------------------------------------------
 -- Main entry point
@@ -71,6 +71,8 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
     config    = initModel modelFileContent
     tokenizer = T.buildTokenizer tokenizerFileContent vocabSize
     prompt'   = fromMaybe "" prompt
+  dumpLayerSums config
+  let
     promptTokensI = T.encodeTokens tokenizer (BSC.pack prompt') True False
     promptTokens  = map fromIntegral promptTokensI :: [Token]
 
@@ -374,196 +376,6 @@ topEntityBundled decoder bundledInputs = topEntity decoder inputToken temp rngSe
   where
     (inputToken, temp, rngSeed) = C.unbundle bundledInputs
 
--- Top-5 helper (indices + values), small and simple
-top5 :: [Float] -> [(Int, Float)]
-top5 xs =
-  take 5 $ reverse $ DL.sortOn snd (zip [0..] xs)
-
-dump8L :: String -> [Float] -> IO ()
-dump8L tag xs = putStrLn $ tag ++ " " ++ show (take 8 xs)
-
--- KV cache for a single layer at a single position (we store rotated K and plain V)
-data KvCache = KvCache
-  { kcK :: C.Vec NumKeyValueHeads (C.Vec HeadDimension Float) -- rotated K at that pos
-  , kcV :: C.Vec NumKeyValueHeads (C.Vec HeadDimension Float) -- V at that pos
-  }
-
--- Build KV (rotated K, plain V) for a layer at a given pos and input xHat_attn
-kvForLayerAt
-  :: TransformerLayerComponent
-  -> StepCount
-  -> C.Vec ModelDim Float                  -- xHat (after rms_att)
-  -> KvCache
-kvForLayerAt layer step xHat =
-  let mha = multiHeadAttention layer
-      nQ  = C.snatToNum (C.SNat @NumQueryHeads)     :: Int
-      nKV = C.snatToNum (C.SNat @NumKeyValueHeads)  :: Int
-      kvMul = max 1 (nQ `div` nKV)
-
-      -- For each KV head, pick the first Q-head in its group to compute K,V
-      oneKV kvI =
-        let qIdx0   = kvI * kvMul
-            qIdx    = toEnum (min (nQ - 1) qIdx0)           :: C.Index NumQueryHeads
-            headComp = (heads mha) C.!! qIdx
-            (_q,k,v) = runSingleHeadQKV headComp xHat
-            (_qR,kR) = applyRotaryToHead headComp step (C.repeat 0, k)
-        in (kR, v)
-      pairs = C.map (\kvI -> oneKV (fromEnum kvI)) (C.indicesI @NumKeyValueHeads)
-      (ks, vs) = C.unzip pairs
-  in KvCache { kcK = ks, kcV = vs }
-
--- Per-head attention output at pos p with causal mask over t<=p, using given KV caches
--- We build 0..p slots, rest zeros/-inf
-headOutputAt
-  :: TransformerLayerComponent
-  -> Int                                   -- pos p (0 or 1 here)
-  -> C.Vec HeadDimension Float             -- q_rot at pos p (for this head)
-  -> C.Vec NumKeyValueHeads (C.Vec HeadDimension Float) -- Ks at each t (Vec over t is implicit by case)
-  -> C.Vec NumKeyValueHeads (C.Vec HeadDimension Float) -- Vs at each t
-  -> C.Vec HeadDimension Float
-headOutputAt layer p qRot kPerKV vPerKV =
-  let mha = multiHeadAttention layer
-      nQ  = C.snatToNum (C.SNat @NumQueryHeads)    :: Int
-      nKV = C.snatToNum (C.SNat @NumKeyValueHeads) :: Int
-      kvMul = max 1 (nQ `div` nKV)
-
-      -- This head’s KV index
-      kvIdxForHead :: Int -> Int
-      kvIdxForHead h = h `div` kvMul
-
-      -- For this head, pick the corresponding KV rows across t
-      hIdxInt = 0 -- will be overridden by caller via mapping; we keep function generic below
-  in qRot `seq` kPerKV `seq` vPerKV `seq`
-     error "headOutputAt is used via headOutputsAt; do not call directly"
-
--- Compute all heads’ outputs at pos p given current xHat and KV caches for t=0 and t=1
-headOutputsAt
-  :: TransformerLayerComponent
-  -> Int                                   -- pos p (0 or 1)
-  -> C.Vec ModelDim Float                  -- xHat (after rms_att) at pos p
-  -> KvCache                               -- KV at t=0
-  -> KvCache                               -- KV at t=1 (only used when p==1)
-  -> C.Vec NumQueryHeads (C.Vec HeadDimension Float)
-headOutputsAt layer p xHat kv0 kv1 =
-  let mha = multiHeadAttention layer
-      nQ  = C.snatToNum (C.SNat @NumQueryHeads)    :: Int
-      nKV = C.snatToNum (C.SNat @NumKeyValueHeads) :: Int
-      kvMul = max 1 (nQ `div` nKV)
-
-      -- Per-Q-head Q,K,V at pos p
-      qkv h =
-        let headComp = (heads mha) C.!! h
-            (q0,k0,v0) = runSingleHeadQKV headComp xHat
-            (qR,kR)    = applyRotaryToHead headComp (StepCount (fromIntegral p)) (q0, k0)
-        in (qR, kR, v0)
-
-      -- Build scores/weights and outputs per head
-      oneHead h =
-        let hI       = fromEnum h
-            kvI      = hI `div` kvMul
-            (qR, _kR, _v) = qkv h    -- we don’t use K/V here; we pull from KV caches for consistency
-            k0       = kcK kv0 C.!! kvI
-            v0       = kcV kv0 C.!! kvI
-            k1       = kcK kv1 C.!! kvI
-            v1       = kcV kv1 C.!! kvI
-
-            -- scores over t=0..p
-            score0   = dotVec qR k0 / sqrt (fromIntegral (C.snatToNum (C.SNat @HeadDimension)) :: Float)
-            score1   = if p >= 1
-                        then dotVec qR k1 / sqrt (fromIntegral (C.snatToNum (C.SNat @HeadDimension)) :: Float)
-                        else -1.0e9
-            -- weights via softmax([score0, score1, -inf, ...])
-            scoresAll :: C.Vec SeqLen Float
-            scoresAll =
-              let base = C.repeat (-1.0e9) :: C.Vec SeqLen Float
-                  base' = C.replace 0 score0 base
-              in  if p >= 1 then C.replace 1 score1 base' else base'
-
-            weights  = Helpers.computeAttentionWeights scoresAll   -- length SeqLen
-            -- Values: only t<=p slots are non-zero
-            vAll :: C.Vec SeqLen (C.Vec HeadDimension Float)
-            vAll =
-              let z = C.repeat (C.repeat 0 :: C.Vec HeadDimension Float)
-                  z' = C.replace 0 v0 z
-              in  if p >= 1 then C.replace 1 v1 z' else z'
-        in Helpers.computeAttentionOutput weights vAll
-  in C.imap (\h _ -> oneHead h) (C.repeat (C.repeat 0 :: C.Vec HeadDimension Float))
-
--- One full layer pass with tracing at a given position (p = 0 or 1).
--- Returns (x_after_ffn, KV at this pos).
-traceLayerAt
-  :: Int                                    -- layer index (for tags)
-  -> Int                                    -- pos (0 or 1)
-  -> TransformerLayerComponent
-  -> C.Vec ModelDim Float                   -- x_in
-  -> KvCache                                -- kv0 (only used when pos==1)
-  -> IO (C.Vec ModelDim Float, KvCache)     -- (x_after_ffn, kv_at_pos)
-traceLayerAt l p layer xIn kv0 = do
-  let mha = multiHeadAttention layer
-      ffn = feedforwardNetwork layer
-
-      -- (a) xHat attn
-      xHat = rmsNorm xIn (rmsAtt mha)
-  whenP $ dump8 (tag "(a) xHat:") xHat
-
-  -- Build KV for this layer at current pos from xHat (rotated K)
-  let kvHere = kvForLayerAt layer (StepCount (fromIntegral p)) xHat
-
-  -- Attention outputs per head using KV caches:
-  -- p==0: use only kvHere
-  -- p==1: use kv0 (t0) and kvHere (t1)
-  let kv1 = kvHere
-      headsOut =
-        if p == 0
-          then C.map (\h -> kcV kvHere C.!! (fromEnum h)) (C.indicesI @NumQueryHeads) -- V itself
-          else headOutputsAt layer 1 xHat kv0 kv1
-
-      -- (b) concat_head at pos 0 equals the raw V by head; at pos 1 we skip printing concat
-      concatHead = C.concat headsOut
-  whenP $ when (p == 0) (dump8 (tag "(b) concat_head:") concatHead)
-
-  -- (c) WO @ head_concat (sum_h W_O[h] @ headOut[h])
-  let perHeadProj = C.zipWith matrixVectorMult (mWo mha) headsOut
-      yAttn       = C.foldl1 (C.zipWith (+)) perHeadProj
-  whenP $ dump8 (tag (if p==0 then "(c) WO@head_concat:" else "(c) WO@heads:")) yAttn
-
-  -- (d) x_after_attn
-  let xAfterAttn = C.zipWith (+) xIn yAttn
-  whenP $ dump8 (tag "(d) x_after_attn:") xAfterAttn
-
-  -- (e) xHat_ffn
-  let xHatFfn = rmsNorm xAfterAttn (fRMSFfn ffn)
-  whenP $ dump8 (tag "(e) xHat_ffn:") xHatFfn
-
-  -- (f)(g) W1/W3 * xHat_ffn
-  let gatePre = matrixVectorMult (fW1 ffn) xHatFfn
-      upPre   = matrixVectorMult (fW3 ffn) xHatFfn
-  whenP $ do
-    dump8 (tag "(f) W1*xHat_ffn:") gatePre
-    dump8 (tag "(g) W3*xHat_ffn:") upPre
-
-  -- (h) ffn_core = SiLU(gatePre) * upPre
-  let silu z = z / (1 + exp (-z))
-      ffnCore = C.zipWith (*) (C.map silu gatePre) upPre
-  whenP $ dump8 (tag "(h) ffn_core:") ffnCore
-
-  -- (W2) and residual
-  let ffnOut     = matrixVectorMult (fW2 ffn) ffnCore
-      xAfterFfn  = C.zipWith (+) xAfterAttn ffnOut
-  whenP $ dump8 (tag "(i) x_after_ffn:") xAfterFfn
-
-  pure (xAfterFfn, kvHere)
- where
-  whenP act = if p <= 1 then act else pure ()
-  tag s = "[L" ++ show l ++ " P" ++ show p ++ "] " ++ s
-
--- zero KV (used only to satisfy type at pos 0; not read)
-zeroKV :: KvCache
-zeroKV =
-  let zHead = C.repeat 0 :: C.Vec HeadDimension Float
-      zKV   = C.repeat zHead :: C.Vec NumKeyValueHeads (C.Vec HeadDimension Float)
-  in KvCache { kcK = zKV, kcV = zKV }
-
 -- Full-model trace at pos 0, and pos 1 if a second token is provided
 -- Pure L0 and pos=1 tracer for any layer; no transpose, no lists inside
 -- Minimal dumper: only converts to list at the very end
@@ -578,8 +390,8 @@ tracePos01AllLayers
 tracePos01AllLayers dec t0 t1 = do
   let EmbeddingComponent{vocabulary=CArray2D vocab} = modelEmbedding dec
       layersV = modelLayers dec
-      x0  = vocab C.!! fromIntegral t0
-      x1  = vocab C.!! fromIntegral t1
+      x0  = vocab C.!! t0
+      x1  = vocab C.!! t1
       silu z = z / (1 + exp (-z))
 
       -- explicit zeros with full type to help inference
@@ -621,7 +433,6 @@ tracePos01AllLayers dec t0 t1 = do
     putStrLn $ "[L" ++ show l ++ " P1] ----"
     -- P1 with two time steps in KV
     let xHat1 = rmsNorm x1 (rmsAtt mha)
-        qkv h v = runSingleHeadQKV (heads mha C.!! h) v
 
         kSeq h =
           let (_,k0,_) = qkv h xHat0
@@ -631,9 +442,9 @@ tracePos01AllLayers dec t0 t1 = do
           in C.replace d1 k1r (C.replace d0 k0r zerosSeq)
 
         vSeq h =
-          let (_,_,v0) = qkv h xHat0
+          let (_,_,v0') = qkv h xHat0
               (_,_,v1) = qkv h xHat1
-          in C.replace d1 v1 (C.replace d0 v0 zerosSeq)
+          in C.replace d1 v1 (C.replace d0 v0' zerosSeq)
 
         q1 h =
           let (q,_,_) = qkv h xHat1
@@ -655,6 +466,7 @@ tracePos01AllLayers dec t0 t1 = do
         core1     = C.zipWith (*) (C.map silu gate1) up1
         ffnOut1   = matrixVectorMult (fW2 ffn) core1
         xAfterFfn1 = C.zipWith (+) xAfterAttn1 ffnOut1
+        qkv h = runSingleHeadQKV (heads mha C.!! h)
 
     dump8 "[L P1] (a) xHat:" xHat1
     dump8 "[L P1] (c) WO@heads:" yAttn1
@@ -664,5 +476,5 @@ tracePos01AllLayers dec t0 t1 = do
     dump8 "[L P1] (i) x_after_ffn:" xAfterFfn1
 
   where
-    d0 = (0 :: C.Index SeqLen)
-    d1 = (1 :: C.Index SeqLen)
+    d0 = 0 :: C.Index SeqLen
+    d1 = 1 :: C.Index SeqLen

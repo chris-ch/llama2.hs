@@ -25,7 +25,8 @@ executable llama2
   other-modules:
     Helpers,
     Tokenizer,
-    Model
+    Model,
+    DebugDump
   hs-source-dirs:
       project/llama2
   build-depends: base,
