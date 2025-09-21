@@ -45,12 +45,8 @@ module Helpers (
 
 import Clash.Prelude
 
-import qualified Prelude as P
 import qualified Clash.Sized.Vector as CV
 import Data.Maybe (fromMaybe)
-import qualified Data.List as DL
-import Data.Ord (Down(..))
-import Text.Printf (printf)
 {- 
 -- model config 260K
 type ModelDim = 64

@@ -26,6 +26,11 @@ executable llama2
     Helpers,
     Tokenizer,
     Model,
+    Model.Types,
+    Model.Cache,
+    Model.Layer,
+    Model.Top,
+    Model.Attention,
     DebugDump
   hs-source-dirs:
       project/llama2

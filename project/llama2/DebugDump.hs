@@ -15,7 +15,7 @@ import Helpers
   , TransformerLayerComponent(..)
   , MultiHeadAttentionComponent(..)
   , FeedForwardNetworkComponent(..)
-  , CArray2D(..), NumLayers, Token, EmbeddingComponent (..), SeqLen, NumQueryHeads, HeadDimension, NumKeyValueHeads, VocabSize, ModelDim, dotProduct, rmsNorm, runSingleHeadQKV, applyRotaryToHead, StepCount (..), computeAttentionScores, computeAttentionWeights, computeAttentionOutput, matrixVectorMult, argMax, transformerLogits
+  , CArray2D(..), NumLayers, Token, EmbeddingComponent (..), SeqLen, NumQueryHeads, HeadDimension, VocabSize, ModelDim, dotProduct, rmsNorm, runSingleHeadQKV, applyRotaryToHead, StepCount (..), computeAttentionScores, computeAttentionWeights, computeAttentionOutput, matrixVectorMult, argMax, transformerLogits
   )
 import Text.Printf (printf)
 import qualified Data.List as DL
@@ -121,12 +121,6 @@ traceFullStackPos01 dec t0 t1 = do
                   (\h _ ->
                     let (q0r,k0r,v0) = qkv h xHat0
                         (q1r,k1r,v1) = qkv1 h
-                        -- map this Q head to its KV bank
-                        nQ = C.snatToNum (C.SNat @NumQueryHeads) :: Int
-                        nK = C.snatToNum (C.SNat @NumKeyValueHeads) :: Int
-                        kvMul = max 1 (nQ `div` nK)
-                        kvIdx :: C.Index NumKeyValueHeads
-                        kvIdx = fromInteger . toInteger $ (fromIntegral h `div` kvMul)
                         -- two-step K/V for this KV bank
                         kSeq = C.replace d1' k1r (C.replace d0' k0r zerosSeq)
                         vSeq = C.replace d1' v1  (C.replace d0' v0  zerosSeq)
