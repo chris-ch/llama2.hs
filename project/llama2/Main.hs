@@ -20,7 +20,7 @@ import Data.Time.Clock.POSIX (getPOSIXTime)
 import System.IO (hFlush, stdout)
 import Control.Monad (replicateM_)
 import Text.Printf (printf)
-
+import qualified Data.Foldable as DF
 import Helpers
     ( TransformerDecoderComponent(..),
       TransformerLayerComponent(TransformerLayerComponent,
@@ -45,9 +45,10 @@ import Helpers
       HiddenDim,
       ModelDim,
       vocabSize,
-      FreqDim, Temperature, Seed, runSingleHeadQKV, applyRotaryToHead, matrixVectorMult, rmsNorm, dotProduct, computeAttentionScores, computeAttentionWeights, computeAttentionOutput )
+      FreqDim, Temperature, Seed, runSingleHeadQKV, applyRotaryToHead, matrixVectorMult, rmsNorm, dotProduct, computeAttentionScores, computeAttentionWeights, computeAttentionOutput, dotVec )
 import Model ( topEntity )
 import qualified Tokenizer as T (buildTokenizer, encodeTokens, Tokenizer, decodePiece)
+import GHC.Base (when)
 
 --------------------------------------------------------------------------------
 -- Main entry point
@@ -73,9 +74,14 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
     promptTokensI = T.encodeTokens tokenizer (BSC.pack prompt') True False
     promptTokens  = map fromIntegral promptTokensI :: [Token]
 
+  -- After promptTokens are built:
   case promptTokens of
-    (t0:_) -> traceL0P0 config t0
-    []     -> pure ()
+    (t0:t1:_) -> do
+      putStrLn $ "[TRACE] token0=" ++ show t0
+      putStrLn $ "[TRACE] token1=" ++ show t1
+      -- Run pure tracer: compares directly to your C prints for pos 0 and pos 1
+      tracePos01AllLayers config t0 t1
+    _ -> putStrLn "Need at least two tokens in the prompt to run pos0/pos1 tracer."
 
   putStrLn "✅ model loaded successfully"
   putStrLn "<s>"
@@ -368,133 +374,295 @@ topEntityBundled decoder bundledInputs = topEntity decoder inputToken temp rngSe
   where
     (inputToken, temp, rngSeed) = C.unbundle bundledInputs
 
-dump8 :: String -> C.Vec n Float -> IO ()
-dump8 tag v = putStrLn $ tag ++ " " ++ show (take 8 (C.toList v))
+-- Top-5 helper (indices + values), small and simple
+top5 :: [Float] -> [(Int, Float)]
+top5 xs =
+  take 5 $ reverse $ DL.sortOn snd (zip [0..] xs)
 
 dump8L :: String -> [Float] -> IO ()
 dump8L tag xs = putStrLn $ tag ++ " " ++ show (take 8 xs)
 
-flattenHeads
-  :: C.Vec NumQueryHeads (C.Vec HeadDimension Float)
-  -> C.Vec ModelDim Float
-flattenHeads = C.concat
+-- KV cache for a single layer at a single position (we store rotated K and plain V)
+data KvCache = KvCache
+  { kcK :: C.Vec NumKeyValueHeads (C.Vec HeadDimension Float) -- rotated K at that pos
+  , kcV :: C.Vec NumKeyValueHeads (C.Vec HeadDimension Float) -- V at that pos
+  }
 
-traceL0P0 :: TransformerDecoderComponent -> Token -> IO ()
-traceL0P0 dec tok = do
+-- Build KV (rotated K, plain V) for a layer at a given pos and input xHat_attn
+kvForLayerAt
+  :: TransformerLayerComponent
+  -> StepCount
+  -> C.Vec ModelDim Float                  -- xHat (after rms_att)
+  -> KvCache
+kvForLayerAt layer step xHat =
+  let mha = multiHeadAttention layer
+      nQ  = C.snatToNum (C.SNat @NumQueryHeads)     :: Int
+      nKV = C.snatToNum (C.SNat @NumKeyValueHeads)  :: Int
+      kvMul = max 1 (nQ `div` nKV)
 
-  let EmbeddingComponent{vocabulary = CArray2D vocabRows, rmsFinalWeight = rmsFin} = modelEmbedding dec
-      l0 :: TransformerLayerComponent
-      l0 = C.head (modelLayers dec)
+      -- For each KV head, pick the first Q-head in its group to compute K,V
+      oneKV kvI =
+        let qIdx0   = kvI * kvMul
+            qIdx    = toEnum (min (nQ - 1) qIdx0)           :: C.Index NumQueryHeads
+            headComp = (heads mha) C.!! qIdx
+            (_q,k,v) = runSingleHeadQKV headComp xHat
+            (_qR,kR) = applyRotaryToHead headComp step (C.repeat 0, k)
+        in (kR, v)
+      pairs = C.map (\kvI -> oneKV (fromEnum kvI)) (C.indicesI @NumKeyValueHeads)
+      (ks, vs) = C.unzip pairs
+  in KvCache { kcK = ks, kcV = vs }
 
-      MultiHeadAttentionComponent{heads = hs, mWo = woSlices, rmsAtt = rmsAtt0} = multiHeadAttention l0
+-- Per-head attention output at pos p with causal mask over t<=p, using given KV caches
+-- We build 0..p slots, rest zeros/-inf
+headOutputAt
+  :: TransformerLayerComponent
+  -> Int                                   -- pos p (0 or 1 here)
+  -> C.Vec HeadDimension Float             -- q_rot at pos p (for this head)
+  -> C.Vec NumKeyValueHeads (C.Vec HeadDimension Float) -- Ks at each t (Vec over t is implicit by case)
+  -> C.Vec NumKeyValueHeads (C.Vec HeadDimension Float) -- Vs at each t
+  -> C.Vec HeadDimension Float
+headOutputAt layer p qRot kPerKV vPerKV =
+  let mha = multiHeadAttention layer
+      nQ  = C.snatToNum (C.SNat @NumQueryHeads)    :: Int
+      nKV = C.snatToNum (C.SNat @NumKeyValueHeads) :: Int
+      kvMul = max 1 (nQ `div` nKV)
 
-      ffn0 = feedforwardNetwork l0
-      FeedForwardNetworkComponent{ fRMSFfn = fRMSFfn0, fW1 = w1, fW2 = w2, fW3 = w3 } = ffn0
+      -- This head’s KV index
+      kvIdxForHead :: Int -> Int
+      kvIdxForHead h = h `div` kvMul
 
-      x   = vocabRows C.!! tok
-      xHat = rmsNorm x rmsAtt0
+      -- For this head, pick the corresponding KV rows across t
+      hIdxInt = 0 -- will be overridden by caller via mapping; we keep function generic below
+  in qRot `seq` kPerKV `seq` vPerKV `seq`
+     error "headOutputAt is used via headOutputsAt; do not call directly"
 
-      -- Per-head QKV from xHat; apply RoPE to Q & K only. At pos=0, attn output == V.
-      qkv h = runSingleHeadQKV (hs C.!! h) xHat
-      qkRot h =
-        let (q0,k0,_) = qkv h
-            (qR,kR)   = applyRotaryToHead (hs C.!! h) (StepCount 0) (q0,k0)
-        in (qR,kR)
+-- Compute all heads’ outputs at pos p given current xHat and KV caches for t=0 and t=1
+headOutputsAt
+  :: TransformerLayerComponent
+  -> Int                                   -- pos p (0 or 1)
+  -> C.Vec ModelDim Float                  -- xHat (after rms_att) at pos p
+  -> KvCache                               -- KV at t=0
+  -> KvCache                               -- KV at t=1 (only used when p==1)
+  -> C.Vec NumQueryHeads (C.Vec HeadDimension Float)
+headOutputsAt layer p xHat kv0 kv1 =
+  let mha = multiHeadAttention layer
+      nQ  = C.snatToNum (C.SNat @NumQueryHeads)    :: Int
+      nKV = C.snatToNum (C.SNat @NumKeyValueHeads) :: Int
+      kvMul = max 1 (nQ `div` nKV)
 
-      vHead h =
-        let (_,_,v0) = qkv h
-        in v0
+      -- Per-Q-head Q,K,V at pos p
+      qkv h =
+        let headComp = (heads mha) C.!! h
+            (q0,k0,v0) = runSingleHeadQKV headComp xHat
+            (qR,kR)    = applyRotaryToHead headComp (StepCount (fromIntegral p)) (q0, k0)
+        in (qR, kR, v0)
 
-      vHeads :: C.Vec NumQueryHeads (C.Vec HeadDimension Float)
-      vHeads = C.map vHead C.indicesI
+      -- Build scores/weights and outputs per head
+      oneHead h =
+        let hI       = fromEnum h
+            kvI      = hI `div` kvMul
+            (qR, _kR, _v) = qkv h    -- we don’t use K/V here; we pull from KV caches for consistency
+            k0       = kcK kv0 C.!! kvI
+            v0       = kcV kv0 C.!! kvI
+            k1       = kcK kv1 C.!! kvI
+            v1       = kcV kv1 C.!! kvI
 
-      concatHead :: C.Vec ModelDim Float
-      concatHead = flattenHeads vHeads
+            -- scores over t=0..p
+            score0   = dotVec qR k0 / sqrt (fromIntegral (C.snatToNum (C.SNat @HeadDimension)) :: Float)
+            score1   = if p >= 1
+                        then dotVec qR k1 / sqrt (fromIntegral (C.snatToNum (C.SNat @HeadDimension)) :: Float)
+                        else -1.0e9
+            -- weights via softmax([score0, score1, -inf, ...])
+            scoresAll :: C.Vec SeqLen Float
+            scoresAll =
+              let base = C.repeat (-1.0e9) :: C.Vec SeqLen Float
+                  base' = C.replace 0 score0 base
+              in  if p >= 1 then C.replace 1 score1 base' else base'
 
-      -- WO @ concat_head: do it equivalently to C: sum_h (WO_slice_h @ v_h)
-      perHeadProj :: C.Vec NumQueryHeads (C.Vec ModelDim Float)
-      perHeadProj = C.zipWith matrixVectorMult woSlices vHeads
+            weights  = Helpers.computeAttentionWeights scoresAll   -- length SeqLen
+            -- Values: only t<=p slots are non-zero
+            vAll :: C.Vec SeqLen (C.Vec HeadDimension Float)
+            vAll =
+              let z = C.repeat (C.repeat 0 :: C.Vec HeadDimension Float)
+                  z' = C.replace 0 v0 z
+              in  if p >= 1 then C.replace 1 v1 z' else z'
+        in Helpers.computeAttentionOutput weights vAll
+  in C.imap (\h _ -> oneHead h) (C.repeat (C.repeat 0 :: C.Vec HeadDimension Float))
 
-      yAttn :: C.Vec ModelDim Float
-      yAttn = C.foldl1 (C.zipWith (+)) perHeadProj
+-- One full layer pass with tracing at a given position (p = 0 or 1).
+-- Returns (x_after_ffn, KV at this pos).
+traceLayerAt
+  :: Int                                    -- layer index (for tags)
+  -> Int                                    -- pos (0 or 1)
+  -> TransformerLayerComponent
+  -> C.Vec ModelDim Float                   -- x_in
+  -> KvCache                                -- kv0 (only used when pos==1)
+  -> IO (C.Vec ModelDim Float, KvCache)     -- (x_after_ffn, kv_at_pos)
+traceLayerAt l p layer xIn kv0 = do
+  let mha = multiHeadAttention layer
+      ffn = feedforwardNetwork layer
 
-      xAfterAttn = C.zipWith (+) x yAttn
-      xHatFfn   = rmsNorm xAfterAttn fRMSFfn0
-      gatePre   = matrixVectorMult w1 xHatFfn
-      upPre     = matrixVectorMult w3 xHatFfn
-      gate      = C.map (\z -> z / (1 + exp (-z))) gatePre  -- SiLU
-      ffnCore   = matrixVectorMult w2 (C.zipWith (*) gate upPre)
-      xAfterFfn = C.zipWith (+) xAfterAttn ffnCore
-      xFin   = rmsNorm xAfterFfn rmsFin
-      logits = C.map (`dotProduct` xFin) vocabRows
-      top5   = take 5
-             $ reverse
-             $ DL.sortOn snd
-             $ zip [0..] (C.toList logits)
+      -- (a) xHat attn
+      xHat = rmsNorm xIn (rmsAtt mha)
+  whenP $ dump8 (tag "(a) xHat:") xHat
 
-  dump8 "[L0 P0] (a) xHat:" xHat
-  dump8 "[L0 P0] (b) concat_head:" concatHead
-  dump8 "[L0 P0] (c) WO@head_concat:" yAttn
-  dump8 "[L0 P0] (d) x_after_attn:" xAfterAttn
+  -- Build KV for this layer at current pos from xHat (rotated K)
+  let kvHere = kvForLayerAt layer (StepCount (fromIntegral p)) xHat
 
-  dump8 "[L0 P0] (e) xHat_ffn:" xHatFfn
-  dump8 "[L0 P0] (f) W1*xHat_ffn:" gatePre
-  dump8 "[L0 P0] (g) W3*xHat_ffn:" upPre
-  dump8 "[L0 P0] (h) ffn_core:" ffnCore
-  dump8 "[L0 P0] (i) x_after_ffn:" xAfterFfn
+  -- Attention outputs per head using KV caches:
+  -- p==0: use only kvHere
+  -- p==1: use kv0 (t0) and kvHere (t1)
+  let kv1 = kvHere
+      headsOut =
+        if p == 0
+          then C.map (\h -> kcV kvHere C.!! (fromEnum h)) (C.indicesI @NumQueryHeads) -- V itself
+          else headOutputsAt layer 1 xHat kv0 kv1
 
-  putStrLn $ "[P0] top5 logits (id, val): " ++ show top5
+      -- (b) concat_head at pos 0 equals the raw V by head; at pos 1 we skip printing concat
+      concatHead = C.concat headsOut
+  whenP $ when (p == 0) (dump8 (tag "(b) concat_head:") concatHead)
 
--- Pure L0, P1 check: recompute K/V for t=0 and t=1, then attention over both
-traceL0P1 :: TransformerDecoderComponent -> Token -> Token -> IO ()
-traceL0P1 dec t0 t1 = do
+  -- (c) WO @ head_concat (sum_h W_O[h] @ headOut[h])
+  let perHeadProj = C.zipWith matrixVectorMult (mWo mha) headsOut
+      yAttn       = C.foldl1 (C.zipWith (+)) perHeadProj
+  whenP $ dump8 (tag (if p==0 then "(c) WO@head_concat:" else "(c) WO@heads:")) yAttn
+
+  -- (d) x_after_attn
+  let xAfterAttn = C.zipWith (+) xIn yAttn
+  whenP $ dump8 (tag "(d) x_after_attn:") xAfterAttn
+
+  -- (e) xHat_ffn
+  let xHatFfn = rmsNorm xAfterAttn (fRMSFfn ffn)
+  whenP $ dump8 (tag "(e) xHat_ffn:") xHatFfn
+
+  -- (f)(g) W1/W3 * xHat_ffn
+  let gatePre = matrixVectorMult (fW1 ffn) xHatFfn
+      upPre   = matrixVectorMult (fW3 ffn) xHatFfn
+  whenP $ do
+    dump8 (tag "(f) W1*xHat_ffn:") gatePre
+    dump8 (tag "(g) W3*xHat_ffn:") upPre
+
+  -- (h) ffn_core = SiLU(gatePre) * upPre
+  let silu z = z / (1 + exp (-z))
+      ffnCore = C.zipWith (*) (C.map silu gatePre) upPre
+  whenP $ dump8 (tag "(h) ffn_core:") ffnCore
+
+  -- (W2) and residual
+  let ffnOut     = matrixVectorMult (fW2 ffn) ffnCore
+      xAfterFfn  = C.zipWith (+) xAfterAttn ffnOut
+  whenP $ dump8 (tag "(i) x_after_ffn:") xAfterFfn
+
+  pure (xAfterFfn, kvHere)
+ where
+  whenP act = if p <= 1 then act else pure ()
+  tag s = "[L" ++ show l ++ " P" ++ show p ++ "] " ++ s
+
+-- zero KV (used only to satisfy type at pos 0; not read)
+zeroKV :: KvCache
+zeroKV =
+  let zHead = C.repeat 0 :: C.Vec HeadDimension Float
+      zKV   = C.repeat zHead :: C.Vec NumKeyValueHeads (C.Vec HeadDimension Float)
+  in KvCache { kcK = zKV, kcV = zKV }
+
+-- Full-model trace at pos 0, and pos 1 if a second token is provided
+-- Pure L0 and pos=1 tracer for any layer; no transpose, no lists inside
+-- Minimal dumper: only converts to list at the very end
+dump8 :: String -> C.Vec n Float -> IO ()
+dump8 tag v = putStrLn $ tag ++ " " ++ show (take 8 (C.toList v))
+
+tracePos01AllLayers
+  :: TransformerDecoderComponent
+  -> Token  -- t0 (BOS=1)
+  -> Token  -- t1 (next prompt token)
+  -> IO ()
+tracePos01AllLayers dec t0 t1 = do
   let EmbeddingComponent{vocabulary=CArray2D vocab} = modelEmbedding dec
-      l0 = C.head (modelLayers dec)
-      mha = multiHeadAttention l0
-      rmsA = rmsAtt mha
+      layersV = modelLayers dec
+      x0  = vocab C.!! fromIntegral t0
+      x1  = vocab C.!! fromIntegral t1
+      silu z = z / (1 + exp (-z))
 
-      x0    = vocab C.!! fromIntegral t0
-      x1    = vocab C.!! fromIntegral t1
-      xHat0 = rmsNorm x0 rmsA
-      xHat1 = rmsNorm x1 rmsA
+      -- explicit zeros with full type to help inference
+      zerosSeq :: C.Vec SeqLen (C.Vec HeadDimension Float)
+      zerosSeq = C.repeat (C.repeat 0)
 
-      -- per-head QKV at t=0 and t=1
-      qkv h v = runSingleHeadQKV (heads mha C.!! h) v
-      rot h s (q,k) = applyRotaryToHead (heads mha C.!! h) (StepCount s) (q,k)
+  -- Iterate layers using Traversable; zip indices with layers
+  DF.for_ (C.zip (C.indicesI @NumLayers) layersV) $ \(lIdx, layer) -> do
+    let l = fromEnum lIdx
+        mha = multiHeadAttention layer
+        ffn = feedforwardNetwork layer
 
-      -- build per-head sequences of K,V: [t0, t1]
-      kSeq h = let (_,k0,_) = qkv h xHat0
-                   (_,k1,_) = qkv h xHat1
-                   (_,k0r)  = rot h 0 (C.repeat 0, k0)
-                   (_,k1r)  = rot h 1 (C.repeat 0, k1)
-               in C.replace 0 k0r $ C.replace 1 k1r $ C.repeat (C.repeat 0)
+    putStrLn $ "[L" ++ show l ++ " P0] ----"
+    -- P0 attention pre-norm
+    let xHat0  = rmsNorm x0 (rmsAtt mha)
+        -- QKV per head @ P0
+        qkv0 h = runSingleHeadQKV (heads mha C.!! h) xHat0
+        v0  h = let (_,_,v) = qkv0 h in v
+        vHeads0 = C.map v0 C.indicesI
+        -- sum_h (W_O(h) @ v_h)
+        yAttn0  = C.foldl1 (C.zipWith (+))
+                $ C.zipWith matrixVectorMult (mWo mha) vHeads0
+        xAfterAttn0 = C.zipWith (+) x0 yAttn0
 
-      vSeq h = let (_,_,v0) = qkv h xHat0
-                   (_,_,v1) = qkv h xHat1
-               in C.replace 0 v0  $ C.replace 1 v1  $ C.repeat (C.repeat 0)
+        xHatFfn0  = rmsNorm xAfterAttn0 (fRMSFfn ffn)
+        gate0     = matrixVectorMult (fW1 ffn) xHatFfn0
+        up0       = matrixVectorMult (fW3 ffn) xHatFfn0
+        core0     = C.zipWith (*) (C.map silu gate0) up0
+        ffnOut0   = matrixVectorMult (fW2 ffn) core0
+        xAfterFfn0 = C.zipWith (+) xAfterAttn0 ffnOut0
 
-      q1 h   = let (q,_,_) = qkv h xHat1
-                   (qr,_)  = rot h 1 (q, C.repeat 0)
-               in qr
+    dump8 "[L P0] (a) xHat:" xHat0
+    dump8 "[L P0] (c) WO@heads:" yAttn0
+    dump8 "[L P0] (d) x_after_attn:" xAfterAttn0
+    dump8 "[L P0] (e) xHat_ffn:" xHatFfn0
+    dump8 "[L P0] (h) ffn_core:" core0
+    dump8 "[L P0] (i) x_after_ffn:" xAfterFfn0
 
-      -- compute per-head outputs at pos=1 using your pure helpers
-      headOut h =
-        let
-          scores  = computeAttentionScores (q1 h) (kSeq h) -- keys[t]
-          weights = computeAttentionWeights (C.replace 2 (negate 1e9) scores) -- only t<=1 matter; rest masked
-          out     = computeAttentionOutput weights (vSeq h)
-        in out
+    putStrLn $ "[L" ++ show l ++ " P1] ----"
+    -- P1 with two time steps in KV
+    let xHat1 = rmsNorm x1 (rmsAtt mha)
+        qkv h v = runSingleHeadQKV (heads mha C.!! h) v
 
-      vHeadsOut = C.map headOut C.indicesI
-      yAttn     = C.foldl1 (C.zipWith (+))
-                $ C.zipWith matrixVectorMult (mWo mha) vHeadsOut
-      xAfterAttn = C.zipWith (+) x1 yAttn
+        kSeq h =
+          let (_,k0,_) = qkv h xHat0
+              (_,k1,_) = qkv h xHat1
+              (_,k0r)  = applyRotaryToHead (heads mha C.!! h) (StepCount 0) (C.repeat 0, k0)
+              (_,k1r)  = applyRotaryToHead (heads mha C.!! h) (StepCount 1) (C.repeat 0, k1)
+          in C.replace d1 k1r (C.replace d0 k0r zerosSeq)
 
-  dump8 "[L0 P1] (a) xHat1:" xHat1
-  let
-    attnScoresL0P1 :: C.Vec SeqLen Float
-    attnScoresL0P1 = computeAttentionScores (q1 0) (kSeq 0)
-    attnScoresL0P1List = C.toList attnScoresL0P1
-  dump8L "[L0 P1] (b) head0 scores t0..t1:" $ take 2 attnScoresL0P1List
-  dump8 "[L0 P1] (c) WO@concat:" yAttn
-  dump8 "[L0 P1] (d) x_after_attn:" xAfterAttn
+        vSeq h =
+          let (_,_,v0) = qkv h xHat0
+              (_,_,v1) = qkv h xHat1
+          in C.replace d1 v1 (C.replace d0 v0 zerosSeq)
+
+        q1 h =
+          let (q,_,_) = qkv h xHat1
+              (qr,_)  = applyRotaryToHead (heads mha C.!! h) (StepCount 1) (q, C.repeat 0)
+          in qr
+
+        scores h  = computeAttentionScores (q1 h) (kSeq h)   -- Vec SeqLen Float
+        weights h = computeAttentionWeights                   -- causal mask t>1
+                   (C.imap (\t s -> if fromEnum t <= 1 then s else s - 1.0e9) (scores h))
+        headOut h = computeAttentionOutput (weights h) (vSeq h)
+
+        yAttn1 = C.foldl1 (C.zipWith (+))
+              $ C.zipWith matrixVectorMult (mWo mha) (C.map headOut C.indicesI)
+        xAfterAttn1 = C.zipWith (+) x1 yAttn1
+
+        xHatFfn1  = rmsNorm xAfterAttn1 (fRMSFfn ffn)
+        gate1     = matrixVectorMult (fW1 ffn) xHatFfn1
+        up1       = matrixVectorMult (fW3 ffn) xHatFfn1
+        core1     = C.zipWith (*) (C.map silu gate1) up1
+        ffnOut1   = matrixVectorMult (fW2 ffn) core1
+        xAfterFfn1 = C.zipWith (+) xAfterAttn1 ffnOut1
+
+    dump8 "[L P1] (a) xHat:" xHat1
+    dump8 "[L P1] (c) WO@heads:" yAttn1
+    dump8 "[L P1] (d) x_after_attn:" xAfterAttn1
+    dump8 "[L P1] (e) xHat_ffn:" xHatFfn1
+    dump8 "[L P1] (h) ffn_core:" core1
+    dump8 "[L P1] (i) x_after_ffn:" xAfterFfn1
+
+  where
+    d0 = (0 :: C.Index SeqLen)
+    d1 = (1 :: C.Index SeqLen)
