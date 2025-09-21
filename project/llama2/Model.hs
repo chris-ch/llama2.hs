@@ -309,36 +309,6 @@ initAttentionCache = AttentionCache
   , valueCache = blockRam (replicate (SNat @CacheDepth) 0)
   }
 
--- Micro-FSM for Cycle3: iterate t = 0..pos (one per cycle).
--- done pulses one cycle after the last t was issued.
-cycle3AttnMicro
-  :: HiddenClockResetEnable dom
-  => Signal dom Bool                 -- start
-  -> Signal dom (Index SeqLen)       -- pos
-  -> ( Signal dom (Index SeqLen)     -- t counter (valid while busy)
-     , Signal dom Bool               -- busy
-     , Signal dom Bool               -- done pulse (1-cycle)
-     )
-cycle3AttnMicro startSig posSig = (tCnt, busySig, doneSig)
- where
-  startPrev  = register False startSig
-  startPulse = liftA2 (\now prev -> now && not prev) startSig startPrev
-
-  busySig = sig where
-    sig = register False next
-    next = liftA3 (\b sp dn -> (b && not dn) || sp) sig startPulse doneSig
-
-  tCnt = regEn 0 (startPulse .||. busySig) tNext
-
-  atLast = (==) <$> tCnt <*> posSig
-
-  tNext = mux busySig
-             (liftA2 (\t lastT -> if lastT then 0 else succ t) tCnt atLast)
-             tCnt
-
-  issuedLast = (&&) <$> busySig <*> atLast
-  doneSig    = register False issuedLast
-
 -- ============================================================================
 -- Multi-Cycle Transformer Layer
 -- ============================================================================
