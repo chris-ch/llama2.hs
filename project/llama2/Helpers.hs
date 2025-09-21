@@ -20,6 +20,7 @@ module Helpers (
   , Token
   , Temperature
   , Seed
+  , dotProduct
   , liftA5
   , runSingleHeadQKV
   , applyRotaryToHead
