@@ -45,10 +45,24 @@ import Helpers
       HiddenDim,
       ModelDim,
       vocabSize,
-      FreqDim, Temperature, Seed, runSingleHeadQKV, applyRotaryToHead, matrixVectorMult, rmsNorm, computeAttentionScores, computeAttentionWeights, computeAttentionOutput )
+      FreqDim, Temperature, Seed, runSingleHeadQKV, applyRotaryToHead, matrixVectorMult, rmsNorm, computeAttentionScores, computeAttentionWeights, computeAttentionOutput, transformerLogits, argMax )
 import Model ( topEntity )
 import qualified Tokenizer as T (buildTokenizer, encodeTokens, Tokenizer, decodePiece)
 import DebugDump (dumpLayerSums)
+import Data.Ord (Down(..))
+
+topKPairs :: Int -> C.Vec n Float -> [(Int, Float)]
+topKPairs k v =
+  take k $
+    DL.sortBy (\(_,a) (_,b) -> compare (Down a) (Down b)) $
+      zip [0..] (C.toList v)
+
+ppTopK :: String -> [(Int,Float)] -> IO ()
+ppTopK tag xs = do
+  putStr tag
+  let one (i,v) = "(" ++ show i ++ ", " ++ printf "%.7g" v ++ ")"
+  putStrLn $ " " ++ DL.intercalate ", " (map one xs)
+
 
 --------------------------------------------------------------------------------
 -- Main entry point
@@ -474,7 +488,23 @@ tracePos01AllLayers dec t0 t1 = do
     dump8 "[L P1] (e) xHat_ffn:" xHatFfn1
     dump8 "[L P1] (h) ffn_core:" core1
     dump8 "[L P1] (i) x_after_ffn:" xAfterFfn1
+    -- at end of P0 block
+    let logits0 = transformerLogits dec xAfterFfn0
+        top50   = topKPairs 5 logits0
+        am0     = argMax logits0
+        am0i    = fromIntegral am0 :: Int
+        am0v    = logits0 C.!! (toEnum am0i :: C.Index VocabSize)
+    ppTopK "[P0] top5:" top50
+    putStrLn $ "[P0] argmax: (" ++ show am0i ++ ", " ++ printf "%.7g" am0v ++ ")"
 
+    -- at end of P1 block
+    let logits1 = transformerLogits dec xAfterFfn1
+        top51   = topKPairs 5 logits1
+        am1     = argMax logits1
+        am1i    = fromIntegral am1 :: Int
+        am1v    = logits1 C.!! (toEnum am1i :: C.Index VocabSize)
+    ppTopK "[P1] top5:" top51
+    putStrLn $ "[P1] argmax: (" ++ show am1i ++ ", " ++ printf "%.7g" am1v ++ ")"
   where
     d0 = 0 :: C.Index SeqLen
     d1 = 1 :: C.Index SeqLen
