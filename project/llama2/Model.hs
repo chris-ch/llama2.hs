@@ -130,49 +130,51 @@ streamHeadAttentionAddrIO
   -> Signal dom (Vec HeadDimension Float)    -- q
   -> Signal dom (Vec HeadDimension Float)    -- curK (bypass)
   -> Signal dom (Vec HeadDimension Float)    -- curV (bypass)
-  -> Signal dom Float                        -- kQ (from RAM)
-  -> Signal dom Float                        -- vQ (from RAM)
+  -> Signal dom Float                        -- kQ (from RAM, 1-cycle)
+  -> Signal dom Float                        -- vQ (from RAM, 1-cycle)
   -> ( Signal dom BankAddr                   -- addr (use for both K and V)
      , Signal dom (Vec HeadDimension Float)  -- head output
      , Signal dom Bool                       -- busy
      , Signal dom Bool )                     -- done (1-cycle)
-streamHeadAttentionAddrIO startSig posSig qSig curKSig curVSig kQin vQin =
-  (addr, oOut, busySig, doneSig)
- where
-  -- Phases and enables (unchanged)
+
+streamHeadAttentionAddrIO startSig posSig qSig curKSig curVSig kQin vQin = (addr, oOut, busySig, doneSig) where
+
   phase    = register PhaseDot phaseNext
   isDot    = (== PhaseDot)      <$> phase
   isAcc    = (== PhaseAcc)      <$> phase
   isFin    = (== PhaseFinalize) <$> phase
-
   startPrev  = register False startSig
   startPulse = liftA2 (\n p -> n && not p) startSig startPrev
-  en         = startPulse .||. busySig
 
+  -- Enables
+  busySig = s where
+    s    = register False next
+    next = mux startPulse (pure True) $ mux doneSig (pure False) s
+
+  en = startPulse .||. busySig
+
+  -- Counters
   tCnt = regEn 0 en tNext
   dCnt = regEn 0 en dNext
-
+  dPrev = register 0 dCnt
   isLastD = (== maxBound) <$> dCnt
   isLastT = (==) <$> tCnt <*> posSig
-  dPrev   = register 0 dCnt
 
-  -- External RAM addressing
+  -- RAM addressing (synchronous read: data appears next cycle)
   addr = bankAddr <$> tCnt <*> dCnt
 
-  -- Synchronous read alignment
-  kAligned = register 0 kQin
-  vAligned = register 0 vQin
-
-  -- Bypass at t == pos (current row)
+  -- Bypass at t==pos (current row), aligned with dPrev
   useKBypass = (&&) <$> isDot <*> isLastT
   useVBypass = (&&) <$> isAcc <*> isLastT
-  kBypass = (!!) <$> curKSig <*> dPrev
-  vBypass = (!!) <$> curVSig <*> dPrev
-  kElem = mux useKBypass kBypass kAligned
-  vElem = mux useVBypass vBypass vAligned
+  kBypass    = (!!) <$> curKSig <*> dPrev
+  vBypass    = (!!) <$> curVSig <*> dPrev
+
+  -- Use RAM outputs directly (1-cycle) and align indexes with dPrev
+  kElem = mux useKBypass kBypass kQin
+  vElem = mux useVBypass vBypass vQin
   qElem = (!!) <$> qSig     <*> dPrev
 
-  -- Dot-product accumulation and online softmax (unchanged)
+  -- Scaled dot-product (online softmax)
   invSqrtHd :: Float
   invSqrtHd = 1.0 / sqrt (snatToNum (SNat @HeadDimension) :: Float)
 
@@ -185,17 +187,14 @@ streamHeadAttentionAddrIO startSig posSig qSig curKSig curVSig kQin vQin =
     mux isDot (mux isLastD (pure 0) partialDot) dotAcc
 
   scoreThisT  = regEn 0 dotBoundary (partialDot * pure invSqrtHd)
-
   mAcc = regEn (-(1/0)) en mNext
   sAcc = regEn 0        en sNext
   oNum = regEn (repeat (0 :: Float) :: Vec HeadDimension Float) en oNumNext
   oOut = regEn (repeat (0 :: Float) :: Vec HeadDimension Float) en oOutNext
-
   mNew     = max <$> mAcc <*> scoreThisT
   scaleOld = exp <$> ((-) <$> mAcc      <*> mNew)
   scaleNew = exp <$> ((-) <$> scoreThisT <*> mNew)
   sNew     = (+) <$> ((* ) <$> sAcc <*> scaleOld) <*> scaleNew
-
   oElemPrev   = (!!) <$> oNum <*> dPrev
   oElemUpd    = (\o v a b -> o * b + v * a) <$> oElemPrev <*> vElem <*> scaleNew <*> scaleOld
   oOutDivElem = (/ ) <$> oElemPrev <*> sNew
@@ -215,10 +214,6 @@ streamHeadAttentionAddrIO startSig posSig qSig curKSig curVSig kQin vQin =
   oOutNext =
     mux startPulse (pure (repeat 0)) $
     mux isFin (replace <$> dPrev <*> oOutDivElem <*> oOut) oOut
-
-  busySig = s where
-    s    = register False next
-    next = mux startPulse (pure True) $ mux doneSig (pure False) s
 
   phaseNext =
     liftA3
@@ -375,45 +370,29 @@ multiCycleTransformerLayer layer owner layerIdx stateSig dataSig =
   mha = multiHeadAttention layer
   ffn = feedforwardNetwork layer
 
-  -- Stage enables (only when this layer is active)
+  -- Stage qualifiers
   stgEq s = liftA2 (\st _ -> psStage st == s && psLayer st == layerIdx) stateSig (pure ())
-  attStart = stgEq Cycle3_ComputeAttn
+  isC3    = stgEq Cycle3_ComputeAttn
+  isC4    = stgEq Cycle4_WriteCache
+  attStart = isC3
+  posSig   = psSeqPos <$> stateSig
 
-  posSig = psSeqPos <$> stateSig
-
-  -- Attention micro-FSM (unchanged)
-  (_tCnt, _attBusy, _) = cycle3AttnMicro attStart posSig
-
-  doneAllHeadsSig = fmap P.and (sequenceA headDoneSigsVec)
-
-  doneAllPrev = register False doneAllHeadsSig
-  attnDoneThisLayerSig = liftA2 (\n p -> n && not p) doneAllHeadsSig doneAllPrev
-
-  banksThisLayer = kvBanks owner
-
-  -- Streaming attention, one instance per query head
-
-  isC3 = stgEq Cycle3_ComputeAttn
-  isC4 = stgEq Cycle4_WriteCache
-
-  -- For each KV bank, wire two heads (A and B) in Cycle3, or the writer on port B in Cycle4.
-  -- Collect per-head outputs in a Vec NumQueryHeads of Signals
-  -- Vec of per-head outputs and per-head done flags
-
-  (headsOutSigsVec, headDoneSigsVec) =
+  -- For each KV bank: two attention runners share the bank; same bank’s writer runs in Cycle4.
+  (headsOutSigsVec, headDoneSigsVec, wrBankDoneVec) =
     let
-      initOut :: Vec NumQueryHeads (Signal dom (Vec HeadDimension Float))
-      initOut  = repeat (pure (repeat 0))
-      initDone :: Vec NumQueryHeads (Signal dom Bool)
-      initDone = repeat (pure (False :: Bool))
+      initOut  = repeat (pure (repeat 0)) :: Vec NumQueryHeads (Signal dom (Vec HeadDimension Float))
+      initDone = repeat (pure False)      :: Vec NumQueryHeads (Signal dom Bool)
+      initWr   = repeat (pure False)      :: Vec NumKeyValueHeads (Signal dom Bool)
+
       headsPerGroupI :: Int
-      headsPerGroupI = natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads
+      headsPerGroupI = natToNum @NumQueryHeads `div` natToNum @NumKeyValueHeads
+
       qHi :: Int
       qHi = natToNum @NumQueryHeads - 1
 
-      fillOneBank (outAcc, doneAcc) kv =
+      fillOneBank (outAcc, doneAcc, wrAcc) kv =
         let
-          bank  = banksThisLayer !! kv
+          bank  = kvBanks owner !! kv
           kRun  = runK bank
           vRun  = runV bank
 
@@ -430,9 +409,11 @@ multiCycleTransformerLayer layer owner layerIdx stateSig dataSig =
           (addr0, out0, _busy0, done0) = streamHeadAttentionAddrIO attStart posSig q0S kCur vCur kQ0 vQ0
           (addr1, out1, _busy1, done1) = streamHeadAttentionAddrIO attStart posSig q1S kCur vCur kQ1 vQ1
 
-          kvPairSig                   = liftA2 (,) kCur vCur
-          (wrAddr, kWr, vWr, _wrDone) = writeSequencer isC4 posSig kvPairSig
+          -- Single writer instance for this bank
+          kvPairSig                       = liftA2 (,) kCur vCur
+          (wrAddr, kWr, vWr, wrDoneBank)  = writeSequencer isC4 posSig kvPairSig
 
+          -- Port muxing: in C3 both ports read; in C4, port B writes
           addrA = addr0
           wrA   = pure Nothing
           addrB = mux isC3 addr1 wrAddr
@@ -449,24 +430,24 @@ multiCycleTransformerLayer layer owner layerIdx stateSig dataSig =
           doneAcc0 = replace q0i done0 doneAcc
           outAcc1  = if hasQ1 then replace q1i out1 outAcc0 else outAcc0
           doneAcc1 = if hasQ1 then replace q1i done1 doneAcc0 else doneAcc0
-        in (outAcc1, doneAcc1)
-    in P.foldl fillOneBank (initOut, initDone) indicesI
+          wrAcc1   = replace kv wrDoneBank wrAcc
+        in (outAcc1, doneAcc1, wrAcc1)
+    in P.foldl fillOneBank (initOut, initDone, initWr) indicesI
 
-  -- Vec NumQueryHeads (Signal (Vec ModelDim Float))
-  perHeadProjectedVec =
-    zipWith (\wo h -> matrixVectorMult wo <$> h) (mWo mha) headsOutSigsVec
+  -- Attention done for this layer = all heads done (rising edge)
+  doneAllHeadsSig     = fmap P.and (sequenceA headDoneSigsVec)
+  doneAllPrev         = register False doneAllHeadsSig
+  attnDoneThisLayerSig = liftA2 (\n p -> n && not p) doneAllHeadsSig doneAllPrev
 
-  -- Signal (Vec NumQueryHeads (Vec ModelDim Float))
+  -- Project each head with its W_O slice, then sum across heads
+  perHeadProjectedVec = zipWith (\wo h -> matrixVectorMult wo <$> h) (mWo mha) headsOutSigsVec
   perHeadProjectedSig = sequenceA perHeadProjectedVec
-
-  -- Signal (Vec ModelDim Float)
   attnSumSig = fmap (foldl1 (zipWith (+))) perHeadProjectedSig
 
-  -- Residual: x + sum_h W_O h_out
-  -- Signal (Vec ModelDim Float)
+  -- Residual: x + sum_h(W_O @ h)
   attnOutSig = (zipWith (+) P.. idInputVec P.<$> dataSig) <*> attnSumSig
 
-  -- Commit idAttnOutput only when this layer’s attention finishes
+  -- Commit attention output only on this layer’s attn done pulse in Cycle3
   nextDataSig =
     liftA4
       (\st cur attOut done ->
@@ -475,16 +456,13 @@ multiCycleTransformerLayer layer owner layerIdx stateSig dataSig =
            else cur)
       stateSig baseNextDataSig attnOutSig attnDoneThisLayerSig
 
-  -- Collect wrDone from the same writeSequencer used to drive the RAMs
-  wrDoneVec = imap (\kv _ ->
-                      let kvPair = liftA2 (,) (getK dataSig kv) (getV dataSig kv)
-                          (_,_,_,wd) = writeSequencer isC4 posSig kvPair
-                      in wd) (repeat ())
-                      
+  -- Layer write done = AND across banks, qualified to this layer/stage
   writeDoneThisLayerSig =
-    (\st d -> psStage st == Cycle4_WriteCache && psLayer st == layerIdx && d)
-      <$> stateSig <*> fmap or (sequenceA wrDoneVec)
+    let allBanksDone = fmap P.and (sequenceA wrBankDoneVec)
+    in  (\st d -> psStage st == Cycle4_WriteCache && psLayer st == layerIdx && d)
+        <$> stateSig <*> allBanksDone
 
+  -- Same gated “commit” view used by the outer pipeline
   commitCycle3 =
     liftA4
       (\st cur attOut done ->
@@ -493,7 +471,7 @@ multiCycleTransformerLayer layer owner layerIdx stateSig dataSig =
           else cur)
       stateSig dataSig attnOutSig attnDoneThisLayerSig
 
-  -- Cycle1 no-op; QKV/FFN unchanged;
+  -- Default per-stage work within this layer
   baseNextDataSig = liftA2 processCycle stateSig dataSig
 
   processCycle :: ProcessingState -> IntermediateData -> IntermediateData
@@ -505,30 +483,27 @@ multiCycleTransformerLayer layer owner layerIdx stateSig dataSig =
           Cycle2_ComputeQKV ->
             let
               xHat = rmsNorm (idInputVec idata) (rmsAtt mha)
-              queries = imap (\hIdx _ ->
-                let headComp = heads mha !! hIdx
-                    (q, _, _) = runSingleHeadQKV headComp xHat
-                    (q_rot, _) = applyRotaryToHead headComp
-                                    (StepCount $ fromIntegral $ psSeqPos st)
-                                    (q, repeat 0)
-                in q_rot) indicesI
-              headsPerGroupI' :: Int
-              headsPerGroupI' = natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads
-              toIndexClamped :: forall n. KnownNat n => Int -> Index n
-              toIndexClamped i =
-                let hi = natToNum @n - 1
-                    j  = max 0 (min hi i)
-                in toEnum j
-              keysAndValues =
+              -- Queries: one per Q head (with RoPE on Q)
+              queries =
                 imap (\hIdx _ ->
-                  let qIdx :: Index NumQueryHeads
-                      qIdx = toIndexClamped @NumQueryHeads (fromEnum hIdx * headsPerGroupI')
-                      headComp = heads mha !! qIdx
-                      (_, k, v) = runSingleHeadQKV headComp xHat
-                      (_, k_rot) = applyRotaryToHead headComp
-                                    (StepCount $ fromIntegral $ psSeqPos st)
-                                    (repeat 0, k)
-                  in (k_rot, v)) indicesI
+                  let headComp = heads mha !! hIdx
+                      (q, _, _)   = runSingleHeadQKV headComp xHat
+                      (qRot, _kU) = applyRotaryToHead headComp
+                                      (StepCount $ fromIntegral $ psSeqPos st)
+                                      (q, repeat 0)
+                  in qRot) indicesI
+
+              -- Keys/Values: one per KV head (apply RoPE to K only)
+              keysAndValues =
+                imap (\kvIdx _ ->
+                  let qIdx0 = fromEnum kvIdx * (natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads)
+                      qIdx  = toEnum (min (natToNum @NumQueryHeads - 1) qIdx0) :: Index NumQueryHeads
+                      headComp     = heads mha !! qIdx
+                      (_q, k, v)   = runSingleHeadQKV headComp xHat
+                      (_qU, kRot)  = applyRotaryToHead headComp
+                                       (StepCount $ fromIntegral $ psSeqPos st)
+                                       (repeat 0, k)
+                  in (kRot, v)) indicesI
               (keys, values) = unzip keysAndValues
             in idata { idQueries = queries, idKeys = keys, idValues = values }
           Cycle3_ComputeAttn -> idata
