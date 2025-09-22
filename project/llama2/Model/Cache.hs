@@ -7,19 +7,15 @@ module Model.Cache
   , makeRamOwnerKV
   , writeSequencer
     -- Global caches
-  , AttentionCache(..)
-  , initAttentionCache
   ) where
 
 import Clash.Prelude
 import qualified Prelude as P
 
-import Model.Types
-  ( BankDepth, BankAddress, CacheDepth, CacheAddress, TrueDualPortRunner )
-
 import Helpers ( NumKeyValueHeads, HeadDimension, SeqLen )
 
 import Data.Maybe (isJust)
+import Model.Core.Types (BankAddress, TrueDualPortRunner, BankDepth)
 
 -- Convert separate read and optional-write signals into a unified RAM operation stream.
 --   - If write is present, emit a RamWrite
@@ -94,17 +90,3 @@ writeSequencer enableSignal sequencePositionSignal keyValueVectorsSignal =
     mux enableSignal (Just <$> bundle (bankAddressSignal, keyElementSignal)) (pure Nothing)
   valueWriteSignal =
     mux enableSignal (Just <$> bundle (bankAddressSignal, valueElementSignal)) (pure Nothing)
-
--- ----------------------------------------------------------------------------
--- Global attention caches (all layers); simple 1-port RAMs
-
-data AttentionCache dom = AttentionCache
-  { keyCacheRam   :: Signal dom CacheAddress -> Signal dom (Maybe (CacheAddress, Float)) -> Signal dom Float
-  , valueCacheRam :: Signal dom CacheAddress -> Signal dom (Maybe (CacheAddress, Float)) -> Signal dom Float
-  }
-
-initAttentionCache :: forall dom. HiddenClockResetEnable dom => AttentionCache dom
-initAttentionCache = AttentionCache
-  { keyCacheRam   = blockRam (replicate (SNat @CacheDepth) 0)
-  , valueCacheRam = blockRam (replicate (SNat @CacheDepth) 0)
-  }

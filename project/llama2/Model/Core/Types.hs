@@ -1,4 +1,4 @@
-module Model.Types
+module Model.Core.Types
   ( -- State machine
     CycleStage(..)
   , ProcessingState(..)

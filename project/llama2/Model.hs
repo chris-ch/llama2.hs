@@ -5,6 +5,7 @@ module Model
   , ProcessingState(..)
   ) where
 
-import Model.Top (topEntity, multiCycleTransformer)
-import Model.Cache (initAttentionCache)
-import Model.Types (ProcessingState(..))
+import Model.Top (topEntity)
+import Model.Top.Transformer (multiCycleTransformer)
+import Model.Core.Types (ProcessingState(..))
+import Model.Layers.Attention.AttentionHead (initAttentionCache)

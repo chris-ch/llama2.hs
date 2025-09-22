@@ -13,7 +13,7 @@ import Helpers
   , computeFeedForward, rmsNorm, matrixVectorMult, liftA4, FeedForwardNetworkComponent
   )
 
-import Model.Types
+import Model.Core.Types
   ( ProcessingState(..), IntermediateData(..), CycleStage (..)
   )
 

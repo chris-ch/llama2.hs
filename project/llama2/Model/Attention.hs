@@ -7,7 +7,7 @@ import Clash.Prelude
 
 import Helpers ( HeadDimension, SeqLen, liftA4, liftA5 )
 import Model.Cache (computeBankAddress)
-import Model.Types (BankAddress)
+import Model.Core.Types (BankAddress)
 
 data AttnPhase = PhaseDot | PhaseAcc | PhaseFinalize
   deriving (Generic, NFDataX, Eq, Show)
