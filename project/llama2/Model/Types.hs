@@ -16,7 +16,6 @@ module Model.Types
   ) where
 
 import Clash.Prelude
-import qualified Prelude as P
 import qualified GHC.TypeNats
 import GHC.Stack (HasCallStack)
 

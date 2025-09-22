@@ -20,7 +20,6 @@ import Data.Time.Clock.POSIX (getPOSIXTime)
 import System.IO (hFlush, stdout)
 import Control.Monad (replicateM_)
 import Text.Printf (printf)
-import qualified Data.Foldable as DF
 import Helpers
     ( TransformerDecoderComponent(..),
       TransformerLayerComponent(TransformerLayerComponent,
@@ -45,24 +44,10 @@ import Helpers
       HiddenDim,
       ModelDim,
       vocabSize,
-      FreqDim, Temperature, Seed, runSingleHeadQKV, applyRotaryToHead, matrixVectorMult, rmsNorm, computeAttentionScores, computeAttentionWeights, computeAttentionOutput, transformerLogits, argMax )
+      FreqDim, Temperature, Seed )
 import Model ( topEntity )
 import qualified Tokenizer as T (buildTokenizer, encodeTokens, Tokenizer, decodePiece)
 import DebugDump (dumpLayerSums, traceFullStackPos01, tracePos01AllLayers)
-import Data.Ord (Down(..))
-
-topKPairs :: Int -> C.Vec n Float -> [(Int, Float)]
-topKPairs k v =
-  take k $
-    DL.sortBy (\(_,a) (_,b) -> compare (Down a) (Down b)) $
-      zip [0..] (C.toList v)
-
-ppTopK :: String -> [(Int,Float)] -> IO ()
-ppTopK tag xs = do
-  putStr tag
-  let one (i,v) = "(" ++ show i ++ ", " ++ printf "%.7g" v ++ ")"
-  putStrLn $ " " ++ DL.intercalate ", " (map one xs)
-
 
 --------------------------------------------------------------------------------
 -- Main entry point

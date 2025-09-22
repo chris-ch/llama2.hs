@@ -4,7 +4,6 @@ module Model.Attention
   ) where
 
 import Clash.Prelude
-import GHC.Stack (HasCallStack)
 
 import Helpers ( HeadDimension, SeqLen, liftA4 )
 import Model.Cache (bankAddr)
