@@ -21,7 +21,9 @@ import Helpers ( NumKeyValueHeads, HeadDimension, SeqLen )
 
 import Data.Maybe (isJust)
 
--- Convert (address + optional write) into a RAM operation stream
+-- Convert separate read and optional-write signals into a unified RAM operation stream.
+--   - If write is present, emit a RamWrite
+--   - Otherwise emit a RamRead
 toRamOperation
   :: NFDataX a
   => Signal dom (Index n)              -- read address signal
@@ -33,6 +35,8 @@ toRamOperation addressSignal writeMaybeSignal =
       (RamRead <$> addressSignal)
 
 -- Compute bank address from sequence index and head-dimension index
+-- Assumes headDimIndex in [0, HeadDimension-1], sequenceIndex in [0, SeqLen-1].
+-- Bank address = time * HeadDimension + headDimIndex.
 computeBankAddress :: Index SeqLen -> Index HeadDimension -> BankAddress
 computeBankAddress sequenceIndex headDimIndex =
   toEnum (fromIntegral headDimIndex + fromIntegral sequenceIndex * natToNum @HeadDimension)
@@ -58,6 +62,8 @@ makeRamOwnerKV :: HiddenClockResetEnable dom => KVRamOwner dom
 makeRamOwnerKV = KVRamOwner { kvBanks = map (const makeBankKV) indicesI }
 
 -- Writer sequencer for one bank: generates (addr, write) streams and a done pulse.
+-- Walks through HeadDimension over successive cycles, writing K and V vectors
+-- to the bank. Emits a one-cycle done pulse after writing the last dimension.
 writeSequencer
   :: HiddenClockResetEnable dom
   => Signal dom Bool                                    -- enable signal

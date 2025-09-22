@@ -9,18 +9,17 @@ import Helpers ( HeadDimension, SeqLen, liftA4, liftA5 )
 import Model.Cache (computeBankAddress)
 import Model.Types (BankAddress)
 
--- One-head streaming attention with online softmax, aligned to 1-cycle BRAM latency.
--- Phases:
---   Dot:  compute score_t = (q · k_t) / sqrt(d) for t = 0..pos
---   Acc:  update running m,s and numerator oNum with scaleOld/scaleNew for this t
---   Fin:  emit head output o = oNum / s for all d
---
--- We use a 1-cycle warm-up at the start of Dot and Acc so that BRAM outputs
--- (kQin/vQin) align with the element index we accumulate. Bypass of current-row
--- K/V is aligned using (tPrev,dPrev).
 data AttnPhase = PhaseDot | PhaseAcc | PhaseFinalize
   deriving (Generic, NFDataX, Eq, Show)
 
+-- Streaming single-head attention with online softmax.
+-- Phases:
+--   PhaseDot: compute dot product q·k_t over d
+--   PhaseAcc: accumulate max/sum and numerator over timesteps
+--   PhaseFinalize: compute final output vector
+-- Notes:
+--   - One-cycle BRAM latency is handled by warm-up/bypass
+--   - Emits done pulse after last element finalized
 streamHeadAttentionAddrIO
   :: HiddenClockResetEnable dom
   => Signal dom Bool                         -- start signal
@@ -188,6 +187,7 @@ streamHeadAttentionAddrIO startSignal sequencePositionSignal queryVectorSignal c
           PhaseFinalize -> current)
       phaseSignal warmupSignal isLastDimensionSignal isLastTimeSignal timeCounterSignal
 
-  -- done pulse at end of Finalize, after last element written
+  -- One-cycle pulse after the final output element is written,
+  -- signalling this head is done for current sequence position.
   donePulseSignal =
     register False $ (&&) <$> (isFinalizePhase .&&. warmupSignal) <*> isLastDimensionSignal

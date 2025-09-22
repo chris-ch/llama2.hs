@@ -46,6 +46,12 @@ type TrueDualPortRunner dom n a =
 -- Multi-Cycle State Machine
 -- ============================================================================
 
+-- FSM stages for each layer:
+--   1. ReadCache      (load K/V from RAM)
+--   2. ComputeQKV     (compute Q/K/V from input)
+--   3. ComputeAttention (stream attention)
+--   4. WriteCache     (store new K/V to RAM)
+--   5. ComputeFeedForward (FFN)
 data CycleStage =
     Cycle1_ReadCache
   | Cycle2_ComputeQKV
@@ -64,6 +70,8 @@ instance NFDataX CycleStage where
   deepErrorX :: HasCallStack => String -> CycleStage
   deepErrorX = errorX
 
+-- Tracks which stage, which layer, and which sequence position
+-- the pipeline is currently processing.
 data ProcessingState = ProcessingState
   { processingStage  :: CycleStage
   , processingLayer  :: Index NumLayers
@@ -99,6 +107,8 @@ nextProcessingState state = case processingStage state of
 -- Intermediate Data Storage
 -- ============================================================================
 
+-- Per-layer intermediate data vectors carried through the pipeline.
+-- Updated selectively depending on cycle stage.
 data IntermediateData = IntermediateData
   { inputVector       :: Vec ModelDim Float
   , queryVectors      :: Vec NumQueryHeads (Vec HeadDimension Float)

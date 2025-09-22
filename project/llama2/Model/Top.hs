@@ -21,7 +21,10 @@ import Model.Cache
 
 import Model.Layer (multiCycleTransformerLayer)
 
--- Run layers; gather per-stage done pulses
+-- One fold step over layers:
+--   - Run a single transformer layer (multi-cycle)
+--   - Collect its write-done and attention-done pulses into vectors
+--   - Merge the new IntermediateData with the pipeline’s current data depending on stage
 foldLayerStep
   :: HiddenClockResetEnable dom
   => Signal dom ProcessingState
@@ -49,7 +52,11 @@ foldLayerStep processingStateSignal (currentDataSignal, writeDoneVector, attnDon
       , replace layerIndex writeDoneSignal writeDoneVector
       , replace layerIndex attnDoneSignal  attnDoneVector)
 
--- Full transformer (multi-cycle, advance on stageDone)
+-- Full multi-cycle transformer decoder:
+--   - Steps through Cycle1..Cycle5 across all layers
+--   - Uses stage-done pulses to advance ProcessingState
+--   - Handles embedding, sampling, and PRNG state
+--   - Emits (token, readyPulse) at the end of the last layer FFN
 multiCycleTransformer
   :: forall dom
    . HiddenClockResetEnable dom
@@ -112,6 +119,9 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
                              processingStage processingState == Cycle5_ComputeFeedForward &&
                              processingLayer processingState == maxBound)
                            processingStateSignal (pure ())
+
+  -- One-cycle pulse emitted when the last layer finishes its feed-forward stage.
+  -- Used to trigger sampling and PRNG reseeding.
   readyPulseSignal = liftA2 (\now prev -> now && not prev)
                             isLastLayerFFN (register False isLastLayerFFN)
 

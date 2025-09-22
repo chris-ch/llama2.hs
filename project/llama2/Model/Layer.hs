@@ -20,7 +20,7 @@ import Model.Types
 import qualified Model.Attention as Attention
 import qualified Model.Cache as Cache
 
--- Accessors for IntermediateData signals
+-- Access the per-head vectors from IntermediateData for use in attention.
 getQueryVector :: Signal dom IntermediateData -> Index NumQueryHeads -> Signal dom (Vec HeadDimension Float)
 getQueryVector intermediateDataSignal queryHeadIndex =
   fmap (\idata -> queryVectors idata !! queryHeadIndex) intermediateDataSignal
@@ -52,7 +52,12 @@ hasSecondQueryHead keyValueHeadIndex = queryHeadsPerKeyValueHead >= 2 && (baseQu
 queryHeadIndex1 :: Index NumKeyValueHeads -> Index NumQueryHeads
 queryHeadIndex1 keyValueHeadIndex = if hasSecondQueryHead keyValueHeadIndex then toEnum (baseQueryIndex keyValueHeadIndex + 1) else queryHeadIndex0 keyValueHeadIndex
 
--- One layer of the multi-cycle pipeline
+-- One transformer layer running across multiple cycles:
+--   Cycle2: compute Q/K/V
+--   Cycle3: run attention heads with streaming RAM reads
+--   Cycle4: write K/V to RAM
+--   Cycle5: feed-forward network
+-- Handles per-head attention and per-bank K/V cache writes.
 multiCycleTransformerLayer
   :: HiddenClockResetEnable dom
   => TransformerLayerComponent
@@ -132,6 +137,11 @@ multiCycleTransformerLayer transformerLayerComponent kvRamOwner layerIndex proce
            processingStateSignal
            intermediateDataSignal
 
+-- For one K/V bank:
+--   - Runs attention for one or two query heads mapped to this bank
+--   - Reads K/V from RAM (or bypass at current t)
+--   - Writes new K/V during Cycle4
+-- Accumulates head outputs and per-bank writeDone pulses.
 fillOneBank
   :: HiddenClockResetEnable dom
   => Index NumLayers
@@ -200,6 +210,10 @@ fillOneBank layerIndex processingStateSignal kvRamOwner intermediateDataSignal (
   in
     (headOutputAcc1, headDoneAcc1, writeDoneAcc1)
 
+-- Stateless per-cycle computation for a single layer:
+--   - In Cycle2 computes Q/K/V (with RoPE)
+--   - In Cycle5 computes feed-forward network
+--   - Otherwise passes IntermediateData through unchanged
 processCycle
   :: MultiHeadAttentionComponent
   -> FeedForwardNetworkComponent
