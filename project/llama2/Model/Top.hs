@@ -12,14 +12,42 @@ import Helpers
   )
 
 import Model.Types
-  ( ProcessingState(..), initialProcessingState, nextState
+  ( ProcessingState(..), initialProcessingState, nextProcessingState
   , IntermediateData(..), initialIntermediateData, CycleStage (..)
   )
 
 import Model.Cache
-  ( KVRamOwner(..), mkKVRamOwner )
+  ( KVRamOwner(..), makeRamOwnerKV)
 
 import Model.Layer (multiCycleTransformerLayer)
+
+-- Run layers; gather per-stage done pulses
+foldLayerStep
+  :: HiddenClockResetEnable dom
+  => Signal dom ProcessingState
+  -> ( Signal dom IntermediateData
+      , Vec NumLayers (Signal dom Bool)  -- writeDone by layer
+      , Vec NumLayers (Signal dom Bool)) -- attnDone  by layer (rising edge)
+  -> (TransformerLayerComponent, KVRamOwner dom, Index NumLayers)
+  -> ( Signal dom IntermediateData
+      , Vec NumLayers (Signal dom Bool)
+      , Vec NumLayers (Signal dom Bool))
+foldLayerStep processingStateSignal (currentDataSignal, writeDoneVector, attnDoneVector)
+              (transformerLayerComponent, cacheOwner, layerIndex) =
+  let (newIntermediateDataSignal, writeDoneSignal, attnDoneSignal, commitCycle3Signal) =
+        multiCycleTransformerLayer transformerLayerComponent cacheOwner layerIndex processingStateSignal currentDataSignal
+
+      selectedIntermediateDataSignal = liftA4
+        (\processingState oldData newData commitCycle3Data ->
+            if processingLayer processingState == layerIndex
+              then if processingStage processingState == Cycle3_ComputeAttention
+                    then commitCycle3Data
+                    else newData
+              else oldData)
+        processingStateSignal currentDataSignal newIntermediateDataSignal commitCycle3Signal
+  in ( selectedIntermediateDataSignal
+      , replace layerIndex writeDoneSignal writeDoneVector
+      , replace layerIndex attnDoneSignal  attnDoneVector)
 
 -- Full transformer (multi-cycle, advance on stageDone)
 multiCycleTransformer
@@ -27,129 +55,106 @@ multiCycleTransformer
    . HiddenClockResetEnable dom
   => TransformerDecoderComponent
   -> Vec NumLayers (KVRamOwner dom)
-  -> Signal dom (Unsigned 32)  -- Token
-  -> Signal dom Temperature
-  -> Signal dom Seed
+  -> Signal dom (Unsigned 32)  -- Input token signal
+  -> Signal dom Temperature    -- Temperature signal
+  -> Signal dom Seed           -- PRNG seed signal
   -> (Signal dom (Unsigned 32), Signal dom Bool)
-multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
-  (outputTokenSig, readyPulseSig)
+multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal seedSignal =
+  (outputTokenSignal, readyPulseSignal)
  where
-  embedding    = modelEmbedding decoder
-  layers       = modelLayers decoder
-  inputVecSig  = embed (vocabulary embedding) <$> tokenSig
+  embeddingComponent      = modelEmbedding decoder
+  transformerLayers       = modelLayers decoder
+  tokenEmbeddingSignal    = embed (vocabulary embeddingComponent) <$> inputTokenSignal
 
-  -- Global controller: advance only when current stageDone is asserted
-  advance st done = if done then nextState st else st
-  procStateSig = register initialProcessingState (advance <$> procStateSig <*> stageDoneSig)
+  advanceProcessingState currentState stageFinished =
+    if stageFinished then nextProcessingState currentState else currentState
 
-  -- Intermediate data register
-  currentDataSig = register initialIntermediateData nextDataSig
+  processingStateSignal =
+    register initialProcessingState (advanceProcessingState <$> processingStateSignal <*> stageFinishedSignal)
 
-  -- Load the layer input at Cycle1:
-  -- - layer 0 gets the token embedding
-  -- - layers >0 get the previous layer's FFN output
-  inputLoadedSig =
+  intermediateDataSignal = register initialIntermediateData nextIntermediateDataSignal
+
+  -- Load layer input at Cycle1
+  inputLoadedSignal =
     liftA3
-      (\st cur inp ->
-         if psStage st == Cycle1_ReadCache
-           then if psLayer st == 0
-                  then cur { idInputVec = inp }                -- layer 0: embedding
-                  else cur { idInputVec = idFFNOutput cur }    -- higher layers: previous FFN
-           else cur)
-      procStateSig currentDataSig inputVecSig
+      (\processingState currentIntermediateData tokenEmbedding ->
+         if processingStage processingState == Cycle1_ReadCache
+           then if processingLayer processingState == 0
+                  then currentIntermediateData { inputVector = tokenEmbedding }                
+                  else currentIntermediateData { inputVector = feedForwardOutput currentIntermediateData }
+           else currentIntermediateData)
+      processingStateSignal intermediateDataSignal tokenEmbeddingSignal
 
-  -- Run layers; gather per-stage done pulses
-  foldStep
-    :: ( Signal dom IntermediateData
-      , Vec NumLayers (Signal dom Bool)  -- writeDone by layer
-      , Vec NumLayers (Signal dom Bool)) -- attnDone  by layer (rising edge)
-    -> (TransformerLayerComponent, KVRamOwner dom, Index NumLayers)
-    -> ( Signal dom IntermediateData
-      , Vec NumLayers (Signal dom Bool)
-      , Vec NumLayers (Signal dom Bool))
-  foldStep (dSig, wD, aD) (layer, cache, lidx) =
-    let (newD, wDoneL, aDoneL, commitC3) =
-          multiCycleTransformerLayer layer cache lidx procStateSig dSig
+  ( nextIntermediateDataSignal
+    , writeDoneVector
+    , attnDoneVector) =
+    foldl (foldLayerStep processingStateSignal) (inputLoadedSignal, repeat (pure False), repeat (pure False))
+                        (zip3 transformerLayers cacheOwners indicesI)
 
-        dSel = liftA4
-          (\st old new commit ->
-             if psLayer st == lidx
-               then if psStage st == Cycle3_ComputeAttn
-                      then commit   -- gated write-back on attnDone (this layer)
-                      else new
-               else old)
-          procStateSig dSig newD commitC3
-    in ( dSel
-       , replace lidx wDoneL wD
-       , replace lidx aDoneL aD)
+  layerIndexSignal   = processingLayer <$> processingStateSignal
+  writeDoneThisLayer = (!!) <$> sequenceA writeDoneVector <*> layerIndexSignal
+  attnDoneThisLayer  = (!!) <$> sequenceA attnDoneVector  <*> layerIndexSignal
 
-  (nextDataSig, writeDoneVec, attnDoneVec) =
-    foldl foldStep (inputLoadedSig, repeat (pure False), repeat (pure False))
-                   (zip3 layers caches indicesI)
+  -- Stage done selection
+  stageSignal = processingStage <$> processingStateSignal
+  isStage cycleStage = (== cycleStage) <$> stageSignal
 
-  -- Select this-layer done instead of OR across all layers
-  layerIdxSig     = psLayer <$> procStateSig
-  writeDoneThis   = (!!) <$> sequenceA writeDoneVec <*> layerIdxSig
-  attnDoneThis    = (!!) <$> sequenceA attnDoneVec  <*> layerIdxSig
-
-  -- Stage done selection (only consider the current layer)
-  stgSig = psStage <$> procStateSig
-  is c   = (== c) <$> stgSig
-
-  stageDoneSig =
-    mux (is Cycle1_ReadCache)   (pure True)   $
-    mux (is Cycle2_ComputeQKV)  (pure True)   $
-    mux (is Cycle3_ComputeAttn) attnDoneThis  $
-    mux (is Cycle4_WriteCache)  writeDoneThis $
-    mux (is Cycle5_ComputeFFN)  (pure True)   $
+  stageFinishedSignal =
+    mux (isStage Cycle1_ReadCache)   (pure True)   $
+    mux (isStage Cycle2_ComputeQKV)  (pure True)   $
+    mux (isStage Cycle3_ComputeAttention) attnDoneThisLayer  $
+    mux (isStage Cycle4_WriteCache)  writeDoneThisLayer $
+    mux (isStage Cycle5_ComputeFeedForward)  (pure True)   $
     pure False
 
-  -- Ready pulse at last layer FFN completion (rising edge)
-  isLastFFN  = liftA2 (\st _ -> psStage st == Cycle5_ComputeFFN && psLayer st == maxBound)
-                      procStateSig (pure ())
-  readyPulseSig = liftA2 (\now prev -> now && not prev) isLastFFN (register False isLastFFN)
+  -- Ready pulse at last layer FFN completion
+  isLastLayerFFN  = liftA2 (\processingState _ ->
+                             processingStage processingState == Cycle5_ComputeFeedForward &&
+                             processingLayer processingState == maxBound)
+                           processingStateSignal (pure ())
+  readyPulseSignal = liftA2 (\now prev -> now && not prev)
+                            isLastLayerFFN (register False isLastLayerFFN)
 
-  -- logits from the current (next) data
-  logitsNow = transformerLogits decoder . idFFNOutput <$> nextDataSig
+  -- logits from the current data
+  logitsSignal = transformerLogits decoder . feedForwardOutput <$> nextIntermediateDataSignal
 
-  -- PRNG state: seed is mixed in on the first pulse; otherwise advance each pulse
-  firstPulseSig :: Signal dom Bool
-  firstPulseSig = regEn True readyPulseSig (pure False)
+  -- PRNG state
+  firstPulseSignal :: Signal dom Bool
+  firstPulseSignal = regEn True readyPulseSignal (pure False)
 
-  mixedSeedSig :: Signal dom (Unsigned 32)
-  mixedSeedSig = (`xor` 0x9E3779B9) <$> seedSig
+  mixedSeedSignal :: Signal dom (Unsigned 32)
+  mixedSeedSignal = (`xor` 0x9E3779B9) <$> seedSignal
 
-  prngStateSig :: Signal dom (Unsigned 32)
-  prngStateSig =
-    let nextVal = mux firstPulseSig (xorshift32 <$> mixedSeedSig)
-                                    (xorshift32 <$> prngStateSig)
-    in regEn 2463534242 readyPulseSig nextVal  -- non-zero default
+  prngStateSignal :: Signal dom (Unsigned 32)
+  prngStateSignal =
+    let nextVal = mux firstPulseSignal (xorshift32 <$> mixedSeedSignal)
+                                        (xorshift32 <$> prngStateSignal)
+    in regEn 2463534242 readyPulseSignal nextVal
 
-  -- Convert to Float in [0,1). Use top 24 bits as mantissa fraction.
-  uniform01Sig :: Signal dom Float
-  uniform01Sig = (/ 16777216.0) . fromIntegral . (`shiftR` 8) <$> prngStateSig
+  uniformRandom01Signal :: Signal dom Float
+  uniformRandom01Signal = (/ 16777216.0) . fromIntegral . (`shiftR` 8) <$> prngStateSignal
 
-  -- Sampling on pulse:
-  sampledTokenOnPulse :: Signal dom (Unsigned 32)
-  sampledTokenOnPulse =
+  -- Sampling on pulse
+  sampledTokenSignal :: Signal dom (Unsigned 32)
+  sampledTokenSignal =
     liftA3
-      (\temperature logs u ->
-         if temperature <= 0.0 then argMax logs
-         else let probs = softmax temperature logs in sampleFromProbs u probs)
-      temperatureSig logitsNow uniform01Sig
+      (\temperature logits randomVal ->
+         if temperature <= 0.0 then argMax logits
+         else let probabilities = softmax temperature logits
+              in sampleFromProbs randomVal probabilities)
+      temperatureSignal logitsSignal uniformRandom01Signal
 
-  outputTokenSig = regEn 0 readyPulseSig sampledTokenOnPulse
+  outputTokenSignal = regEn 0 readyPulseSignal sampledTokenSignal
 
 -- ============================================================================
 -- Top Entity
 -- ============================================================================
-
 topEntity
   :: forall dom
    . HiddenClockResetEnable dom
   => TransformerDecoderComponent
-  -> Signal dom (Unsigned 32)  -- Token
+  -> Signal dom (Unsigned 32)  -- Input token
   -> Signal dom Temperature
   -> Signal dom Seed
   -> (Signal dom (Unsigned 32), Signal dom Bool)
-topEntity decoder = multiCycleTransformer decoder (repeat mkKVRamOwner)
+topEntity decoder = multiCycleTransformer decoder (repeat makeRamOwnerKV)

@@ -3,16 +3,16 @@ module Model.Types
     CycleStage(..)
   , ProcessingState(..)
   , initialProcessingState
-  , nextState
+  , nextProcessingState
     -- Intermediate data
   , IntermediateData(..)
   , initialIntermediateData
     -- Geometry and helpers
   , BankDepth
-  , BankAddr
+  , BankAddress
   , CacheDepth
-  , CacheAddr
-  , TdprRunner
+  , CacheAddress
+  , TrueDualPortRunner
   ) where
 
 import Clash.Prelude
@@ -22,22 +22,25 @@ import GHC.Stack (HasCallStack)
 import Helpers
   ( NumQueryHeads, NumKeyValueHeads, NumLayers, SeqLen, HeadDimension, ModelDim )
 
--- Bank geometry
-type BankDepth = SeqLen GHC.TypeNats.* HeadDimension
-type BankAddr  = Index BankDepth
+-- ============================================================================
+-- Bank and Cache Geometry
+-- ============================================================================
+
+type BankDepth   = SeqLen GHC.TypeNats.* HeadDimension
+type BankAddress = Index BankDepth
 
 -- Global KV-cache geometry (all layers × KV heads × seq × headDim)
-type CacheDepth = NumLayers GHC.TypeNats.* NumKeyValueHeads GHC.TypeNats.* SeqLen GHC.TypeNats.* HeadDimension
-type CacheAddr  = Index CacheDepth
+type CacheDepth   = NumLayers GHC.TypeNats.* NumKeyValueHeads GHC.TypeNats.* SeqLen GHC.TypeNats.* HeadDimension
+type CacheAddress = Index CacheDepth
 
 -- Dual-port RAM runner type (true dual port)
-type TdprRunner dom n a =
+type TrueDualPortRunner dom n a =
        ( Signal dom (Index n)               -- Port A address
        , Signal dom (Maybe (Index n, a)) )  -- Port A write (optional)
     -> ( Signal dom (Index n)               -- Port B address
        , Signal dom (Maybe (Index n, a)) )  -- Port B write (optional)
-    -> ( Signal dom a                       -- qA
-       , Signal dom a )                     -- qB
+    -> ( Signal dom a                       -- Port A read output
+       , Signal dom a )                     -- Port B read output
 
 -- ============================================================================
 -- Multi-Cycle State Machine
@@ -46,9 +49,9 @@ type TdprRunner dom n a =
 data CycleStage =
     Cycle1_ReadCache
   | Cycle2_ComputeQKV
-  | Cycle3_ComputeAttn
+  | Cycle3_ComputeAttention
   | Cycle4_WriteCache
-  | Cycle5_ComputeFFN
+  | Cycle5_ComputeFeedForward
   deriving (Show, Eq, Enum, Bounded, Generic)
 
 instance NFDataX CycleStage where
@@ -62,55 +65,55 @@ instance NFDataX CycleStage where
   deepErrorX = errorX
 
 data ProcessingState = ProcessingState
-  { psStage  :: CycleStage
-  , psLayer  :: Index NumLayers
-  , psSeqPos :: Index SeqLen
+  { processingStage  :: CycleStage
+  , processingLayer  :: Index NumLayers
+  , sequencePosition :: Index SeqLen
   } deriving (Show, Generic, NFDataX)
 
 initialProcessingState :: ProcessingState
 initialProcessingState = ProcessingState
-  { psStage  = Cycle1_ReadCache
-  , psLayer  = 0
-  , psSeqPos = 0
+  { processingStage  = Cycle1_ReadCache
+  , processingLayer  = 0
+  , sequencePosition = 0
   }
 
 -- Single state transition function (one step)
-nextState :: ProcessingState -> ProcessingState
-nextState st = case psStage st of
-  Cycle1_ReadCache   -> st { psStage = Cycle2_ComputeQKV }
-  Cycle2_ComputeQKV  -> st { psStage = Cycle3_ComputeAttn }
-  Cycle3_ComputeAttn -> st { psStage = Cycle4_WriteCache }
-  Cycle4_WriteCache  -> st { psStage = Cycle5_ComputeFFN }
-  Cycle5_ComputeFFN ->
-    if psLayer st == maxBound
-      then st { psStage  = Cycle1_ReadCache
-              , psLayer  = 0
-              , psSeqPos = if psSeqPos st == maxBound then 0 else succ (psSeqPos st)
-              }
-      else st { psStage  = Cycle1_ReadCache
-              , psLayer  = succ (psLayer st)
-              }
+nextProcessingState :: ProcessingState -> ProcessingState
+nextProcessingState state = case processingStage state of
+  Cycle1_ReadCache          -> state { processingStage = Cycle2_ComputeQKV }
+  Cycle2_ComputeQKV         -> state { processingStage = Cycle3_ComputeAttention }
+  Cycle3_ComputeAttention   -> state { processingStage = Cycle4_WriteCache }
+  Cycle4_WriteCache         -> state { processingStage = Cycle5_ComputeFeedForward }
+  Cycle5_ComputeFeedForward ->
+    if processingLayer state == maxBound
+      then state { processingStage  = Cycle1_ReadCache
+                 , processingLayer  = 0
+                 , sequencePosition = if sequencePosition state == maxBound
+                                        then 0 else succ (sequencePosition state)
+                 }
+      else state { processingStage  = Cycle1_ReadCache
+                 , processingLayer  = succ (processingLayer state)
+                 }
 
 -- ============================================================================
--- Intermediate data storage
+-- Intermediate Data Storage
 -- ============================================================================
 
 data IntermediateData = IntermediateData
-  { idInputVec   :: Vec ModelDim Float
-  , idQueries    :: Vec NumQueryHeads (Vec HeadDimension Float)
-  , idKeys       :: Vec NumKeyValueHeads (Vec HeadDimension Float)
-  , idValues     :: Vec NumKeyValueHeads (Vec HeadDimension Float)
-  , idAttnOutput :: Vec ModelDim Float
-  , idFFNOutput  :: Vec ModelDim Float
+  { inputVector       :: Vec ModelDim Float
+  , queryVectors      :: Vec NumQueryHeads (Vec HeadDimension Float)
+  , keyVectors        :: Vec NumKeyValueHeads (Vec HeadDimension Float)
+  , valueVectors      :: Vec NumKeyValueHeads (Vec HeadDimension Float)
+  , attentionOutput   :: Vec ModelDim Float
+  , feedForwardOutput :: Vec ModelDim Float
   } deriving (Show, Generic, NFDataX)
 
 initialIntermediateData :: IntermediateData
 initialIntermediateData = IntermediateData
-  { idInputVec   = repeat 0
-  , idQueries    = repeat (repeat 0)
-  , idKeys       = repeat (repeat 0)
-  , idValues     = repeat (repeat 0)
-  , idAttnOutput = repeat 0
-  , idFFNOutput  = repeat 0
+  { inputVector       = repeat 0
+  , queryVectors      = repeat (repeat 0)
+  , keyVectors        = repeat (repeat 0)
+  , valueVectors      = repeat (repeat 0)
+  , attentionOutput   = repeat 0
+  , feedForwardOutput = repeat 0
   }
-  

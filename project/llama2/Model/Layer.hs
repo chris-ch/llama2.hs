@@ -1,5 +1,5 @@
 module Model.Layer
-  ( getQ, getK, getV
+  ( getQueryVector, getKeyVector, getValueVector
   , multiCycleTransformerLayer
   ) where
 
@@ -21,20 +21,36 @@ import qualified Model.Attention as Attention
 import qualified Model.Cache as Cache
 
 -- Accessors for IntermediateData signals
-getQ :: Signal dom IntermediateData -> Index NumQueryHeads -> Signal dom (Vec HeadDimension Float)
-getQ dataSig h = fmap (\idata -> idQueries idata !! h) dataSig
+getQueryVector :: Signal dom IntermediateData -> Index NumQueryHeads -> Signal dom (Vec HeadDimension Float)
+getQueryVector intermediateDataSignal queryHeadIndex =
+  fmap (\idata -> queryVectors idata !! queryHeadIndex) intermediateDataSignal
 
-getK :: Signal dom IntermediateData -> Index NumKeyValueHeads -> Signal dom (Vec HeadDimension Float)
-getK dataSig kv = fmap (\idata -> idKeys idata !! kv) dataSig
+getKeyVector :: Signal dom IntermediateData -> Index NumKeyValueHeads -> Signal dom (Vec HeadDimension Float)
+getKeyVector intermediateDataSignal keyValueHeadIndex =
+  fmap (\idata -> keyVectors idata !! keyValueHeadIndex) intermediateDataSignal
 
-getV :: Signal dom IntermediateData -> Index NumKeyValueHeads -> Signal dom (Vec HeadDimension Float)
-getV dataSig kv = fmap (\idata -> idValues idata !! kv) dataSig
+getValueVector :: Signal dom IntermediateData -> Index NumKeyValueHeads -> Signal dom (Vec HeadDimension Float)
+getValueVector intermediateDataSignal keyValueHeadIndex =
+  fmap (\idata -> valueVectors idata !! keyValueHeadIndex) intermediateDataSignal
 
-headsPerGroupI :: Int
-headsPerGroupI = natToNum @NumQueryHeads `div` natToNum @NumKeyValueHeads
+-- Query heads per KV head
+queryHeadsPerKeyValueHead :: Int
+queryHeadsPerKeyValueHead = natToNum @NumQueryHeads `div` natToNum @NumKeyValueHeads
 
-qHi :: Int
-qHi = natToNum @NumQueryHeads - 1
+maxQueryHeadIndex :: Int
+maxQueryHeadIndex = natToNum @NumQueryHeads - 1
+
+baseQueryIndex :: Index NumKeyValueHeads -> Int
+baseQueryIndex keyValueHeadIndex = fromEnum keyValueHeadIndex * queryHeadsPerKeyValueHead
+
+queryHeadIndex0 :: Index NumKeyValueHeads -> Index NumQueryHeads
+queryHeadIndex0 keyValueHeadIndex = toEnum (min maxQueryHeadIndex (baseQueryIndex keyValueHeadIndex))
+
+hasSecondQueryHead :: Index NumKeyValueHeads -> Bool
+hasSecondQueryHead keyValueHeadIndex = queryHeadsPerKeyValueHead >= 2 && (baseQueryIndex keyValueHeadIndex + 1 <= maxQueryHeadIndex)
+
+queryHeadIndex1 :: Index NumKeyValueHeads -> Index NumQueryHeads
+queryHeadIndex1 keyValueHeadIndex = if hasSecondQueryHead keyValueHeadIndex then toEnum (baseQueryIndex keyValueHeadIndex + 1) else queryHeadIndex0 keyValueHeadIndex
 
 -- One layer of the multi-cycle pipeline
 multiCycleTransformerLayer
@@ -48,62 +64,76 @@ multiCycleTransformerLayer
      , Signal dom Bool     -- writeDone (Cycle4)
      , Signal dom Bool     -- attnDone  (Cycle3)
      , Signal dom IntermediateData) -- commitCycle3 (gated write-back)
-multiCycleTransformerLayer layer owner layerIdx stateSig dataSig =
-  (nextDataSig, writeDoneThisLayerSig, attnDoneThisLayerSig, commitCycle3)
+multiCycleTransformerLayer transformerLayerComponent kvRamOwner layerIndex processingStateSignal intermediateDataSignal =
+  (nextIntermediateDataSignal, writeDoneThisLayerSignal, attentionDoneThisLayerSignal, commitCycle3Signal)
  where
-  mha = multiHeadAttention layer
-  ffn = feedforwardNetwork layer
+  multiHeadAttentionComponent  = multiHeadAttention transformerLayerComponent
+  feedForwardNetworkComponent = feedforwardNetwork transformerLayerComponent
 
   -- For each KV bank: two attention runners share the bank; same bank’s writer runs in Cycle4.
-  (headsOutSigsVec, headDoneSigsVec, wrBankDoneVec) =
+  (perHeadOutputSignalsVec, perHeadDoneSignalsVec, perBankWriteDoneVec) =
     let
-      initOut  = repeat (pure (repeat 0)) :: Vec NumQueryHeads (Signal dom (Vec HeadDimension Float))
-      initDone = repeat (pure False)      :: Vec NumQueryHeads (Signal dom Bool)
-      initWr   = repeat (pure False)      :: Vec NumKeyValueHeads (Signal dom Bool)
-
-    in P.foldl (fillOneBank layerIdx stateSig owner dataSig) (initOut, initDone, initWr) indicesI
+      initHeadOutputs  = repeat (pure (repeat 0)) :: Vec NumQueryHeads (Signal dom (Vec HeadDimension Float))
+      initHeadDone     = repeat (pure False)      :: Vec NumQueryHeads (Signal dom Bool)
+      initWriteDone    = repeat (pure False)      :: Vec NumKeyValueHeads (Signal dom Bool)
+    in P.foldl
+         (fillOneBank layerIndex processingStateSignal kvRamOwner intermediateDataSignal)
+         (initHeadOutputs, initHeadDone, initWriteDone)
+         indicesI
 
   -- Attention done for this layer = all heads done (rising edge)
-  doneAllHeadsSig     = fmap P.and (sequenceA headDoneSigsVec)
-  doneAllPrev         = register False doneAllHeadsSig
-  attnDoneThisLayerSig = liftA2 (\n p -> n && not p) doneAllHeadsSig doneAllPrev
+  allHeadsDoneSignal          = fmap P.and (sequenceA perHeadDoneSignalsVec)
+  allHeadsDonePreviousSignal  = register False allHeadsDoneSignal
+  attentionDoneThisLayerSignal =
+    liftA2 (\now prev -> now && not prev) allHeadsDoneSignal allHeadsDonePreviousSignal
 
   -- Project each head with its W_O slice, then sum across heads
-  perHeadProjectedVec = zipWith (\wo h -> matrixVectorMult wo <$> h) (mWo mha) headsOutSigsVec
-  perHeadProjectedSig = sequenceA perHeadProjectedVec
-  attnSumSig = fmap (foldl1 (zipWith (+))) perHeadProjectedSig
+  perHeadProjectedSignalsVec = zipWith
+                                 (\wo hSig -> matrixVectorMult wo <$> hSig)
+                                 (mWo multiHeadAttentionComponent)
+                                 perHeadOutputSignalsVec
+  perHeadProjectedSignal = sequenceA perHeadProjectedSignalsVec
+  attentionSumSignal     = fmap (foldl1 (zipWith (+))) perHeadProjectedSignal
 
   -- Residual: x + sum_h(W_O @ h)
-  attnOutSig = (zipWith (+) P.. idInputVec P.<$> dataSig) <*> attnSumSig
+  attentionOutputSignal =
+    (zipWith (+) P.. inputVector P.<$> intermediateDataSignal) <*> attentionSumSignal
 
   -- Commit attention output only on this layer’s attn done pulse in Cycle3
-  nextDataSig =
+  nextIntermediateDataSignal =
     liftA4
-      (\st cur attOut done ->
-         if psLayer st == layerIdx && psStage st == Cycle3_ComputeAttn && done
-           then cur { idAttnOutput = attOut }
-           else cur)
-      stateSig baseNextDataSig attnOutSig attnDoneThisLayerSig
+      (\procState currentIntermediateData attentionOutput doneSignal ->
+         if processingLayer procState == layerIndex && processingStage procState == Cycle3_ComputeAttention && doneSignal
+           then currentIntermediateData { attentionOutput = attentionOutput }
+           else currentIntermediateData)
+      processingStateSignal baseNextIntermediateDataSignal attentionOutputSignal attentionDoneThisLayerSignal
 
   -- Layer write done = AND across banks, qualified to this layer/stage
-  writeDoneThisLayerSig =
-    let allBanksDone = fmap P.and (sequenceA wrBankDoneVec)
-    in  (\st d -> psStage st == Cycle4_WriteCache && psLayer st == layerIdx && d)
-        <$> stateSig <*> allBanksDone
+  writeDoneThisLayerSignal =
+    let allBanksDoneSignal = fmap P.and (sequenceA perBankWriteDoneVec)
+    in  (\procState banksDone ->
+           processingStage procState == Cycle4_WriteCache &&
+           processingLayer procState == layerIndex &&
+           banksDone)
+        <$> processingStateSignal <*> allBanksDoneSignal
 
   -- Same gated “commit” view used by the outer pipeline
-  commitCycle3 =
+  commitCycle3Signal =
     liftA4
-      (\st cur attOut done ->
-        if psLayer st == layerIdx && psStage st == Cycle3_ComputeAttn && done
-          then cur { idAttnOutput = attOut }
-          else cur)
-      stateSig dataSig attnOutSig attnDoneThisLayerSig
+      (\procState currentIntermediateData attentionOutput doneSignal ->
+        if processingLayer procState == layerIndex && processingStage procState == Cycle3_ComputeAttention && doneSignal
+          then currentIntermediateData { attentionOutput = attentionOutput }
+          else currentIntermediateData)
+      processingStateSignal intermediateDataSignal attentionOutputSignal attentionDoneThisLayerSignal
 
   -- Default per-stage work within this layer
-  baseNextDataSig = liftA2 (processCycle mha ffn layerIdx) stateSig dataSig
+  baseNextIntermediateDataSignal =
+    liftA2 (processCycle multiHeadAttentionComponent feedForwardNetworkComponent layerIndex)
+           processingStateSignal
+           intermediateDataSignal
 
-fillOneBank :: HiddenClockResetEnable dom
+fillOneBank
+  :: HiddenClockResetEnable dom
   => Index NumLayers
   -> Signal dom ProcessingState
   -> Cache.KVRamOwner dom
@@ -115,98 +145,104 @@ fillOneBank :: HiddenClockResetEnable dom
   -> ( Vec NumQueryHeads (Signal dom (Vec HeadDimension Float))
      , Vec NumQueryHeads (Signal dom Bool)
      , Vec NumKeyValueHeads (Signal dom Bool))
-fillOneBank layerIdx stateSig owner dataSig (outAcc, doneAcc, wrAcc) kv =
+fillOneBank layerIndex processingStateSignal kvRamOwner intermediateDataSignal (headOutputAcc, headDoneAcc, writeDoneAcc) keyValueHeadIndex =
   let
-    stgEq s = liftA2 (\st _ -> psStage st == s && psLayer st == layerIdx) stateSig (pure ())
-    isC3    = stgEq Cycle3_ComputeAttn
-    isC4    = stgEq Cycle4_WriteCache
-    attStart = isC3
-    posSig   = psSeqPos <$> stateSig
+    stageEquals cycleStage =
+      liftA2 (\procState _ -> processingStage procState == cycleStage && processingLayer procState == layerIndex)
+             processingStateSignal (pure ())
 
-    bank  = Cache.kvBanks owner !! kv
-    kRun  = Cache.runK bank
-    vRun  = Cache.runV bank
+    isCycle3Attention = stageEquals Cycle3_ComputeAttention
+    isCycle4Write     = stageEquals Cycle4_WriteCache
+    attentionStartSignal = isCycle3Attention
+    sequencePositionSignal = sequencePosition <$> processingStateSignal
 
-    base  = fromEnum kv * headsPerGroupI
+    bank   = Cache.kvBanks kvRamOwner !! keyValueHeadIndex
+    runKey = Cache.runKeyBank bank
+    runVal = Cache.runValueBank bank
 
-    q0i :: Index NumQueryHeads
-    q0i = toEnum (min qHi base)
+    queryVectorSignal0 = getQueryVector intermediateDataSignal (queryHeadIndex0 keyValueHeadIndex)
+    queryVectorSignal1 = if hasSecondQueryHead keyValueHeadIndex then getQueryVector intermediateDataSignal (queryHeadIndex1 keyValueHeadIndex)
+                                               else pure (repeat 0)
 
-    hasQ1 :: Bool
-    hasQ1 = headsPerGroupI >= 2 && (base + 1 <= qHi)
+    keyVectorSignal   = getKeyVector intermediateDataSignal keyValueHeadIndex
+    valueVectorSignal = getValueVector intermediateDataSignal keyValueHeadIndex
 
-    q1i :: Index NumQueryHeads
-    q1i = if hasQ1 then toEnum (base + 1) else q0i
+    (address0, headOutput0, _busy0, done0) =
+      Attention.streamHeadAttentionAddrIO
+        attentionStartSignal sequencePositionSignal
+        queryVectorSignal0 keyVectorSignal valueVectorSignal keyRamOutput0 valueRamOutput0
+    (address1, headOutput1, _busy1, done1) =
+      Attention.streamHeadAttentionAddrIO
+        attentionStartSignal sequencePositionSignal
+        queryVectorSignal1 keyVectorSignal valueVectorSignal keyRamOutput1 valueRamOutput1
 
-    q0S  = getQ dataSig q0i
-    q1S  = if hasQ1 then getQ dataSig q1i else pure (repeat 0)
+    keyValuePairSignal                      = liftA2 (,) keyVectorSignal valueVectorSignal
+    (writeAddressSignal, keyWriteSignal, valueWriteSignal, writeDoneBankSignal) =
+      Cache.writeSequencer isCycle4Write sequencePositionSignal keyValuePairSignal
 
-    kCur = getK dataSig kv
-    vCur = getV dataSig kv
+    addressA = address0
+    writeA   = pure Nothing
+    addressBForCycle3 = if hasSecondQueryHead keyValueHeadIndex then address1 else address0
+    addressB = mux isCycle3Attention addressBForCycle3 writeAddressSignal
+    keyWriteB  = mux isCycle3Attention (pure Nothing) keyWriteSignal
+    valueWriteB= mux isCycle3Attention (pure Nothing) valueWriteSignal
 
-    (addr0, out0, _busy0, done0) = Attention.streamHeadAttentionAddrIO attStart posSig q0S kCur vCur kQ0 vQ0
-    (addr1, out1, _busy1, done1) = Attention.streamHeadAttentionAddrIO attStart posSig q1S kCur vCur kQ1 vQ1
+    (keyRamOutput0, keyRamOutput1) = runKey (addressA, writeA) (addressB, keyWriteB)
+    (valueRamOutput0, valueRamOutput1) = runVal (addressA, writeA) (addressB, valueWriteB)
 
-    kvPairSig                       = liftA2 (,) kCur vCur
-    (wrAddr, kWr, vWr, wrDoneBank)  = Cache.writeSequencer isC4 posSig kvPairSig
+    headOutputAcc0  = replace (queryHeadIndex0 keyValueHeadIndex) headOutput0 headOutputAcc
+    headDoneAcc0    = replace (queryHeadIndex0 keyValueHeadIndex) done0 headDoneAcc
 
-    addrA = addr0
-    wrA   = pure Nothing
-    addrB_c3 = if hasQ1 then addr1 else addr0
-    addrB = mux isC3 addrB_c3 wrAddr
-    wrKB  = mux isC3 (pure Nothing) kWr
-    wrVB  = mux isC3 (pure Nothing) vWr
+    headOutputAcc1  = if hasSecondQueryHead keyValueHeadIndex then replace (queryHeadIndex1 keyValueHeadIndex) headOutput1 headOutputAcc0 else headOutputAcc0
+    headDoneAcc1    = if hasSecondQueryHead keyValueHeadIndex then replace (queryHeadIndex1 keyValueHeadIndex) done1 headDoneAcc0 else headDoneAcc0
 
-    (kQA, kQB) = kRun (addrA, wrA) (addrB, wrKB)
-    (vQA, vQB) = vRun (addrA, wrA) (addrB, wrVB)
-
-    kQ0 = kQA; vQ0 = vQA
-    kQ1 = kQB; vQ1 = vQB
-
-    outAcc0  = replace q0i out0 outAcc
-    doneAcc0 = replace q0i done0 doneAcc
-
-    outAcc1  = if hasQ1 then replace q1i out1 outAcc0 else outAcc0
-    doneAcc1 = if hasQ1 then replace q1i done1 doneAcc0 else doneAcc0
-
-    wrAcc1   = replace kv wrDoneBank wrAcc
+    writeDoneAcc1   = replace keyValueHeadIndex writeDoneBankSignal writeDoneAcc
   in
-    (outAcc1, doneAcc1, wrAcc1)
+    (headOutputAcc1, headDoneAcc1, writeDoneAcc1)
 
-processCycle :: MultiHeadAttentionComponent -> FeedForwardNetworkComponent -> Index NumLayers -> ProcessingState -> IntermediateData ->  IntermediateData
-processCycle mha ffn layerIdx st idata
-  | psLayer st /= layerIdx = idata
+processCycle
+  :: MultiHeadAttentionComponent
+  -> FeedForwardNetworkComponent
+  -> Index NumLayers
+  -> ProcessingState
+  -> IntermediateData
+  -> IntermediateData
+processCycle multiHeadAttentionComponent feedForwardNetworkComponent layerIndex processingState intermediateData
+  | processingLayer processingState /= layerIndex = intermediateData
   | otherwise =
-      case psStage st of
-        Cycle1_ReadCache -> idata
+      case processingStage processingState of
+        Cycle1_ReadCache -> intermediateData
         Cycle2_ComputeQKV ->
           let
-            xHat = rmsNorm (idInputVec idata) (rmsAtt mha)
+            normalizedInput = rmsNorm (inputVector intermediateData) (rmsAtt multiHeadAttentionComponent)
             -- Queries: one per Q head (with RoPE on Q)
             queries =
-              imap (\hIdx _ ->
-                let headComp = heads mha !! hIdx
-                    (q, _, _)   = runSingleHeadQKV headComp xHat
-                    (qRot, _kU) = applyRotaryToHead headComp
-                                    (StepCount $ fromIntegral $ psSeqPos st)
-                                    (q, repeat 0)
-                in qRot) indicesI
+              imap (\queryHeadIdx _ ->
+                let headComponent = heads multiHeadAttentionComponent !! queryHeadIdx
+                    (query, _, _)   = runSingleHeadQKV headComponent normalizedInput
+                    (queryRotated, _kU) =
+                      applyRotaryToHead headComponent
+                                        (StepCount $ fromIntegral $ sequencePosition processingState)
+                                        (query, repeat 0)
+                in queryRotated) indicesI
 
             -- Keys/Values: one per KV head (apply RoPE to K only)
             keysAndValues =
-              imap (\kvIdx _ ->
-                let qIdx0 = fromEnum kvIdx * (natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads)
-                    qIdx  = toEnum (min (natToNum @NumQueryHeads - 1) qIdx0) :: Index NumQueryHeads
-                    headComp     = heads mha !! qIdx
-                    (_q, k, v)   = runSingleHeadQKV headComp xHat
-                    (_qU, kRot)  = applyRotaryToHead headComp
-                                      (StepCount $ fromIntegral $ psSeqPos st)
-                                      (repeat 0, k)
-                in (kRot, v)) indicesI
+              imap (\keyValueHeadIdx _ ->
+                let qIdx0 = fromEnum keyValueHeadIdx *
+                              (natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads)
+                    queryIndex = toEnum (min (natToNum @NumQueryHeads - 1) qIdx0) :: Index NumQueryHeads
+                    headComponent     = heads multiHeadAttentionComponent !! queryIndex
+                    (_q, key, value)   = runSingleHeadQKV headComponent normalizedInput
+                    (_qU, keyRotated)  =
+                      applyRotaryToHead headComponent
+                                        (StepCount $ fromIntegral $ sequencePosition processingState)
+                                        (repeat 0, key)
+                in (keyRotated, value)) indicesI
             (keys, values) = unzip keysAndValues
-          in idata { idQueries = queries, idKeys = keys, idValues = values }
-        Cycle3_ComputeAttn -> idata
-        Cycle4_WriteCache  -> idata
-        Cycle5_ComputeFFN  ->
-          let ffnOut = computeFeedForward ffn (idAttnOutput idata)
-          in idata { idFFNOutput = ffnOut }
+          in intermediateData { queryVectors = queries, keyVectors = keys, valueVectors = values }
+        Cycle3_ComputeAttention -> intermediateData
+        Cycle4_WriteCache  -> intermediateData
+        Cycle5_ComputeFeedForward  ->
+          let ffnOutput = computeFeedForward feedForwardNetworkComponent (attentionOutput intermediateData)
+          in intermediateData { feedForwardOutput = ffnOutput }

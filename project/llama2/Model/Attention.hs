@@ -6,8 +6,8 @@ module Model.Attention
 import Clash.Prelude
 
 import Helpers ( HeadDimension, SeqLen, liftA4, liftA5 )
-import Model.Cache (bankAddr)
-import Model.Types (BankAddr)
+import Model.Cache (computeBankAddress)
+import Model.Types (BankAddress)
 
 -- One-head streaming attention with online softmax, aligned to 1-cycle BRAM latency.
 -- Phases:
@@ -23,155 +23,171 @@ data AttnPhase = PhaseDot | PhaseAcc | PhaseFinalize
 
 streamHeadAttentionAddrIO
   :: HiddenClockResetEnable dom
-  => Signal dom Bool                         -- start
-  -> Signal dom (Index SeqLen)               -- pos
-  -> Signal dom (Vec HeadDimension Float)    -- q
-  -> Signal dom (Vec HeadDimension Float)    -- curK (bypass at t==pos)
-  -> Signal dom (Vec HeadDimension Float)    -- curV (bypass at t==pos)
-  -> Signal dom Float                        -- kQ (from RAM, 1-cycle)
-  -> Signal dom Float                        -- vQ (from RAM, 1-cycle)
-  -> ( Signal dom BankAddr                   -- addr (use for both K and V)
-     , Signal dom (Vec HeadDimension Float)  -- head output
-     , Signal dom Bool                       -- busy
-     , Signal dom Bool )                     -- done (1-cycle pulse)
-streamHeadAttentionAddrIO startSig posSig qSig curKSig curVSig kQin vQin =
-  (addr, oOut, busySig, donePulse)
+  => Signal dom Bool                         -- start signal
+  -> Signal dom (Index SeqLen)               -- sequence position signal
+  -> Signal dom (Vec HeadDimension Float)    -- query vector signal
+  -> Signal dom (Vec HeadDimension Float)    -- current-key vector signal (bypass at t==pos)
+  -> Signal dom (Vec HeadDimension Float)    -- current-value vector signal (bypass at t==pos)
+  -> Signal dom Float                        -- key from RAM (1-cycle delayed)
+  -> Signal dom Float                        -- value from RAM (1-cycle delayed)
+  -> ( Signal dom BankAddress                -- bank address signal (use for both K and V)
+     , Signal dom (Vec HeadDimension Float)  -- head output vector signal
+     , Signal dom Bool                       -- busy signal
+     , Signal dom Bool )                     -- done signal (1-cycle pulse)
+streamHeadAttentionAddrIO startSignal sequencePositionSignal queryVectorSignal currentKeySignal currentValueSignal keyFromRamSignal valueFromRamSignal =
+  (bankAddressSignal, outputVectorSignal, busySignal, donePulseSignal)
  where
-  -- phase control + warm-up (align 1-cycle BRAM)
-  phase    = register PhaseDot phaseNext
-  isDot    = (== PhaseDot)      <$> phase
-  isAcc    = (== PhaseAcc)      <$> phase
-  isFin    = (== PhaseFinalize) <$> phase
+  -- Phase control + warm-up (align 1-cycle BRAM)
+  phaseSignal    = register PhaseDot nextPhaseSignal
+  isDotPhase     = (== PhaseDot)      <$> phaseSignal
+  isAccPhase     = (== PhaseAcc)      <$> phaseSignal
+  isFinalizePhase= (== PhaseFinalize) <$> phaseSignal
 
-  startPrev  = register False startSig
-  startPulse = liftA2 (\n p -> n && not p) startSig startPrev
+  startPreviousSignal  = register False startSignal
+  startPulseSignal     = liftA2 (\now prev -> now && not prev) startSignal startPreviousSignal
 
-  warm     = regEn False en warmNext
-  warmNext = mux startPulse (pure False) $
-             mux (isDot .||. isAcc) (pure True) warm -- stay warm after first tick in Dot/Acc
-  en = startPulse .||. busySig
+  warmupSignal     = regEn False enableSignal warmupNextSignal
+  warmupNextSignal = mux startPulseSignal (pure False) $
+                     mux (isDotPhase .||. isAccPhase) (pure True) warmupSignal -- stay warm after first tick in Dot/Acc
+  enableSignal = startPulseSignal .||. busySignal
 
-  busySig = s where
-    s    = register False next
-    next = mux startPulse (pure True) $
-           mux donePulse   (pure False) s
+  busySignal = busyReg where
+    busyReg    = register False nextBusy
+    nextBusy   = mux startPulseSignal (pure True) $
+                 mux donePulseSignal   (pure False) busyReg
 
-  -- counters
-  tCnt  = regEn 0 en tNext
-  dCnt  = regEn 0 en dNext
-  tPrev = register 0 tCnt
-  dPrev = register 0 dCnt
-  isLastD_now = (== maxBound) <$> dCnt
-  isLastT_now = (==) <$> tCnt <*> posSig
+  -- Counters
+  timeCounterSignal  = regEn 0 enableSignal nextTimeCounterSignal
+  dimensionCounterSignal  = regEn 0 enableSignal nextDimensionCounterSignal
+  previousTimeCounterSignal = register 0 timeCounterSignal
+  previousDimensionCounterSignal = register 0 dimensionCounterSignal
+  isLastDimensionSignal = (== maxBound) <$> dimensionCounterSignal
+  isLastTimeSignal      = (==) <$> timeCounterSignal <*> sequencePositionSignal
 
-  -- addressing (issue address for current (tCnt,dCnt); data valid next cycle)
-  addr = bankAddr <$> tCnt <*> dCnt
+  -- Addressing (issue address for current (time, dimension); data valid next cycle)
+  bankAddressSignal = computeBankAddress <$> timeCounterSignal <*> dimensionCounterSignal
 
-  -- element selection, aligned to previous address
-  qElem_raw = (!!) <$> qSig   <*> dPrev
-  kBypass   = (!!) <$> curKSig <*> dPrev
-  vBypass   = (!!) <$> curVSig <*> dPrev
+  -- Element selection, aligned to previous address
+  queryElementRawSignal = (!!) <$> queryVectorSignal    <*> previousDimensionCounterSignal
+  keyBypassElementSignal= (!!) <$> currentKeySignal     <*> previousDimensionCounterSignal
+  valueBypassElementSignal= (!!) <$> currentValueSignal <*> previousDimensionCounterSignal
 
-  useKBypass = liftA3 (\w pd pt -> w && pd && pt) warm (pure True) ((==) <$> tPrev <*> posSig)
-  useVBypass = useKBypass -- same t test; used in Acc
+  useKeyBypassSignal =
+    liftA3 (\warm pd pt -> warm && pd && pt)
+           warmupSignal (pure True) ((==) <$> previousTimeCounterSignal <*> sequencePositionSignal)
+  useValueBypassSignal = useKeyBypassSignal
 
-  kElem = mux useKBypass kBypass kQin
-  vElem = mux useVBypass vBypass vQin
-  qElem = qElem_raw
+  keyElementSignal   = mux useKeyBypassSignal  keyBypassElementSignal  keyFromRamSignal
+  valueElementSignal = mux useValueBypassSignal valueBypassElementSignal valueFromRamSignal
+  queryElementSignal = queryElementRawSignal
 
-  -- scaling
-  invSqrtHd :: Float
-  invSqrtHd = 1.0 / sqrt (snatToNum (SNat @HeadDimension) :: Float)
+  -- Scaling
+  invSqrtHeadDim :: Float
+  invSqrtHeadDim = 1.0 / sqrt (snatToNum (SNat @HeadDimension) :: Float)
 
-  -- online softmax accumulators across timesteps
-  mAcc = regEn (-(1/0)) en mAccNext
-  sAcc = regEn 0        en sAccNext
+  -- Online softmax accumulators across timesteps
+  maxAccumulatorSignal = regEn (-(1/0)) enableSignal nextMaxAccumulatorSignal
+  sumAccumulatorSignal = regEn 0        enableSignal nextSumAccumulatorSignal
 
-  -- per-t cached scales (written at end of Dot, used across all d in Acc)
-  scaleOldReg = regEn 1 en scaleOldNext
-  scaleNewReg = regEn 0 en scaleNewNext
+  -- Per-t cached scales (written at end of Dot, used across all d in Acc)
+  scaleOldRegisterSignal = regEn 1 enableSignal nextScaleOldSignal
+  scaleNewRegisterSignal = regEn 0 enableSignal nextScaleNewSignal
 
-  -- dot partial across d for current t
-  dotAcc = regEn 0 en dotAccNext
+  -- Dot partial across d for current t
+  dotAccumulatorSignal = regEn 0 enableSignal nextDotAccumulatorSignal
 
-  canAccumulate = warm .&&. isDot
-  dotAccNext =
-    mux startPulse (pure 0)
-    $ mux isDot
-        (mux canAccumulate (dotAcc + (qElem * kElem)) dotAcc)
-        dotAcc
+  canAccumulateDotSignal = warmupSignal .&&. isDotPhase
+  nextDotAccumulatorSignal =
+    mux startPulseSignal (pure 0)
+    $ mux isDotPhase
+        (mux canAccumulateDotSignal (dotAccumulatorSignal + (queryElementSignal * keyElementSignal))
+                                    dotAccumulatorSignal)
+        dotAccumulatorSignal
 
-  -- boundary at end of Dot: when we just accumulated dPrev == maxBound (i.e., now dCnt==0 next cycle)
-  dotBoundary =
+  -- Boundary at end of Dot
+  dotBoundarySignal =
     liftA3
-      (\ph w dLast -> ph == PhaseDot && w && dLast)
-      phase warm isLastD_now
+      (\phase warm dLast -> phase == PhaseDot && warm && dLast)
+      phaseSignal warmupSignal isLastDimensionSignal
 
-  scoreThisT = (dotAcc + (qElem * kElem)) * pure invSqrtHd
-  mNew       = max <$> mAcc <*> scoreThisT
-  scaleOld   = exp <$> ((-) <$> mAcc      <*> mNew)
-  scaleNew   = exp <$> ((-) <$> scoreThisT <*> mNew)
-  sNew       = (+) <$> ((* ) <$> sAcc <*> scaleOld) <*> scaleNew
+  scoreThisTimeSignal = (dotAccumulatorSignal + (queryElementSignal * keyElementSignal)) * pure invSqrtHeadDim
+  newMaxSignal       = max <$> maxAccumulatorSignal <*> scoreThisTimeSignal
+  scaleOldSignal     = exp <$> ((-) <$> maxAccumulatorSignal      <*> newMaxSignal)
+  scaleNewSignal     = exp <$> ((-) <$> scoreThisTimeSignal <*> newMaxSignal)
+  newSumSignal       = (+) <$> ((* ) <$> sumAccumulatorSignal <*> scaleOldSignal) <*> scaleNewSignal
 
-  -- latch m/s/scales at t boundary
-  mAccNext      = mux startPulse (pure (-(1/0)))
-                 $ mux dotBoundary mNew mAcc
-  sAccNext      = mux startPulse (pure 0)
-                 $ mux dotBoundary sNew sAcc
-  scaleOldNext  = mux dotBoundary scaleOld scaleOldReg
-  scaleNewNext  = mux dotBoundary scaleNew scaleNewReg
+  -- Latch m/s/scales at t boundary
+  nextMaxAccumulatorSignal =
+    mux startPulseSignal (pure (-(1/0)))
+    $ mux dotBoundarySignal newMaxSignal maxAccumulatorSignal
+  nextSumAccumulatorSignal =
+    mux startPulseSignal (pure 0)
+    $ mux dotBoundarySignal newSumSignal sumAccumulatorSignal
+  nextScaleOldSignal  = mux dotBoundarySignal scaleOldSignal scaleOldRegisterSignal
+  nextScaleNewSignal  = mux dotBoundarySignal scaleNewSignal scaleNewRegisterSignal
 
-  -- numerator across d: oNum[d] = oNum[d]*scaleOld + v[d]*scaleNew
-  oNum     = regEn (repeat 0 :: Vec HeadDimension Float) en oNumNext
-  oElemPrev = (!!) <$> oNum <*> dPrev
-  oElemUpd  = (\o v a b -> o * b + v * a) <$> oElemPrev <*> vElem <*> scaleNewReg <*> scaleOldReg
+  -- Numerator across d: oNum[d] = oNum[d]*scaleOld + v[d]*scaleNew
+  numeratorVectorSignal = regEn (repeat 0 :: Vec HeadDimension Float) enableSignal nextNumeratorVectorSignal
+  numeratorElementPrevSignal = (!!) <$> numeratorVectorSignal <*> previousDimensionCounterSignal
+  numeratorElementUpdatedSignal =
+    (\o v a b -> o * b + v * a) <$> numeratorElementPrevSignal
+                                <*> valueElementSignal
+                                <*> scaleNewRegisterSignal
+                                <*> scaleOldRegisterSignal
 
-  canAccumulateAcc = warm .&&. isAcc
-  oNumNext =
-    mux startPulse (pure (repeat 0))
-    $ mux isAcc
-        (mux canAccumulateAcc (replace <$> dPrev <*> oElemUpd <*> oNum) oNum)
-        oNum
+  canAccumulateAccSignal = warmupSignal .&&. isAccPhase
+  nextNumeratorVectorSignal =
+    mux startPulseSignal (pure (repeat 0))
+    $ mux isAccPhase
+        (mux canAccumulateAccSignal (replace <$> previousDimensionCounterSignal
+                                             <*> numeratorElementUpdatedSignal
+                                             <*> numeratorVectorSignal)
+                                    numeratorVectorSignal)
+        numeratorVectorSignal
 
-  -- finalize: write oOut[d] = oNum[d] / sAcc
-  oOut     = regEn (repeat 0 :: Vec HeadDimension Float) en oOutNext
-  oOutDiv  = (/ ) <$> oElemPrev <*> sAcc
-  canFinalize = warm .&&. isFin
-  oOutNext =
-    mux startPulse (pure (repeat 0))
-    $ mux isFin
-        (mux canFinalize (replace <$> dPrev <*> oOutDiv <*> oOut) oOut)
-        oOut
+  -- Finalize: write output[d] = numerator[d] / sAcc
+  outputVectorSignal     = regEn (repeat 0 :: Vec HeadDimension Float) enableSignal nextOutputVectorSignal
+  outputElementDivSignal = (/ ) <$> numeratorElementPrevSignal <*> sumAccumulatorSignal
+  canFinalizeSignal = warmupSignal .&&. isFinalizePhase
+  nextOutputVectorSignal =
+    mux startPulseSignal (pure (repeat 0))
+    $ mux isFinalizePhase
+        (mux canFinalizeSignal (replace <$> previousDimensionCounterSignal
+                                        <*> outputElementDivSignal
+                                        <*> outputVectorSignal)
+                               outputVectorSignal)
+        outputVectorSignal
 
-  -- phase transitions and counters
-  phaseNext =
+  -- Phase transitions and counters
+  nextPhaseSignal =
     liftA5
-      (\ph w dLast tLast dotBdy ->
-        case ph of
-          PhaseDot      -> if dotBdy then PhaseAcc else PhaseDot
-          PhaseAcc      -> if w && dLast then (if tLast then PhaseFinalize else PhaseDot) else PhaseAcc
-          PhaseFinalize -> if w && dLast then PhaseDot else PhaseFinalize)
-      phase warm isLastD_now isLastT_now dotBoundary
+      (\phase warm dLast tLast dotBoundary ->
+        case phase of
+          PhaseDot      -> if dotBoundary then PhaseAcc else PhaseDot
+          PhaseAcc      -> if warm && dLast then (if tLast then PhaseFinalize else PhaseDot) else PhaseAcc
+          PhaseFinalize -> if warm && dLast then PhaseDot else PhaseFinalize)
+      phaseSignal warmupSignal isLastDimensionSignal isLastTimeSignal dotBoundarySignal
 
   -- d counter: run through 0..max in Dot/Acc/Fin; reset at phase changes
-  dNext =
+  nextDimensionCounterSignal =
     liftA4
-      (\ph w dLast curr ->
-        case ph of
-          PhaseDot      -> if w && dLast then 0 else if w then succ curr else curr
-          PhaseAcc      -> if w && dLast then 0 else if w then succ curr else curr
-          PhaseFinalize -> if w && dLast then 0 else if w then succ curr else curr)
-      phase warm isLastD_now dCnt
+      (\phase warm dLast current ->
+        case phase of
+          PhaseDot      -> if warm && dLast then 0 else if warm then succ current else current
+          PhaseAcc      -> if warm && dLast then 0 else if warm then succ current else current
+          PhaseFinalize -> if warm && dLast then 0 else if warm then succ current else current)
+      phaseSignal warmupSignal isLastDimensionSignal dimensionCounterSignal
 
   -- t counter: advance once per finished Acc (after last d)
-  tNext =
+  nextTimeCounterSignal =
     liftA5
-      (\ph w dLast tLast curr ->
-        case ph of
-          PhaseDot      -> curr
-          PhaseAcc      -> if w && dLast then (if tLast then 0 else succ curr) else curr
-          PhaseFinalize -> curr)
-      phase warm isLastD_now isLastT_now tCnt
+      (\phase warm dLast tLast current ->
+        case phase of
+          PhaseDot      -> current
+          PhaseAcc      -> if warm && dLast then (if tLast then 0 else succ current) else current
+          PhaseFinalize -> current)
+      phaseSignal warmupSignal isLastDimensionSignal isLastTimeSignal timeCounterSignal
 
   -- done pulse at end of Finalize, after last element written
-  donePulse = register False $ (&&) <$> (isFin .&&. warm) <*> isLastD_now
+  donePulseSignal =
+    register False $ (&&) <$> (isFinalizePhase .&&. warmupSignal) <*> isLastDimensionSignal
