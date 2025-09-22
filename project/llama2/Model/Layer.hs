@@ -108,12 +108,15 @@ fillOneBank :: HiddenClockResetEnable dom
   -> Signal dom ProcessingState
   -> Cache.KVRamOwner dom
   -> Signal dom IntermediateData
-  -> (Vec NumQueryHeads (Signal dom (Vec HeadDimension Float)), Vec NumQueryHeads (Signal dom Bool), Vec NumKeyValueHeads (Signal dom Bool))
+  -> ( Vec NumQueryHeads (Signal dom (Vec HeadDimension Float))
+     , Vec NumQueryHeads (Signal dom Bool)
+     , Vec NumKeyValueHeads (Signal dom Bool))
   -> Index NumKeyValueHeads
-  -> (Vec NumQueryHeads (Signal dom (Vec HeadDimension Float)), Vec NumQueryHeads (Signal dom Bool), Vec NumKeyValueHeads (Signal dom Bool))
+  -> ( Vec NumQueryHeads (Signal dom (Vec HeadDimension Float))
+     , Vec NumQueryHeads (Signal dom Bool)
+     , Vec NumKeyValueHeads (Signal dom Bool))
 fillOneBank layerIdx stateSig owner dataSig (outAcc, doneAcc, wrAcc) kv =
   let
-    -- Stage qualifiers
     stgEq s = liftA2 (\st _ -> psStage st == s && psLayer st == layerIdx) stateSig (pure ())
     isC3    = stgEq Cycle3_ComputeAttn
     isC4    = stgEq Cycle4_WriteCache
@@ -125,26 +128,32 @@ fillOneBank layerIdx stateSig owner dataSig (outAcc, doneAcc, wrAcc) kv =
     vRun  = Cache.runV bank
 
     base  = fromEnum kv * headsPerGroupI
-    q0i   = toEnum (min qHi base)         :: Index NumQueryHeads
-    hasQ1 = base + 1 <= qHi
-    q1i   = if hasQ1 then toEnum (base + 1) else q0i
+
+    q0i :: Index NumQueryHeads
+    q0i = toEnum (min qHi base)
+
+    hasQ1 :: Bool
+    hasQ1 = headsPerGroupI >= 2 && (base + 1 <= qHi)
+
+    q1i :: Index NumQueryHeads
+    q1i = if hasQ1 then toEnum (base + 1) else q0i
 
     q0S  = getQ dataSig q0i
+    q1S  = if hasQ1 then getQ dataSig q1i else pure (repeat 0)
+
     kCur = getK dataSig kv
     vCur = getV dataSig kv
-    q1S  = if hasQ1 then getQ dataSig q1i else pure (repeat 0)
 
     (addr0, out0, _busy0, done0) = Attention.streamHeadAttentionAddrIO attStart posSig q0S kCur vCur kQ0 vQ0
     (addr1, out1, _busy1, done1) = Attention.streamHeadAttentionAddrIO attStart posSig q1S kCur vCur kQ1 vQ1
 
-    -- Single writer instance for this bank
     kvPairSig                       = liftA2 (,) kCur vCur
     (wrAddr, kWr, vWr, wrDoneBank)  = Cache.writeSequencer isC4 posSig kvPairSig
 
-    -- Port muxing: in C3 both ports read; in C4, port B writes
     addrA = addr0
     wrA   = pure Nothing
-    addrB = mux isC3 addr1 wrAddr
+    addrB_c3 = if hasQ1 then addr1 else addr0
+    addrB = mux isC3 addrB_c3 wrAddr
     wrKB  = mux isC3 (pure Nothing) kWr
     wrVB  = mux isC3 (pure Nothing) vWr
 
@@ -156,10 +165,13 @@ fillOneBank layerIdx stateSig owner dataSig (outAcc, doneAcc, wrAcc) kv =
 
     outAcc0  = replace q0i out0 outAcc
     doneAcc0 = replace q0i done0 doneAcc
+
     outAcc1  = if hasQ1 then replace q1i out1 outAcc0 else outAcc0
     doneAcc1 = if hasQ1 then replace q1i done1 doneAcc0 else doneAcc0
+
     wrAcc1   = replace kv wrDoneBank wrAcc
-  in (outAcc1, doneAcc1, wrAcc1)
+  in
+    (outAcc1, doneAcc1, wrAcc1)
 
 processCycle :: MultiHeadAttentionComponent -> FeedForwardNetworkComponent -> Index NumLayers -> ProcessingState -> IntermediateData ->  IntermediateData
 processCycle mha ffn layerIdx st idata
