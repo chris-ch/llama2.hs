@@ -53,16 +53,16 @@ multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
       (\st cur inp ->
          if psStage st == Cycle1_ReadCache
            then if psLayer st == 0
-                  then cur { idInputVec = inp }         -- layer 0: embedding
-                  else cur { idInputVec = idFFNOutput cur } -- higher layers: previous FFN
+                  then cur { idInputVec = inp }                -- layer 0: embedding
+                  else cur { idInputVec = idFFNOutput cur }    -- higher layers: previous FFN
            else cur)
       procStateSig currentDataSig inputVecSig
 
   -- Run layers; gather per-stage done pulses
   foldStep
     :: ( Signal dom IntermediateData
-      , Vec NumLayers (Signal dom Bool)
-      , Vec NumLayers (Signal dom Bool))
+      , Vec NumLayers (Signal dom Bool)  -- writeDone by layer
+      , Vec NumLayers (Signal dom Bool)) -- attnDone  by layer (rising edge)
     -> (TransformerLayerComponent, KVRamOwner dom, Index NumLayers)
     -> ( Signal dom IntermediateData
       , Vec NumLayers (Signal dom Bool)
@@ -75,7 +75,7 @@ multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
           (\st old new commit ->
              if psLayer st == lidx
                then if psStage st == Cycle3_ComputeAttn
-                      then commit   -- gated write-back on attnDone
+                      then commit   -- gated write-back on attnDone (this layer)
                       else new
                else old)
           procStateSig dSig newD commitC3
@@ -87,19 +87,21 @@ multiCycleTransformer decoder caches tokenSig temperatureSig seedSig =
     foldl foldStep (inputLoadedSig, repeat (pure False), repeat (pure False))
                    (zip3 layers caches indicesI)
 
-  writeDoneAny = fmap or (sequenceA writeDoneVec)
-  attnDoneAny  = fmap or (sequenceA attnDoneVec)
+  -- Select this-layer done instead of OR across all layers
+  layerIdxSig     = psLayer <$> procStateSig
+  writeDoneThis   = (!!) <$> sequenceA writeDoneVec <*> layerIdxSig
+  attnDoneThis    = (!!) <$> sequenceA attnDoneVec  <*> layerIdxSig
 
-  -- Stage done selection
+  -- Stage done selection (only consider the current layer)
   stgSig = psStage <$> procStateSig
   is c   = (== c) <$> stgSig
 
   stageDoneSig =
-    mux (is Cycle1_ReadCache)   (pure True)  $
-    mux (is Cycle2_ComputeQKV)  (pure True)  $
-    mux (is Cycle3_ComputeAttn) attnDoneAny  $
-    mux (is Cycle4_WriteCache)  writeDoneAny $
-    mux (is Cycle5_ComputeFFN)  (pure True)  $
+    mux (is Cycle1_ReadCache)   (pure True)   $
+    mux (is Cycle2_ComputeQKV)  (pure True)   $
+    mux (is Cycle3_ComputeAttn) attnDoneThis  $
+    mux (is Cycle4_WriteCache)  writeDoneThis $
+    mux (is Cycle5_ComputeFFN)  (pure True)   $
     pure False
 
   -- Ready pulse at last layer FFN completion (rising edge)
