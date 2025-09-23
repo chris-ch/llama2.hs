@@ -1,15 +1,16 @@
 module Model.Top.Transformer (
-    multiCycleTransformer
-    , argMax
+    multiCycleTransformer,
+    multiCycleTransformerWithTap,
+    argMax
 ) where
 
 import Clash.Prelude
-import Helpers (NumLayers, Temperature, Seed, EmbeddingComponent (..), liftA4, CArray2D (..), VocabSize, Token, ModelDim)
+import Helpers (NumLayers, Temperature, Seed, EmbeddingComponent (..), liftA4, CArray2D (..), VocabSize, Token, ModelDim, SeqLen)
 
 import Model.Core.Types (IntermediateData(..), nextProcessingState, initialProcessingState, initialIntermediateData, ProcessingState (..), CycleStage (..))
 
 import qualified Model.Memory.KVCacheBank as Cache
-import qualified Model.Layers.TransformerLayer as TransformerLayer (TransformerLayerComponent(..), TransformerDecoderComponent(..), multiCycleTransformerLayer)
+import qualified Model.Layers.TransformerLayer as TransformerLayer (TransformerLayerComponent(..), TransformerDecoderComponent(..), multiCycleTransformerLayer, multiCycleTransformerLayerTap)
 import Model.Layers.TransformerLayer (TransformerDecoderComponent(..), transformerLogits)
 import qualified Clash.Sized.Vector as CV
 import Data.Maybe (fromMaybe)
@@ -45,11 +46,8 @@ transformerLayerFold processingStateSignal (currentDataSignal, writeDoneVector, 
       , replace layerIndex writeDoneSignal writeDoneVector
       , replace layerIndex attnDoneSignal  attnDoneVector)
 
--- Full multi-cycle transformer decoder:
---   - Steps through Cycle1..Cycle5 across all layers
---   - Uses stage-done pulses to advance ProcessingState
---   - Handles embedding, sampling, and PRNG state
---   - Emits (token, readyPulse) at the end of the last layer FFN
+-- Full multi-cycle transformer decoder with a 1-cycle pause after sampling
+-- so L0 Cycle1 consumes the new token embedding (fixes boundary race).
 multiCycleTransformer :: forall dom
    . HiddenClockResetEnable dom
   => TransformerLayer.TransformerDecoderComponent
@@ -59,7 +57,7 @@ multiCycleTransformer :: forall dom
   -> Signal dom Seed           -- PRNG seed signal
   -> (Signal dom (Unsigned 32), Signal dom Bool)
 multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal seedSignal =
-  (outputTokenSignal readyPulseSignal temperatureSignal seedSignal decoder nextIntermediateDataSignal, readyPulseSignal)
+  (outputTokenSignal readyPulseRaw temperatureSignal seedSignal decoder nextIntermediateDataSignal, readyPulseOut)
  where
   embeddingComponent      = modelEmbedding decoder
   transformerLayers       = modelLayers decoder
@@ -94,28 +92,33 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
   writeDoneThisLayer = (!!) <$> sequenceA writeDoneVector <*> layerIndexSignal
   attnDoneThisLayer  = (!!) <$> sequenceA attnDoneVector  <*> layerIndexSignal
 
-  -- Stage done selection
+  -- Stage selector
   stageSignal = processingStage <$> processingStateSignal
   isStage cycleStage = (== cycleStage) <$> stageSignal
 
-  stageFinishedSignal =
-    mux (isStage Cycle1_ReadCache)   (pure True)   $
-    mux (isStage Cycle2_ComputeQKV)  (pure True)   $
-    mux (isStage Cycle3_ComputeAttention) attnDoneThisLayer  $
-    mux (isStage Cycle4_WriteCache)  writeDoneThisLayer $
-    mux (isStage Cycle5_ComputeFeedForward)  (pure True)   $
-    pure False
-
-  -- Ready pulse at last layer FFN completion
+  -- Ready pulse at last layer FFN completion (unchanged)
   isLastLayerFFN  = liftA2 (\processingState _ ->
                              processingStage processingState == Cycle5_ComputeFeedForward &&
                              processingLayer processingState == maxBound)
                            processingStateSignal (pure ())
+  readyPulseRaw = liftA2 (\now prev -> now && not prev)
+                         isLastLayerFFN (register False isLastLayerFFN)
 
-  -- One-cycle pulse emitted when the last layer finishes its feed-forward stage.
-  -- Used to trigger sampling and PRNG reseeding.
-  readyPulseSignal = liftA2 (\now prev -> now && not prev)
-                            isLastLayerFFN (register False isLastLayerFFN)
+  -- One-cycle pause after sampling so the new token appears on input
+  pauseAfterReady :: Signal dom Bool
+  pauseAfterReady = register False readyPulseRaw
+
+  -- Stage done selection with pause on Cycle5
+  stageFinishedSignal =
+    mux (isStage Cycle1_ReadCache)              (pure True)   $
+    mux (isStage Cycle2_ComputeQKV)             (pure True)   $
+    mux (isStage Cycle3_ComputeAttention)       attnDoneThisLayer  $
+    mux (isStage Cycle4_WriteCache)             writeDoneThisLayer $
+    mux (isStage Cycle5_ComputeFeedForward)     (not <$> pauseAfterReady) $
+    pure False
+
+  -- Export the ready pulse (unchanged externally)
+  readyPulseOut = readyPulseRaw
 
 -- logits from the current data
 logitsSignal :: TransformerLayer.TransformerDecoderComponent -> Signal dom IntermediateData -> Signal dom (Vec VocabSize Float)
@@ -188,3 +191,135 @@ argMax vec = fst $ foldl compareMax (0, head vec) (imap (\i x -> (fromIntegral i
 -- Embed a token
 embed :: CArray2D VocabSize ModelDim -> Token -> Vec ModelDim Float
 embed (CArray2D vocab) tokenCode = vocab !! (fromIntegral tokenCode :: Int)
+
+-- ====== NEW: top-level with per-layer attention tap ======
+multiCycleTransformerWithTap :: forall dom
+   . HiddenClockResetEnable dom
+  => TransformerLayer.TransformerDecoderComponent
+  -> Vec NumLayers (Cache.KVRamOwner dom)
+  -> Signal dom (Unsigned 32)
+  -> Signal dom Temperature
+  -> Signal dom Seed
+  -> ( Signal dom (Unsigned 32)
+     , Signal dom Bool
+     , Signal dom Bool
+     , Signal dom (Index NumLayers)
+     , Signal dom (Index SeqLen)
+     , Signal dom (Vec ModelDim Float)
+     , Signal dom (Vec ModelDim Float)
+     , Signal dom (Vec ModelDim Float)
+     )
+multiCycleTransformerWithTap decoder cacheOwners inputTokenSignal temperatureSignal seedSignal =
+  ( outputTokenSignal readyPulseRaw temperatureSignal seedSignal decoder nextIntermediateDataSignal
+  , readyPulseRaw
+  , tapPulseAny
+  , tapLayerIdxOut
+  , tapSeqPosOut
+  , dbgXHatAny
+  , dbgWoAny
+  , dbgXAfterAny
+  )
+ where
+  embeddingComponent      = modelEmbedding decoder
+  transformerLayers       = modelLayers decoder
+  tokenEmbeddingSignal    = embed (vocabulary embeddingComponent) <$> inputTokenSignal
+
+  advanceProcessingState currentState stageFinished =
+    if stageFinished then nextProcessingState currentState else currentState
+  processingStateSignal =
+    register initialProcessingState (advanceProcessingState <$> processingStateSignal <*> stageFinishedSignal)
+  intermediateDataSignal = register initialIntermediateData nextIntermediateDataSignal
+
+  inputLoadedSignal =
+    liftA3
+      (\processingState currentIntermediateData tokenEmbedding ->
+         if processingStage processingState == Cycle1_ReadCache
+           then if processingLayer processingState == 0
+                  then currentIntermediateData { inputVector = tokenEmbedding }
+                  else currentIntermediateData { inputVector = feedForwardOutput currentIntermediateData }
+           else currentIntermediateData)
+      processingStateSignal intermediateDataSignal tokenEmbeddingSignal
+
+  layerStep
+    :: ( Signal dom IntermediateData
+       , Vec NumLayers (Signal dom Bool)
+       , Vec NumLayers (Signal dom Bool)
+       , Vec NumLayers (Signal dom Bool)
+       , Vec NumLayers (Signal dom (Vec ModelDim Float))
+       , Vec NumLayers (Signal dom (Vec ModelDim Float))
+       , Vec NumLayers (Signal dom (Vec ModelDim Float)) )
+    -> (TransformerLayer.TransformerLayerComponent, Cache.KVRamOwner dom, Index NumLayers)
+    -> ( Signal dom IntermediateData
+       , Vec NumLayers (Signal dom Bool)
+       , Vec NumLayers (Signal dom Bool)
+       , Vec NumLayers (Signal dom Bool)
+       , Vec NumLayers (Signal dom (Vec ModelDim Float))
+       , Vec NumLayers (Signal dom (Vec ModelDim Float))
+       , Vec NumLayers (Signal dom (Vec ModelDim Float)) )
+  layerStep (currData, wDoneVec, attnDoneVec, tapVec, xHatVec, woVec, xaaVec)
+            (layerComp, cacheOwner, lIx) =
+    let (newData, wDone, attnDone, commitC3, tapPulse, dbgXHat, dbgWo, dbgXAfter) =
+          TransformerLayer.multiCycleTransformerLayerTap layerComp cacheOwner lIx processingStateSignal currData
+        selectedData =
+          liftA4
+            (\ps oldD newD c3D ->
+               if processingLayer ps == lIx
+                  then if processingStage ps == Cycle3_ComputeAttention
+                         then c3D
+                         else newD
+                  else oldD)
+            processingStateSignal currData newData commitC3
+    in  ( selectedData
+        , replace lIx wDone wDoneVec
+        , replace lIx attnDone attnDoneVec
+        , replace lIx tapPulse tapVec
+        , replace lIx dbgXHat xHatVec
+        , replace lIx dbgWo   woVec
+        , replace lIx dbgXAfter xaaVec
+        )
+
+  ( nextIntermediateDataSignal
+    , writeDoneVector
+    , attnDoneVector
+    , tapVec
+    , xHatVec
+    , woVec
+    , xAfterVec ) =
+      foldl layerStep (inputLoadedSignal, repeat (pure False), repeat (pure False),
+                       repeat (pure False), repeat (pure (repeat 0)), repeat (pure (repeat 0)), repeat (pure (repeat 0)))
+            (zip3 transformerLayers cacheOwners indicesI)
+
+  layerIndexSignal   = processingLayer <$> processingStateSignal
+  seqPosSignal       = sequencePosition <$> processingStateSignal
+
+  writeDoneThisLayer = (!!) <$> sequenceA writeDoneVector <*> layerIndexSignal
+  attnDoneThisLayer  = (!!) <$> sequenceA attnDoneVector  <*> layerIndexSignal
+
+  stageSignal = processingStage <$> processingStateSignal
+  isStage cycleStage = (== cycleStage) <$> stageSignal
+
+  -- Ready pulse at last layer FFN completion
+  isLastLayerFFN  = liftA2 (\ps _ ->
+                             processingStage ps == Cycle5_ComputeFeedForward
+                          && processingLayer ps == maxBound)
+                           processingStateSignal (pure ())
+  readyPulseRaw = liftA2 (\now prev -> now && not prev)
+                         isLastLayerFFN (register False isLastLayerFFN)
+
+  -- Pause one cycle on the ready pulse
+  stageFinishedSignal =
+    mux (isStage Cycle1_ReadCache)           (pure True)   $
+    mux (isStage Cycle2_ComputeQKV)          (pure True)   $
+    mux (isStage Cycle3_ComputeAttention)    attnDoneThisLayer  $
+    mux (isStage Cycle4_WriteCache)          writeDoneThisLayer $
+    mux (isStage Cycle5_ComputeFeedForward)  (not <$> readyPulseRaw) $
+    pure False
+
+  -- Fan-in taps
+  tapPulseAny  = or <$> sequenceA tapVec
+  dbgXHatAny   = mux tapPulseAny ( (!!) <$> sequenceA xHatVec    <*> layerIndexSignal ) (pure (repeat 0))
+  dbgWoAny     = mux tapPulseAny ( (!!) <$> sequenceA woVec      <*> layerIndexSignal ) (pure (repeat 0))
+  dbgXAfterAny = mux tapPulseAny ( (!!) <$> sequenceA xAfterVec  <*> layerIndexSignal ) (pure (repeat 0))
+
+  tapLayerIdxOut = regEn 0 tapPulseAny layerIndexSignal
+  tapSeqPosOut   = regEn 0 tapPulseAny seqPosSignal

@@ -37,12 +37,14 @@ import Helpers
       HiddenDim,
       ModelDim,
       FreqDim, Temperature, Seed )
-import Model.Top ( topEntity )
+import qualified Model.Top as Top ( topEntity, topEntityWithTap )
 import qualified Tokenizer as T (buildTokenizer, encodeTokens, Tokenizer, decodePiece)
 import Model.Layers.TransformerLayer (TransformerDecoderComponent (..), TransformerLayerComponent (..))
 import qualified Model.Layer as Layer
 import qualified Model.Layers.FeedForward.FeedForwardNetwork as FeedForwardNetwork
 import qualified Model.Layers.Attention.MultiHeadAttention as MultiHeadAttention
+import GHC.Base (when)
+import qualified Model.Layers.TransformerLayer as TransformerLayer
 
 --------------------------------------------------------------------------------
 -- Main entry point
@@ -275,6 +277,9 @@ parseModelConfigFile = do
 --------------------------------------------------------------------------------
 -- Token Generation with Clash Simulation
 --------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+-- Token Generation with Clash Simulation
+--------------------------------------------------------------------------------
 
 -- | Autoregressive token generation, one token at a time.
 generateTokensSimAutoregressive
@@ -364,6 +369,140 @@ topEntityBundled
   => TransformerDecoderComponent
   -> C.Signal dom (Token, Temperature, Seed)
   -> (C.Signal dom Token, C.Signal dom Bool)
-topEntityBundled decoder bundledInputs = topEntity decoder inputToken temp rngSeed
+topEntityBundled decoder bundledInputs = Top.topEntity decoder inputToken temp rngSeed
   where
     (inputToken, temp, rngSeed) = C.unbundle bundledInputs
+
+-- | Autoregressive token generation, one token at a time.
+generateTokensSimAutoregressiveWithTap
+  :: TransformerDecoderComponent
+  -> T.Tokenizer
+  -> C.Unsigned 32
+  -> [Token]
+  -> Temperature
+  -> Seed
+  -> IO ([Token], Layer.StepCount)
+generateTokensSimAutoregressiveWithTap decoder tokenizer nSteps promptTokens temperature seed = do
+
+  putStrLn $ "✅ Prompt: " ++ show promptTokens
+  putStr "<s>\n"
+  putStr "Generated: "
+  hFlush stdout
+
+  let temps   = repeat temperature
+      seeds   = repeat seed
+
+  let outputs :: [( Token, Bool, Bool
+                  , C.Index NumLayers, C.Index SeqLen
+                  , C.Vec ModelDim Float, C.Vec ModelDim Float, C.Vec ModelDim Float)]
+      outputs = CS.simulate (bundledOutputsWithTap decoder) (DL.zip3 tokenStream temps seeds)
+
+      outTokens   = [ t  | (t, _, _, _, _, _, _, _) <- outputs ]
+      readyFlags  = [ r  | (_, r, _, _, _, _, _, _) <- outputs ]
+      tapFlags    = [ tp | (_, _, tp, _, _, _, _, _) <- outputs ]
+      tapLayers   = [ l  | (_, _, _, l, _, _, _, _) <- outputs ]
+      tapSeqs     = [ p  | (_, _, _, _, p, _, _, _) <- outputs ]
+      dbgXHats    = [ xv | (_, _, _, _, _, xv, _, _) <- outputs ]
+      dbgWOs      = [ wv | (_, _, _, _, _, _, wv, _) <- outputs ]
+      dbgXAfters  = [ av | (_, _, _, _, _, _, _, av) <- outputs ]
+
+      tokenStream :: [Token]
+      tokenStream =
+        let (cur0, restPrompt) =
+              case promptTokens of
+                (t0:ts) -> (t0, ts)
+                []      -> (1, [])
+        in drive cur0 restPrompt readyFlags outTokens
+        where
+          drive :: Token -> [Token] -> [Bool] -> [Token] -> [Token]
+          drive cur ps (r:rs) (o:os) =
+            cur : if not r
+                    then drive cur ps rs os
+                    else case ps of
+                           (p:ps') -> drive p  ps'  rs os
+                           []      -> drive o  []    rs os
+          drive cur _ _ _ = repeat cur
+
+      sampledAll :: [Token]
+      sampledAll = [ t | (t,r,_,_,_,_,_,_) <- outputs, r ]
+
+  -- Print taps with layer/pos labeling aligned to the C trace:
+  -- For taps coming from the last layer, display P+1 (the C log prints the next pos after sampling).
+  let fmt8 :: C.Vec n Float -> String
+      fmt8 v = DL.intercalate " " (DL.map show (DL.take 8 (C.toList v)))
+
+      -- saturated succ for Index
+      succIdx :: forall n. (Bounded (C.Index n), Enum (C.Index n), Eq (C.Index n)) => C.Index n -> C.Index n
+      succIdx p = if p == maxBound then p else succ p
+
+      showPos :: C.Index NumLayers -> C.Index SeqLen -> (Int, Int)
+      showPos l p =
+        let lInt = fromEnum l
+            pAdj = if l == maxBound then succIdx p else p
+        in (lInt, fromEnum pAdj)
+
+  mapM_
+    (\(tp, l, p, xhat, woh, xaa) ->
+        when tp $ do
+          let (lI, pI) = showPos l p
+          putStr "[L" >> putStr (show lI) >> putStr " P" >> putStr (show pI) >> putStr "] "
+          putStr "xHat: "         >> putStrLn (fmt8 xhat)
+          putStr "[L" >> putStr (show lI) >> putStr " P" >> putStr (show pI) >> putStr "] "
+          putStr "WO@heads: "     >> putStrLn (fmt8 woh)
+          putStr "[L" >> putStr (show lI) >> putStr " P" >> putStr (show pI) >> putStr "] "
+          putStr "x_after_attn: " >> putStrLn (fmt8 xaa)
+    ) (DL.zip6 tapFlags tapLayers tapSeqs dbgXHats dbgWOs dbgXAfters)
+
+  let promptLen = length promptTokens
+      forcedEmitted = promptTokens                         -- emit full prompt
+      sampledAfterPrompt = drop promptLen sampledAll       -- then model outputs
+      emittedAll = forcedEmitted ++ sampledAfterPrompt
+      totalWanted = promptLen + fromIntegral nSteps
+      emittedLimited = take totalWanted emittedAll
+      trans   = zip emittedLimited (drop 1 emittedLimited)
+
+  mapM_
+    (\(prev, nxt) ->
+        BSC.putStr (T.decodePiece tokenizer (fromIntegral prev) (fromIntegral nxt))
+        >> hFlush stdout)
+    trans
+  putStrLn ""
+
+  let generated = take (fromIntegral nSteps) (drop promptLen emittedLimited)
+  pure (generated, Layer.StepCount nSteps)
+
+bundledOutputsWithTap
+  :: TransformerDecoderComponent
+  -> C.Signal C.System (Token, Temperature, Seed)
+  -> C.Signal C.System  ( Token
+                         , Bool
+                         , Bool
+                         , C.Index NumLayers
+                         , C.Index SeqLen
+                         , C.Vec ModelDim Float
+                         , C.Vec ModelDim Float
+                         , C.Vec ModelDim Float )
+bundledOutputsWithTap decoder =
+  C.bundle . C.exposeClockResetEnable
+    (topEntityBundledWithTap @CS.System decoder)
+    CS.systemClockGen
+    CS.resetGen
+    CS.enableGen
+
+-- Helper function to create a bundled version of topEntityWithTap
+topEntityBundledWithTap :: CS.HiddenClockResetEnable dom
+  => TransformerDecoderComponent
+  -> C.Signal dom (Token, Temperature, Seed)
+  -> ( C.Signal dom Token
+     , C.Signal dom Bool
+     , C.Signal dom Bool
+    , C.Signal dom (C.Index NumLayers)
+    , C.Signal dom (C.Index SeqLen)
+    , C.Signal dom (C.Vec ModelDim Float)
+    , C.Signal dom (C.Vec ModelDim Float)
+    , C.Signal dom (C.Vec ModelDim Float ))
+topEntityBundledWithTap decoder bundledInputs =
+  Top.topEntityWithTap decoder inputToken temp rngSeed
+  where
+    (inputToken, temp, rngSeed) = C.unbundle bundledInputs
+  
