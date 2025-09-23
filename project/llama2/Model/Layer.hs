@@ -15,10 +15,10 @@ import Model.Core.Types
   ( ProcessingState(..), IntermediateData(..), CycleStage (..)
   )
 
-import qualified Model.Attention as Attention
 import qualified Model.Memory.KVCacheBank as Cache (KVRamOwner (..), writeSequencer, KvBank (..))
 import qualified Model.Layers.FeedForward.FeedForwardNetwork as FeedForwardNetwork (FeedForwardNetworkComponent, computeFeedForward)
-import qualified Model.Layers.Attention.MultiHeadAttention as MultiHeadAttention
+import qualified Model.Layers.Attention.MultiHeadAttention as MultiHeadAttention (MultiHeadAttentionComponent (..))
+import qualified Model.Layers.Attention.AttentionHead as AttentionHead (streamHeadAttentionAddrIO)
 
 newtype StepCount = StepCount (Unsigned 32) deriving (Show, Eq, Ord)
 
@@ -95,11 +95,11 @@ fillOneBank layerIndex processingStateSignal kvRamOwner intermediateDataSignal (
     valueVectorSignal = getValueVector intermediateDataSignal keyValueHeadIndex
 
     (address0, headOutput0, _busy0, done0) =
-      Attention.streamHeadAttentionAddrIO
+      AttentionHead.streamHeadAttentionAddrIO
         attentionStartSignal sequencePositionSignal
         queryVectorSignal0 keyVectorSignal valueVectorSignal keyRamOutput0 valueRamOutput0
     (address1, headOutput1, _busy1, done1) =
-      Attention.streamHeadAttentionAddrIO
+      AttentionHead.streamHeadAttentionAddrIO
         attentionStartSignal sequencePositionSignal
         queryVectorSignal1 keyVectorSignal valueVectorSignal keyRamOutput1 valueRamOutput1
 

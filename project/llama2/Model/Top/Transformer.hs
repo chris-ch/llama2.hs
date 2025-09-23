@@ -13,13 +13,13 @@ import qualified Model.Layers.TransformerLayer as TransformerLayer (TransformerL
 import Model.Layers.TransformerLayer (TransformerDecoderComponent(..), transformerLogits)
 import qualified Clash.Sized.Vector as CV
 import Data.Maybe (fromMaybe)
+import qualified Model.Embedding.PRNG as PRNG
 
 -- One fold step over layers:
 --   - Run a single transformer layer (multi-cycle)
 --   - Collect its write-done and attention-done pulses into vectors
 --   - Merge the new IntermediateData with the pipeline’s current data depending on stage
-foldLayerStep
-  :: HiddenClockResetEnable dom
+transformerLayerFold :: HiddenClockResetEnable dom
   => Signal dom ProcessingState
   -> ( Signal dom IntermediateData
       , Vec NumLayers (Signal dom Bool)  -- writeDone by layer
@@ -28,7 +28,7 @@ foldLayerStep
   -> ( Signal dom IntermediateData
       , Vec NumLayers (Signal dom Bool)
       , Vec NumLayers (Signal dom Bool))
-foldLayerStep processingStateSignal (currentDataSignal, writeDoneVector, attnDoneVector)
+transformerLayerFold processingStateSignal (currentDataSignal, writeDoneVector, attnDoneVector)
               (transformerLayerComponent, cacheOwner, layerIndex) =
   let (newIntermediateDataSignal, writeDoneSignal, attnDoneSignal, commitCycle3Signal) =
         TransformerLayer.multiCycleTransformerLayer transformerLayerComponent cacheOwner layerIndex processingStateSignal currentDataSignal
@@ -50,8 +50,7 @@ foldLayerStep processingStateSignal (currentDataSignal, writeDoneVector, attnDon
 --   - Uses stage-done pulses to advance ProcessingState
 --   - Handles embedding, sampling, and PRNG state
 --   - Emits (token, readyPulse) at the end of the last layer FFN
-multiCycleTransformer
-  :: forall dom
+multiCycleTransformer :: forall dom
    . HiddenClockResetEnable dom
   => TransformerLayer.TransformerDecoderComponent
   -> Vec NumLayers (Cache.KVRamOwner dom)
@@ -60,7 +59,7 @@ multiCycleTransformer
   -> Signal dom Seed           -- PRNG seed signal
   -> (Signal dom (Unsigned 32), Signal dom Bool)
 multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal seedSignal =
-  (outputTokenSignal, readyPulseSignal)
+  (outputTokenSignal readyPulseSignal temperatureSignal seedSignal decoder nextIntermediateDataSignal, readyPulseSignal)
  where
   embeddingComponent      = modelEmbedding decoder
   transformerLayers       = modelLayers decoder
@@ -88,7 +87,7 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
   ( nextIntermediateDataSignal
     , writeDoneVector
     , attnDoneVector) =
-    foldl (foldLayerStep processingStateSignal) (inputLoadedSignal, repeat (pure False), repeat (pure False))
+    foldl (transformerLayerFold processingStateSignal) (inputLoadedSignal, repeat (pure False), repeat (pure False))
                         (zip3 transformerLayers cacheOwners indicesI)
 
   layerIndexSignal   = processingLayer <$> processingStateSignal
@@ -118,36 +117,48 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
   readyPulseSignal = liftA2 (\now prev -> now && not prev)
                             isLastLayerFFN (register False isLastLayerFFN)
 
-  -- logits from the current data
-  logitsSignal = transformerLogits decoder . feedForwardOutput <$> nextIntermediateDataSignal
+-- logits from the current data
+logitsSignal :: TransformerLayer.TransformerDecoderComponent -> Signal dom IntermediateData -> Signal dom (Vec VocabSize Float)
+logitsSignal decoder nextIntermediateDataSignal = transformerLogits decoder . feedForwardOutput <$> nextIntermediateDataSignal
 
-  -- PRNG state
-  firstPulseSignal :: Signal dom Bool
-  firstPulseSignal = regEn True readyPulseSignal (pure False)
+-- Sampling on pulse
+sampledTokenSignal :: forall dom
+   . HiddenClockResetEnable dom
+  =>  Signal dom Bool -> Signal dom Temperature -> Signal dom (Unsigned 32) -> TransformerLayer.TransformerDecoderComponent -> Signal dom IntermediateData -> Signal dom (Unsigned 32)
+sampledTokenSignal readyPulseSignal temperatureSignal seedSignal decoder nextIntermediateDataSignal =
+  liftA3
+    (\temperature logits randomVal ->
+        if temperature <= 0.0 then argMax logits
+        else let probabilities = softmax temperature logits
+            in sampleFromProbs randomVal probabilities)
+    temperatureSignal (logitsSignal decoder nextIntermediateDataSignal) (uniformRandom01Signal readyPulseSignal seedSignal)
 
-  mixedSeedSignal :: Signal dom (Unsigned 32)
-  mixedSeedSignal = (`xor` 0x9E3779B9) <$> seedSignal
+outputTokenSignal :: forall dom
+   . HiddenClockResetEnable dom
+  =>  Signal dom Bool -> Signal dom Temperature -> Signal dom (Unsigned 32) -> TransformerLayer.TransformerDecoderComponent -> Signal dom IntermediateData -> Signal dom (Unsigned 32)
+outputTokenSignal readyPulseSignal temperatureSignal seedSignal decoder nextIntermediateDataSignal = regEn 0 readyPulseSignal (sampledTokenSignal readyPulseSignal temperatureSignal seedSignal decoder nextIntermediateDataSignal)
 
-  prngStateSignal :: Signal dom (Unsigned 32)
-  prngStateSignal =
-    let nextVal = mux firstPulseSignal (xorshift32 <$> mixedSeedSignal)
-                                        (xorshift32 <$> prngStateSignal)
-    in regEn 2463534242 readyPulseSignal nextVal
+-- PRNG state
+firstPulseSignal :: forall dom
+   . HiddenClockResetEnable dom
+  =>  Signal dom Bool -> Signal dom Bool
+firstPulseSignal readyPulseSignal = regEn True readyPulseSignal (pure False)
 
-  uniformRandom01Signal :: Signal dom Float
-  uniformRandom01Signal = (/ 16777216.0) . fromIntegral . (`shiftR` 8) <$> prngStateSignal
+mixedSeedSignal :: Signal dom (Unsigned 32) -> Signal dom (Unsigned 32)
+mixedSeedSignal seedSignal = (`xor` 0x9E3779B9) <$> seedSignal
 
-  -- Sampling on pulse
-  sampledTokenSignal :: Signal dom (Unsigned 32)
-  sampledTokenSignal =
-    liftA3
-      (\temperature logits randomVal ->
-         if temperature <= 0.0 then argMax logits
-         else let probabilities = softmax temperature logits
-              in sampleFromProbs randomVal probabilities)
-      temperatureSignal logitsSignal uniformRandom01Signal
+prngStateSignal :: forall dom
+   . HiddenClockResetEnable dom
+  => Signal dom Bool -> Signal dom (Unsigned 32) ->Signal dom (Unsigned 32)
+prngStateSignal readyPulseSignal seedSignal =
+  let nextVal = mux (firstPulseSignal readyPulseSignal) (PRNG.xorshift32 <$> mixedSeedSignal seedSignal)
+                                      (PRNG.xorshift32 <$> prngStateSignal readyPulseSignal seedSignal)
+  in regEn 2463534242 readyPulseSignal nextVal
 
-  outputTokenSignal = regEn 0 readyPulseSignal sampledTokenSignal
+uniformRandom01Signal :: forall dom
+   . HiddenClockResetEnable dom
+  =>  Signal dom Bool -> Signal dom (Unsigned 32) -> Signal dom Float
+uniformRandom01Signal readyPulseSignal seedSignal = (/ 16777216.0) . fromIntegral . (`shiftR` 8) <$> prngStateSignal readyPulseSignal seedSignal
 
 -- Pure, synthesizable categorical sampling from probabilities summing to ~1.0
 sampleFromProbs :: forall n. (KnownNat (n + 1), KnownNat n) => Float -> Vec (n + 1) Float -> Unsigned 32
@@ -156,14 +167,6 @@ sampleFromProbs u probs =
     cdf = CV.scanl1 (+) probs
     idx = fromMaybe maxBound (findIndex (>= u) cdf)
   in fromIntegral (fromEnum idx)
-
--- xorshift32 core (synthesizable, 1-cycle combinational)
-xorshift32 :: Unsigned 32 -> Unsigned 32
-xorshift32 s0 =
-  let s1 = s0 `xor` shiftL s0 13
-      s2 = s1 `xor` shiftR s1 17
-      s3 = s2 `xor` shiftL s2 5
-  in s3
 
 softmax :: forall n. KnownNat (n + 1) => Float -> Vec (n + 1) Float -> Vec (n + 1) Float
 softmax t xs =

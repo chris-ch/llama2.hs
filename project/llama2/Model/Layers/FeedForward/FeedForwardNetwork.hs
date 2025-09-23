@@ -3,7 +3,7 @@ module Model.Layers.FeedForward.FeedForwardNetwork (
 ) where
 
 import Clash.Prelude
-import qualified Prelude as P
+
 import Helpers (CArray2D, ModelDim, HiddenDim, rmsNorm, matrixVectorMult)
 
 data FeedForwardNetworkComponent = FeedForwardNetworkComponent

@@ -3,7 +3,7 @@ module Model.Layers.Attention.MultiHeadAttention (
 ) where
 
 import Clash.Prelude
-import qualified Prelude as P
+
 import Helpers (NumQueryHeads, ModelDim, NumKeyValueHeads, SeqLen, HeadDimension, CArray2D, SingleHeadComponent, matrixVectorMult, dotVec)
 
 data MultiHeadAttentionComponent = MultiHeadAttentionComponent

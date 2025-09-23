@@ -3,7 +3,6 @@ module Model.Memory.RamOps (
 ) where
 
 import Clash.Prelude
-import qualified Prelude as P
 import Data.Maybe (isJust)
 
 -- Convert separate read and optional-write signals into a unified RAM operation stream.

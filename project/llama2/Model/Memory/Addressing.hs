@@ -3,7 +3,7 @@ module Model.Memory.Addressing (
 ) where
 
 import Clash.Prelude
-import qualified Prelude as P
+
 import Helpers (SeqLen, HeadDimension)
 import Model.Core.Types (BankAddress)
 
