@@ -5,16 +5,13 @@ module Model.Top
 import Clash.Prelude
 
 import Helpers
-  ( TransformerDecoderComponent(..)
-  
-  , Temperature, Seed
+  ( 
+  Temperature, Seed
   )
 
-
-import Model.Cache
-  ( makeRamOwnerKV)
-
 import Model.Top.Transformer (multiCycleTransformer)
+import qualified Model.Memory.KVCacheBank as Cache
+import qualified Model.Layers.TransformerLayer as TransformerLayer (TransformerDecoderComponent)
 
 
 -- ============================================================================
@@ -23,9 +20,9 @@ import Model.Top.Transformer (multiCycleTransformer)
 topEntity
   :: forall dom
    . HiddenClockResetEnable dom
-  => TransformerDecoderComponent
+  => TransformerLayer.TransformerDecoderComponent
   -> Signal dom (Unsigned 32)  -- Input token
   -> Signal dom Temperature
   -> Signal dom Seed
   -> (Signal dom (Unsigned 32), Signal dom Bool)
-topEntity decoder = multiCycleTransformer decoder (repeat makeRamOwnerKV)
+topEntity decoder = multiCycleTransformer decoder (repeat Cache.makeRamOwnerKV)

@@ -38,13 +38,13 @@ executable llama2
     Model.Layers.Attention.AttentionHead,
     Model.Layers.Attention.CacheController,
     Model.Layers.FeedForward.FeedForwardNetwork,
+    Model.Layers.TransformerLayer,
     Model.Memory.Addressing,
     Model.Memory.KVCacheBank,
     Model.Memory.RamOps,
-    Model.Top.InferenceLoop,
     Model.Top,
-    Model.Top.Transformer,
-    DebugDump
+    Model.Top.InferenceLoop,
+    Model.Top.Transformer
   hs-source-dirs:
       project/llama2
   build-depends: base,

@@ -21,18 +21,11 @@ import System.IO (hFlush, stdout)
 import Control.Monad (replicateM_)
 import Text.Printf (printf)
 import Helpers
-    ( TransformerDecoderComponent(..),
-      TransformerLayerComponent(TransformerLayerComponent,
-                                feedforwardNetwork, multiHeadAttention),
-      FeedForwardNetworkComponent(FeedForwardNetworkComponent, fRMSFfn,
-                                  fW1, fW2, fW3),
-      MultiHeadAttentionComponent(MultiHeadAttentionComponent, rmsAtt,
-                                  heads, mWo),
+    (
       SingleHeadComponent(SingleHeadComponent, rotary, wqHead, wkHead,
                           wvHead),
       RotaryEncodingComponent(RotaryEncodingComponent, freqSin, freqCos),
       EmbeddingComponent(EmbeddingComponent, rmsFinalWeight, vocabulary),
-      StepCount(..),
       Token,
       CArray2D(CArray2D),
       HeadDimension,
@@ -43,11 +36,13 @@ import Helpers
       NumKeyValueHeads,
       HiddenDim,
       ModelDim,
-      vocabSize,
       FreqDim, Temperature, Seed )
 import Model ( topEntity )
 import qualified Tokenizer as T (buildTokenizer, encodeTokens, Tokenizer, decodePiece)
-import DebugDump (dumpLayerSums, traceFullStackPos01, tracePos01AllLayers)
+import Model.Layers.TransformerLayer (TransformerDecoderComponent (..), TransformerLayerComponent (..))
+import qualified Model.Layer as Layer
+import qualified Model.Layers.FeedForward.FeedForwardNetwork as FeedForwardNetwork
+import qualified Model.Layers.Attention.MultiHeadAttention as MultiHeadAttention
 
 --------------------------------------------------------------------------------
 -- Main entry point
@@ -68,9 +63,8 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
     seedValue = fromIntegral $ fromMaybe (round currentTime) seed
     initModel = BG.runGet parseModelConfigFile
     config    = initModel modelFileContent
-    tokenizer = T.buildTokenizer tokenizerFileContent vocabSize
+    tokenizer = T.buildTokenizer tokenizerFileContent (C.natToNum @VocabSize)
     prompt'   = fromMaybe "" prompt
-  dumpLayerSums config
   let
     promptTokensI = T.encodeTokens tokenizer (BSC.pack prompt') True False
     promptTokens  = map fromIntegral promptTokensI :: [Token]
@@ -81,15 +75,13 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
       putStrLn $ "[TRACE] token0=" ++ show t0
       putStrLn $ "[TRACE] token1=" ++ show t1
       -- Run pure tracer: compares directly to your C prints for pos 0 and pos 1
-      tracePos01AllLayers config t0 t1
-      traceFullStackPos01 config t0 t1
     _ -> putStrLn "Need at least two tokens in the prompt to run pos0/pos1 tracer."
 
   putStrLn "✅ model loaded successfully"
   putStrLn "<s>"
   startTime <- getPOSIXTime
 
-  (_, StepCount countTokens) <- generateTokensSimAutoregressive config tokenizer (fromIntegral steps) promptTokens temperature seedValue
+  (_, Layer.StepCount countTokens) <- generateTokensSimAutoregressive config tokenizer (fromIntegral steps) promptTokens temperature seedValue
 
   endTime <- getPOSIXTime
   let duration :: Integer
@@ -260,12 +252,12 @@ parseModelConfigFile = do
         mWoVec = C.map headBlock (C.indicesI @NumQueryHeads)
 
       in TransformerLayerComponent
-           { multiHeadAttention = MultiHeadAttentionComponent
+           { multiHeadAttention = MultiHeadAttention.MultiHeadAttentionComponent
                { heads  = C.map sha (C.indicesI :: C.Vec NumQueryHeads (C.Index NumQueryHeads))
                , mWo    = mWoVec
                , rmsAtt = rmsAttWeight' C.!! lIdx
                }
-           , feedforwardNetwork = FeedForwardNetworkComponent
+           , feedforwardNetwork = FeedForwardNetwork.FeedForwardNetworkComponent
                { fW1     = CArray2D $ w1' C.!! lIdx
                , fW2     = CArray2D $ w2' C.!! lIdx
                , fW3     = CArray2D $ w3' C.!! lIdx
@@ -292,7 +284,7 @@ generateTokensSimAutoregressive
   -> [Token]
   -> Temperature
   -> Seed
-  -> IO ([Token], StepCount)
+  -> IO ([Token], Layer.StepCount)
 generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperature seed = do
 
   putStrLn $ "✅ Prompt: " ++ show promptTokens
@@ -357,7 +349,7 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
   putStrLn ""
   -- Only the generated tokens (exclude the prompt portion)
   let generated = take (fromIntegral nSteps) (drop promptLen emittedLimited)
-  pure (generated, StepCount nSteps)
+  pure (generated, Layer.StepCount nSteps)
 
 bundledOutputs :: TransformerDecoderComponent -> CS.Signal CS.System (Token, Temperature, Seed) -> CS.Signal C.System (Token, Bool)
 bundledOutputs decoder = CS.bundle . CS.exposeClockResetEnable

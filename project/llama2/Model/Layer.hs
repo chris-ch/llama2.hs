@@ -1,6 +1,6 @@
 module Model.Layer
-  ( getQueryVector, getKeyVector, getValueVector
-  , multiCycleTransformerLayer
+  ( StepCount(..),
+    getQueryVector, getKeyVector, getValueVector, processCycle, fillOneBank, applyRotaryToHead
   ) where
 
 import Clash.Prelude
@@ -8,9 +8,7 @@ import qualified Prelude as P
 
 import Helpers
   ( NumQueryHeads, NumKeyValueHeads, NumLayers, HeadDimension
-  , TransformerLayerComponent(..), MultiHeadAttentionComponent(..)
-  , runSingleHeadQKV, applyRotaryToHead, StepCount (..)
-  , computeFeedForward, rmsNorm, matrixVectorMult, liftA4, FeedForwardNetworkComponent
+  , rmsNorm, FreqDim, RotaryEncodingComponent (..), SingleHeadComponent (..), CArray2D (..), ModelDim, matrixVectorMult
   )
 
 import Model.Core.Types
@@ -18,7 +16,11 @@ import Model.Core.Types
   )
 
 import qualified Model.Attention as Attention
-import qualified Model.Cache as Cache
+import qualified Model.Memory.KVCacheBank as Cache (KVRamOwner (..), writeSequencer, KvBank (..))
+import qualified Model.Layers.FeedForward.FeedForwardNetwork as FeedForwardNetwork (FeedForwardNetworkComponent, computeFeedForward)
+import qualified Model.Layers.Attention.MultiHeadAttention as MultiHeadAttention
+
+newtype StepCount = StepCount (Unsigned 32) deriving (Show, Eq, Ord)
 
 -- Access the per-head vectors from IntermediateData for use in attention.
 getQueryVector :: Signal dom IntermediateData -> Index NumQueryHeads -> Signal dom (Vec HeadDimension Float)
@@ -51,91 +53,6 @@ hasSecondQueryHead keyValueHeadIndex = queryHeadsPerKeyValueHead >= 2 && (baseQu
 
 queryHeadIndex1 :: Index NumKeyValueHeads -> Index NumQueryHeads
 queryHeadIndex1 keyValueHeadIndex = if hasSecondQueryHead keyValueHeadIndex then toEnum (baseQueryIndex keyValueHeadIndex + 1) else queryHeadIndex0 keyValueHeadIndex
-
--- One transformer layer running across multiple cycles:
---   Cycle2: compute Q/K/V
---   Cycle3: run attention heads with streaming RAM reads
---   Cycle4: write K/V to RAM
---   Cycle5: feed-forward network
--- Handles per-head attention and per-bank K/V cache writes.
-multiCycleTransformerLayer
-  :: HiddenClockResetEnable dom
-  => TransformerLayerComponent
-  -> Cache.KVRamOwner dom
-  -> Index NumLayers
-  -> Signal dom ProcessingState
-  -> Signal dom IntermediateData
-  -> ( Signal dom IntermediateData
-     , Signal dom Bool     -- writeDone (Cycle4)
-     , Signal dom Bool     -- attnDone  (Cycle3)
-     , Signal dom IntermediateData) -- commitCycle3 (gated write-back)
-multiCycleTransformerLayer transformerLayerComponent kvRamOwner layerIndex processingStateSignal intermediateDataSignal =
-  (nextIntermediateDataSignal, writeDoneThisLayerSignal, attentionDoneThisLayerSignal, commitCycle3Signal)
- where
-  multiHeadAttentionComponent  = multiHeadAttention transformerLayerComponent
-  feedForwardNetworkComponent = feedforwardNetwork transformerLayerComponent
-
-  -- For each KV bank: two attention runners share the bank; same bank’s writer runs in Cycle4.
-  (perHeadOutputSignalsVec, perHeadDoneSignalsVec, perBankWriteDoneVec) =
-    let
-      initHeadOutputs  = repeat (pure (repeat 0)) :: Vec NumQueryHeads (Signal dom (Vec HeadDimension Float))
-      initHeadDone     = repeat (pure False)      :: Vec NumQueryHeads (Signal dom Bool)
-      initWriteDone    = repeat (pure False)      :: Vec NumKeyValueHeads (Signal dom Bool)
-    in P.foldl
-         (fillOneBank layerIndex processingStateSignal kvRamOwner intermediateDataSignal)
-         (initHeadOutputs, initHeadDone, initWriteDone)
-         indicesI
-
-  -- Attention done for this layer = all heads done (rising edge)
-  allHeadsDoneSignal          = fmap P.and (sequenceA perHeadDoneSignalsVec)
-  allHeadsDonePreviousSignal  = register False allHeadsDoneSignal
-  attentionDoneThisLayerSignal =
-    liftA2 (\now prev -> now && not prev) allHeadsDoneSignal allHeadsDonePreviousSignal
-
-  -- Project each head with its W_O slice, then sum across heads
-  perHeadProjectedSignalsVec = zipWith
-                                 (\wo hSig -> matrixVectorMult wo <$> hSig)
-                                 (mWo multiHeadAttentionComponent)
-                                 perHeadOutputSignalsVec
-  perHeadProjectedSignal = sequenceA perHeadProjectedSignalsVec
-  attentionSumSignal     = fmap (foldl1 (zipWith (+))) perHeadProjectedSignal
-
-  -- Residual: x + sum_h(W_O @ h)
-  attentionOutputSignal =
-    (zipWith (+) P.. inputVector P.<$> intermediateDataSignal) <*> attentionSumSignal
-
-  -- Commit attention output only on this layer’s attn done pulse in Cycle3
-  nextIntermediateDataSignal =
-    liftA4
-      (\procState currentIntermediateData attentionOutput doneSignal ->
-         if processingLayer procState == layerIndex && processingStage procState == Cycle3_ComputeAttention && doneSignal
-           then currentIntermediateData { attentionOutput = attentionOutput }
-           else currentIntermediateData)
-      processingStateSignal baseNextIntermediateDataSignal attentionOutputSignal attentionDoneThisLayerSignal
-
-  -- Layer write done = AND across banks, qualified to this layer/stage
-  writeDoneThisLayerSignal =
-    let allBanksDoneSignal = fmap P.and (sequenceA perBankWriteDoneVec)
-    in  (\procState banksDone ->
-           processingStage procState == Cycle4_WriteCache &&
-           processingLayer procState == layerIndex &&
-           banksDone)
-        <$> processingStateSignal <*> allBanksDoneSignal
-
-  -- Same gated “commit” view used by the outer pipeline
-  commitCycle3Signal =
-    liftA4
-      (\procState currentIntermediateData attentionOutput doneSignal ->
-        if processingLayer procState == layerIndex && processingStage procState == Cycle3_ComputeAttention && doneSignal
-          then currentIntermediateData { attentionOutput = attentionOutput }
-          else currentIntermediateData)
-      processingStateSignal intermediateDataSignal attentionOutputSignal attentionDoneThisLayerSignal
-
-  -- Default per-stage work within this layer
-  baseNextIntermediateDataSignal =
-    liftA2 (processCycle multiHeadAttentionComponent feedForwardNetworkComponent layerIndex)
-           processingStateSignal
-           intermediateDataSignal
 
 -- For one K/V bank:
 --   - Runs attention for one or two query heads mapped to this bank
@@ -215,8 +132,8 @@ fillOneBank layerIndex processingStateSignal kvRamOwner intermediateDataSignal (
 --   - In Cycle5 computes feed-forward network
 --   - Otherwise passes IntermediateData through unchanged
 processCycle
-  :: MultiHeadAttentionComponent
-  -> FeedForwardNetworkComponent
+  :: MultiHeadAttention.MultiHeadAttentionComponent
+  -> FeedForwardNetwork.FeedForwardNetworkComponent
   -> Index NumLayers
   -> ProcessingState
   -> IntermediateData
@@ -228,11 +145,11 @@ processCycle multiHeadAttentionComponent feedForwardNetworkComponent layerIndex 
         Cycle1_ReadCache -> intermediateData
         Cycle2_ComputeQKV ->
           let
-            normalizedInput = rmsNorm (inputVector intermediateData) (rmsAtt multiHeadAttentionComponent)
+            normalizedInput = rmsNorm (inputVector intermediateData) (MultiHeadAttention.rmsAtt multiHeadAttentionComponent)
             -- Queries: one per Q head (with RoPE on Q)
             queries =
               imap (\queryHeadIdx _ ->
-                let headComponent = heads multiHeadAttentionComponent !! queryHeadIdx
+                let headComponent = MultiHeadAttention.heads multiHeadAttentionComponent !! queryHeadIdx
                     (query, _, _)   = runSingleHeadQKV headComponent normalizedInput
                     (queryRotated, _kU) =
                       applyRotaryToHead headComponent
@@ -246,7 +163,7 @@ processCycle multiHeadAttentionComponent feedForwardNetworkComponent layerIndex 
                 let qIdx0 = fromEnum keyValueHeadIdx *
                               (natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads)
                     queryIndex = toEnum (min (natToNum @NumQueryHeads - 1) qIdx0) :: Index NumQueryHeads
-                    headComponent     = heads multiHeadAttentionComponent !! queryIndex
+                    headComponent     = MultiHeadAttention.heads multiHeadAttentionComponent !! queryIndex
                     (_q, key, value)   = runSingleHeadQKV headComponent normalizedInput
                     (_qU, keyRotated)  =
                       applyRotaryToHead headComponent
@@ -258,5 +175,56 @@ processCycle multiHeadAttentionComponent feedForwardNetworkComponent layerIndex 
         Cycle3_ComputeAttention -> intermediateData
         Cycle4_WriteCache  -> intermediateData
         Cycle5_ComputeFeedForward  ->
-          let ffnOutput = computeFeedForward feedForwardNetworkComponent (attentionOutput intermediateData)
+          let ffnOutput = FeedForwardNetwork.computeFeedForward feedForwardNetworkComponent (attentionOutput intermediateData)
           in intermediateData { feedForwardOutput = ffnOutput }
+
+-- Rotary application
+applyRotaryToHead :: SingleHeadComponent -> StepCount -> (Vec HeadDimension Float , Vec HeadDimension Float ) -> (Vec HeadDimension Float , Vec HeadDimension Float )
+applyRotaryToHead headComp step (q, k) = (q', k') where
+    rot = rotary headComp
+    q' = applyRotation rot step q
+    k' = applyRotation rot step k
+
+-- Apply rotation per head
+applyRotation
+  :: RotaryEncodingComponent
+  -> StepCount
+  -> Vec HeadDimension Float
+  -> Vec HeadDimension Float
+applyRotation rot step tokenVec =
+  let cosFrequencies = getRow step (freqCos rot)
+      sinFrequencies = getRow step (freqSin rot)
+  in applyRotaryPositionEncoding tokenVec cosFrequencies sinFrequencies
+
+applyRotaryPositionEncoding :: Vec HeadDimension Float    -- input vector
+  -> Vec FreqDim Float  -- cosFrequencies
+  -> Vec FreqDim Float  -- sinFrequencies
+  -> Vec HeadDimension Float
+applyRotaryPositionEncoding inputVec cosVec sinVec =
+  imap rotatePair inputVec
+  where
+    rotatePair :: KnownNat headDim => Index headDim -> Float -> Float
+    rotatePair i _
+        | even idx = rotatedReal
+        | otherwise = rotatedImag
+        where
+            idx :: Int
+            idx = fromIntegral i
+            pairIdx = idx `div` 2
+            realComponent = inputVec !! (2 * pairIdx)
+            imagComponent = inputVec !! (2 * pairIdx + 1)
+            cosValue = cosVec !! pairIdx
+            sinValue = sinVec !! pairIdx
+            rotatedReal = realComponent * cosValue - imagComponent * sinValue
+            rotatedImag = realComponent * sinValue + imagComponent * cosValue
+
+-- Index into CArray2D to get a row
+getRow :: forall n m. (KnownNat n) => StepCount -> CArray2D n m -> Vec m Float
+getRow (StepCount i) (CArray2D arr) = arr !! (fromIntegral i :: Index n)
+
+-- QKV per head - should return HeadDimension vectors, not ModelDim
+runSingleHeadQKV :: SingleHeadComponent -> Vec ModelDim Float -> (Vec HeadDimension Float, Vec HeadDimension Float, Vec HeadDimension Float)
+runSingleHeadQKV headComp normalizedInput = (q, k, v) where
+    q = matrixVectorMult (wqHead headComp) normalizedInput  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
+    k = matrixVectorMult (wkHead headComp) normalizedInput  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
+    v = matrixVectorMult (wvHead headComp) normalizedInput  -- HeadDimension x ModelDim * ModelDim -> HeadDimension

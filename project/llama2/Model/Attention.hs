@@ -6,7 +6,7 @@ module Model.Attention
 import Clash.Prelude
 
 import Helpers ( HeadDimension, SeqLen, liftA4, liftA5 )
-import Model.Cache (computeBankAddress)
+import qualified Model.Memory.Addressing as Addressing (computeBankAddress)
 import Model.Core.Types (BankAddress)
 
 data AttnPhase = PhaseDot | PhaseAcc | PhaseFinalize
@@ -64,7 +64,7 @@ streamHeadAttentionAddrIO startSignal sequencePositionSignal queryVectorSignal c
   isLastTimeSignal      = (==) <$> timeCounterSignal <*> sequencePositionSignal
 
   -- Addressing (issue address for current (time, dimension); data valid next cycle)
-  bankAddressSignal = computeBankAddress <$> timeCounterSignal <*> dimensionCounterSignal
+  bankAddressSignal = Addressing.computeBankAddress <$> timeCounterSignal <*> dimensionCounterSignal
 
   -- Element selection, aligned to previous address
   queryElementRawSignal = (!!) <$> queryVectorSignal    <*> previousDimensionCounterSignal

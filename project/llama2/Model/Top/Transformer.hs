@@ -1,12 +1,18 @@
 module Model.Top.Transformer (
     multiCycleTransformer
+    , argMax
 ) where
 
 import Clash.Prelude
-import Helpers (TransformerDecoderComponent (..), NumLayers, Temperature, Seed, embed, EmbeddingComponent (..), transformerLogits, xorshift32, argMax, softmax, sampleFromProbs, TransformerLayerComponent, liftA4)
-import Model.Cache (KVRamOwner)
+import Helpers (NumLayers, Temperature, Seed, EmbeddingComponent (..), liftA4, CArray2D (..), VocabSize, Token, ModelDim)
+
 import Model.Core.Types (IntermediateData(..), nextProcessingState, initialProcessingState, initialIntermediateData, ProcessingState (..), CycleStage (..))
-import Model.Layer (multiCycleTransformerLayer)
+
+import qualified Model.Memory.KVCacheBank as Cache
+import qualified Model.Layers.TransformerLayer as TransformerLayer (TransformerLayerComponent(..), TransformerDecoderComponent(..), multiCycleTransformerLayer)
+import Model.Layers.TransformerLayer (TransformerDecoderComponent(..), transformerLogits)
+import qualified Clash.Sized.Vector as CV
+import Data.Maybe (fromMaybe)
 
 -- One fold step over layers:
 --   - Run a single transformer layer (multi-cycle)
@@ -18,14 +24,14 @@ foldLayerStep
   -> ( Signal dom IntermediateData
       , Vec NumLayers (Signal dom Bool)  -- writeDone by layer
       , Vec NumLayers (Signal dom Bool)) -- attnDone  by layer (rising edge)
-  -> (TransformerLayerComponent, KVRamOwner dom, Index NumLayers)
+  -> (TransformerLayer.TransformerLayerComponent, Cache.KVRamOwner dom, Index NumLayers)
   -> ( Signal dom IntermediateData
       , Vec NumLayers (Signal dom Bool)
       , Vec NumLayers (Signal dom Bool))
 foldLayerStep processingStateSignal (currentDataSignal, writeDoneVector, attnDoneVector)
               (transformerLayerComponent, cacheOwner, layerIndex) =
   let (newIntermediateDataSignal, writeDoneSignal, attnDoneSignal, commitCycle3Signal) =
-        multiCycleTransformerLayer transformerLayerComponent cacheOwner layerIndex processingStateSignal currentDataSignal
+        TransformerLayer.multiCycleTransformerLayer transformerLayerComponent cacheOwner layerIndex processingStateSignal currentDataSignal
 
       selectedIntermediateDataSignal = liftA4
         (\processingState oldData newData commitCycle3Data ->
@@ -47,8 +53,8 @@ foldLayerStep processingStateSignal (currentDataSignal, writeDoneVector, attnDon
 multiCycleTransformer
   :: forall dom
    . HiddenClockResetEnable dom
-  => TransformerDecoderComponent
-  -> Vec NumLayers (KVRamOwner dom)
+  => TransformerLayer.TransformerDecoderComponent
+  -> Vec NumLayers (Cache.KVRamOwner dom)
   -> Signal dom (Unsigned 32)  -- Input token signal
   -> Signal dom Temperature    -- Temperature signal
   -> Signal dom Seed           -- PRNG seed signal
@@ -142,3 +148,40 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
       temperatureSignal logitsSignal uniformRandom01Signal
 
   outputTokenSignal = regEn 0 readyPulseSignal sampledTokenSignal
+
+-- Pure, synthesizable categorical sampling from probabilities summing to ~1.0
+sampleFromProbs :: forall n. (KnownNat (n + 1), KnownNat n) => Float -> Vec (n + 1) Float -> Unsigned 32
+sampleFromProbs u probs =
+  let
+    cdf = CV.scanl1 (+) probs
+    idx = fromMaybe maxBound (findIndex (>= u) cdf)
+  in fromIntegral (fromEnum idx)
+
+-- xorshift32 core (synthesizable, 1-cycle combinational)
+xorshift32 :: Unsigned 32 -> Unsigned 32
+xorshift32 s0 =
+  let s1 = s0 `xor` shiftL s0 13
+      s2 = s1 `xor` shiftR s1 17
+      s3 = s2 `xor` shiftL s2 5
+  in s3
+
+softmax :: forall n. KnownNat (n + 1) => Float -> Vec (n + 1) Float -> Vec (n + 1) Float
+softmax t xs =
+  let
+    m    = maximum xs
+    exps = map (\x -> exp ((x - m) / t)) xs
+    s    = sum exps
+  in map (/ s) exps
+
+-- | Find the index of the maximum element in a non-empty vector
+argMax :: forall n. ( KnownNat (n + 1)) =>Vec (n+1) Float -> Unsigned 32
+argMax vec = fst $ foldl compareMax (0, head vec) (imap (\i x -> (fromIntegral i, x)) vec)
+  where
+    compareMax :: (Unsigned 32, Float) -> (Unsigned 32, Float) -> (Unsigned 32, Float)
+    compareMax (maxIdx, maxVal) (i, x)
+      | x > maxVal = (i, x)
+      | otherwise  = (maxIdx, maxVal)
+
+-- Embed a token
+embed :: CArray2D VocabSize ModelDim -> Token -> Vec ModelDim Float
+embed (CArray2D vocab) tokenCode = vocab !! (fromIntegral tokenCode :: Int)
