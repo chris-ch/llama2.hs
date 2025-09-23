@@ -37,7 +37,7 @@ import Helpers
       HiddenDim,
       ModelDim,
       FreqDim, Temperature, Seed )
-import Model ( topEntity )
+import Model.Top ( topEntity )
 import qualified Tokenizer as T (buildTokenizer, encodeTokens, Tokenizer, decodePiece)
 import Model.Layers.TransformerLayer (TransformerDecoderComponent (..), TransformerLayerComponent (..))
 import qualified Model.Layer as Layer

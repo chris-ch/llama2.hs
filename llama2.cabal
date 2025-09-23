@@ -25,7 +25,6 @@ executable llama2
   other-modules:
     Helpers,
     Tokenizer,
-    Model,
     Model.Attention,
     Model.Cache,
     Model.Core.Types,
