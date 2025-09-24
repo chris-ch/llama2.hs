@@ -32,19 +32,22 @@ runPipelineController attnDoneThisLayer writeDoneThisLayer = outs
   advance s done = if done then nextProcessingState s else s
   procState = register initialProcessingState (advance <$> procState <*> stageFinishedSig)
 
+  -- Track if all layers have completed Cycle4
+  allLayersWritten = register False (mux (isStage Cycle4_WriteCache .&&. writeDoneThisLayer .&&. fmap (== maxBound) (processingLayer <$> procState)) (pure True) (pure False))
+
   -- Convenience fields
   stageSig = processingStage <$> procState
   layerIx  = processingLayer <$> procState
   posIx    = sequencePosition <$> procState
 
-  -- Ready pulse: last layer finishing Cycle5
+  -- Ready pulse: last layer finishing Cycle5 AND all writes completed
   isLastLayerFFN =
     liftA2 (\ps _ -> processingStage ps == Cycle5_ComputeFeedForward
                   && processingLayer ps == maxBound)
            procState (pure ())
   readyPulseRaw =
     let rising now prev = now && not prev
-    in liftA2 rising isLastLayerFFN (register False isLastLayerFFN)
+    in liftA3 (\ffn written prev -> rising (ffn && written) prev) isLastLayerFFN allLayersWritten (register False (isLastLayerFFN .&&. allLayersWritten))
 
   -- “when to advance” policy
   isStage st = (== st) <$> stageSig
@@ -64,3 +67,4 @@ runPipelineController attnDoneThisLayer writeDoneThisLayer = outs
     , readyPulse      = readyPulseRaw
     , stageFinished   = stageFinishedSig
     }
+  
