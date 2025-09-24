@@ -22,20 +22,17 @@ data PipelineOutputs dom = PipelineOutputs
 runPipelineController
   :: HiddenClockResetEnable dom
   => Signal dom Bool  -- attnDoneThisLayer (Cycle3)
-  -> Signal dom Bool  -- writeDoneThisLayer (Cycle2)
+  -> Signal dom Bool  -- writeDoneThisLayer (Cycle4)
   -> PipelineOutputs dom
 runPipelineController attnDoneThisLayer writeDoneThisLayer = outs
  where
-  -- State register
   advance s done = if done then nextProcessingState s else s
   procState = register initialProcessingState (advance <$> procState <*> stageFinishedSig)
 
-  -- Convenience fields
   stageSig = processingStage <$> procState
   layerIx  = processingLayer <$> procState
   posIx    = sequencePosition <$> procState
 
-  -- Ready pulse: last layer finishing Cycle5
   isLastLayerFFN =
     liftA2 (\ps _ -> processingStage ps == Cycle5_ComputeFeedForward
                   && processingLayer ps == maxBound)
@@ -44,18 +41,12 @@ runPipelineController attnDoneThisLayer writeDoneThisLayer = outs
     let rising now prev = now && not prev
     in liftA2 rising isLastLayerFFN (register False isLastLayerFFN)
 
-  -- Stage-done policy for the simplified schedule:
-  --   C1: immediate
-  --   C2: wait for KV writeDone (now produced in Cycle2)
-  --   C3: wait for attention done (all heads)
-  --   C4: immediate (no-op in this schedule)
-  --   C5: one cycle; emit readyPulse on last layer
   isStage st = (== st) <$> stageSig
   stageFinishedSig =
     mux (isStage Cycle1_ReadCache)           (pure True)               $
-    mux (isStage Cycle2_ComputeQKV)          writeDoneThisLayer        $
+    mux (isStage Cycle2_ComputeQKV)          (pure True)               $
     mux (isStage Cycle3_ComputeAttention)    attnDoneThisLayer         $
-    mux (isStage Cycle4_WriteCache)          (pure True)               $
+    mux (isStage Cycle4_WriteCache)          writeDoneThisLayer        $
     mux (isStage Cycle5_ComputeFeedForward)  (not <$> readyPulseRaw)   $
     pure False
 

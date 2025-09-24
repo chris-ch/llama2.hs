@@ -73,8 +73,8 @@ fillOneBank layerIndex processingStateSignal kvRamOwner intermediateDataSignal (
       liftA2 (\ps _ -> processingStage ps == st && processingLayer ps == layerIndex)
              processingStateSignal (pure ())
 
-    isCycle2Write     = stageEquals Cycle2_ComputeQKV
     isCycle3Attention = stageEquals Cycle3_ComputeAttention
+    isCycle4Write     = stageEquals Cycle4_WriteCache
 
     seqPosSignal = sequencePosition <$> processingStateSignal
 
@@ -82,7 +82,7 @@ fillOneBank layerIndex processingStateSignal kvRamOwner intermediateDataSignal (
     runKey = Cache.runKeyBank bank
     runVal = Cache.runValueBank bank
 
-    -- Head mapping for this KV bank
+    -- Which query heads map to this KV head
     qIdx0 = queryHeadIndex0 keyValueHeadIndex
     hasQ1 = hasSecondQueryHead keyValueHeadIndex
     qIdx1 = queryHeadIndex1 keyValueHeadIndex
@@ -93,40 +93,46 @@ fillOneBank layerIndex processingStateSignal kvRamOwner intermediateDataSignal (
     keyVec   = getKeyVector   intermediateDataSignal keyValueHeadIndex
     valueVec = getValueVector intermediateDataSignal keyValueHeadIndex
 
-    -- Cycle2: write K,V at current pos (port B)
-    keyValuePairSignal = liftA2 (,) keyVec valueVec
-    (writeAddrSig, keyWriteSig, valWriteSig, writeDoneThisBank) =
-      Cache.writeSequencer isCycle2Write seqPosSignal keyValuePairSignal
-
-    -- Cycle3: attention on port A (read-only). Serialize heads per bank.
+    -- Cycle3: two attention engines, one per RAM port (read-only)
     (addrA0, out0, _busy0, done0) =
       AttentionHead.streamHeadAttentionAddrIO
         isCycle3Attention seqPosSignal query0 keyVec valueVec keyOutA valOutA
 
-    startHead1 = isCycle3Attention .&&. register False done0
-    (addrA1, out1, _busy1, done1raw) =
+    (addrB1, out1raw, _busy1, done1raw) =
       AttentionHead.streamHeadAttentionAddrIO
-        startHead1 seqPosSignal query1 keyVec valueVec keyOutA valOutA
+        isCycle3Attention seqPosSignal query1 keyVec valueVec keyOutB valOutB
 
-    -- Combined 'done' for both heads (align pulses to the same cycle)
-    combinedDone = if hasQ1 then done1raw else done0
+    -- If there is no second head on this bank, treat head1 as “instantly done” and zero output
+    out1  = if hasQ1 then out1raw else pure (repeat 0)
+    done1 = if hasQ1 then done1raw else done0
 
-    -- Dual-port RAM wiring:
-    --   Port A -> attention addresses (head0 or head1)
-    --   Port B -> KV writes in Cycle2, idle otherwise
-    addrA = mux startHead1 addrA1 addrA0
-    addrB = writeAddrSig
-    wrK_B = mux isCycle2Write keyWriteSig (pure Nothing)
-    wrV_B = mux isCycle2Write valWriteSig (pure Nothing)
+    -- Align both head-done pulses to the same cycle so the layer-wide AND reduces cleanly
+    doneBoth = done0 .&&. done1
 
-    (keyOutA, _keyOutB) = runKey (addrA, pure Nothing) (addrB, wrK_B)
-    (valOutA, _valOutB) = runVal (addrA, pure Nothing) (addrB, wrV_B)
+    -- Cycle4: write K,V for current pos (one element per cycle) on Port B
+    keyValuePairSignal = liftA2 (,) keyVec valueVec
+    (writeAddrSig, keyWriteSig, valWriteSig, writeDoneThisBank) =
+      Cache.writeSequencer isCycle4Write seqPosSignal keyValuePairSignal
 
-    -- Accumulate outputs and aligned done pulses
+    -- Dual-port RAM wiring
+    --   Cycle3: Port A -> head0 addresses, Port B -> head1 addresses, no writes
+    --   Cycle4: Port B -> KV writes, Port A idle read
+    addrA = mux isCycle3Attention addrA0 writeAddrSig
+    addrB = mux isCycle3Attention addrB1 writeAddrSig
+
+    wrK_A = pure Nothing
+    wrV_A = pure Nothing
+    wrK_B = mux isCycle4Write keyWriteSig (pure Nothing)
+    wrV_B = mux isCycle4Write valWriteSig (pure Nothing)
+
+    (keyOutA, keyOutB) = runKey (addrA, wrK_A) (addrB, wrK_B)
+    (valOutA, valOutB) = runVal (addrA, wrV_A) (addrB, wrV_B)
+
+    -- Accumulate outputs and aligned done pulses for just the heads this bank owns
     headOutputAcc0 = replace qIdx0 out0 headOutputAcc
-    headDoneAcc0   = replace qIdx0 combinedDone headDoneAcc
+    headDoneAcc0   = replace qIdx0 doneBoth headDoneAcc
     headOutputAcc1 = if hasQ1 then replace qIdx1 out1 headOutputAcc0 else headOutputAcc0
-    headDoneAcc1   = if hasQ1 then replace qIdx1 combinedDone headDoneAcc0 else headDoneAcc0
+    headDoneAcc1   = if hasQ1 then replace qIdx1 doneBoth headDoneAcc0 else headDoneAcc0
 
     writeDoneAcc1  = replace keyValueHeadIndex writeDoneThisBank writeDoneAcc
   in

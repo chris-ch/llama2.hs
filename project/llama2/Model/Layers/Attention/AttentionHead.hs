@@ -28,21 +28,20 @@ initAttentionCache = AttentionCache
 -- which we track with previousTimeCounterSignal/previousDimensionCounterSignal.
 streamHeadAttentionAddrIO
   :: HiddenClockResetEnable dom
-  => Signal dom Bool                         -- start signal (1-cycle pulse)
-  -> Signal dom (Index SeqLen)               -- sequence position 'pos'
-  -> Signal dom (Vec HeadDimension Float)    -- query vector
-  -> Signal dom (Vec HeadDimension Float)    -- current K at t==pos (bypass)
-  -> Signal dom (Vec HeadDimension Float)    -- current V at t==pos (bypass)
-  -> Signal dom Float                        -- key from BRAM (1-cycle delayed)
-  -> Signal dom Float                        -- value from BRAM (1-cycle delayed)
-  -> ( Signal dom BankAddress                -- bank address for both K and V
-     , Signal dom (Vec HeadDimension Float)  -- head output
-     , Signal dom Bool                       -- busy
-     , Signal dom Bool )                     -- done (1-cycle pulse)
+  => Signal dom Bool
+  -> Signal dom (Index SeqLen)
+  -> Signal dom (Vec HeadDimension Float)
+  -> Signal dom (Vec HeadDimension Float)
+  -> Signal dom (Vec HeadDimension Float)
+  -> Signal dom Float
+  -> Signal dom Float
+  -> ( Signal dom BankAddress
+     , Signal dom (Vec HeadDimension Float)
+     , Signal dom Bool
+     , Signal dom Bool )
 streamHeadAttentionAddrIO startSignal sequencePositionSignal queryVectorSignal currentKeySignal currentValueSignal keyFromRamSignal valueFromRamSignal =
   (bankAddressSignal, outputVectorSignal, busySignal, donePulseSignal)
  where
-  -- Phase control
   phaseSignal        = register PhaseDot nextPhaseSignal
   isDotPhase         = (== PhaseDot)      <$> phaseSignal
   isAccPhase         = (== PhaseAcc)      <$> phaseSignal
@@ -58,36 +57,29 @@ streamHeadAttentionAddrIO startSignal sequencePositionSignal queryVectorSignal c
       mux startPulseSignal (pure True) $
       mux donePulseSignal   (pure False) busyReg
 
-  -- Counters and last-value registers (to align with BRAM output)
-  timeCounterSignal             = regEn 0 enableSignal nextTimeCounterSignal
-  dimensionCounterSignal        = regEn 0 enableSignal nextDimensionCounterSignal
-  previousTimeCounterSignal     = register 0 timeCounterSignal
-  previousDimensionCounterSignal= register 0 dimensionCounterSignal
+  timeCounterSignal              = regEn 0 enableSignal nextTimeCounterSignal
+  dimensionCounterSignal         = regEn 0 enableSignal nextDimensionCounterSignal
+  previousTimeCounterSignal      = register 0 timeCounterSignal
+  previousDimensionCounterSignal = register 0 dimensionCounterSignal
 
   isLastDimensionSignal = (== maxBound) <$> dimensionCounterSignal
   isLastTimeSignal      = (==) <$> timeCounterSignal <*> sequencePositionSignal
 
-  -- Addressing (address issued now, BRAM data arrives next cycle)
   bankAddressSignal = Addressing.computeBankAddress <$> timeCounterSignal <*> dimensionCounterSignal
 
-  -- Vector element selection aligned to BRAM read-out (previous indices)
-  queryElementSignal         = (!!) <$> queryVectorSignal        <*> previousDimensionCounterSignal
-  keyBypassElementSignal     = (!!) <$> currentKeySignal         <*> previousDimensionCounterSignal
-  valueBypassElementSignal   = (!!) <$> currentValueSignal       <*> previousDimensionCounterSignal
+  queryElementSignal       = (!!) <$> queryVectorSignal        <*> previousDimensionCounterSignal
+  keyBypassElementSignal   = (!!) <$> currentKeySignal         <*> previousDimensionCounterSignal
+  valueBypassElementSignal = (!!) <$> currentValueSignal       <*> previousDimensionCounterSignal
 
-  -- CRUCIAL: bypass selection must not depend on 'warmup'.
-  -- We always substitute BRAM data with current-step K,V when the returning data
-  -- corresponds to t == pos (i.e., previousTimeCounterSignal == pos).
-  isReturnForCurrentTime     = (==) <$> previousTimeCounterSignal <*> sequencePositionSignal
-  keyElementSignal           = mux isReturnForCurrentTime  keyBypassElementSignal   keyFromRamSignal
-  valueElementSignal         = mux isReturnForCurrentTime  valueBypassElementSignal valueFromRamSignal
+  -- Unconditional selection for the current time (no warmup involved)
+  isReturnForCurrentTime   = (==) <$> previousTimeCounterSignal <*> sequencePositionSignal
+  keyElementSignal         = mux isReturnForCurrentTime  keyBypassElementSignal   keyFromRamSignal
+  valueElementSignal       = mux isReturnForCurrentTime  valueBypassElementSignal valueFromRamSignal
 
-  -- Accumulation gating (warmup handles the first latent cycle)
   warmupSignal = regEn False enableSignal warmupNext
   warmupNext   = mux startPulseSignal (pure False) $
                  mux (isDotPhase .||. isAccPhase .||. isFinalizePhase) (pure True) warmupSignal
 
-  -- Dot over d with 1-cycle element latency: accumulate only in warm cycles
   dotAccumulatorSignal = regEn 0 enableSignal nextDotAccumulatorSignal
   canAccumulateDot     = warmupSignal .&&. isDotPhase
   nextDotAccumulatorSignal =
@@ -97,12 +89,10 @@ streamHeadAttentionAddrIO startSignal sequencePositionSignal queryVectorSignal c
                               dotAccumulatorSignal)
         dotAccumulatorSignal
 
-  -- End-of-dot boundary (last element valid for this t)
   dotBoundarySignal =
     liftA3 (\ph warm dLast -> ph == PhaseDot && warm && dLast)
            phaseSignal warmupSignal isLastDimensionSignal
 
-  -- Scale and running max/sum for online softmax (per time step)
   invSqrtHeadDim :: Float
   invSqrtHeadDim = 1.0 / sqrt (snatToNum (SNat @HeadDimension) :: Float)
 
@@ -124,11 +114,9 @@ streamHeadAttentionAddrIO startSignal sequencePositionSignal queryVectorSignal c
     mux startPulseSignal (pure 0)
     $ mux dotBoundarySignal newSumSignal sumAccumulatorSignal
 
-  -- Latch scales at t boundary to use during PhaseAcc
   scaleOldRegisterSignal = regEn 1 enableSignal (mux dotBoundarySignal scaleOldSignal scaleOldRegisterSignal)
   scaleNewRegisterSignal = regEn 0 enableSignal (mux dotBoundarySignal scaleNewSignal scaleNewRegisterSignal)
 
-  -- Numerator over d across timesteps: oNum[d] = oNum[d]*scaleOld + v[d]*scaleNew
   numeratorVectorSignal = regEn (repeat 0 :: Vec HeadDimension Float) enableSignal nextNumeratorVectorSignal
   numeratorElementPrev  = (!!) <$> numeratorVectorSignal <*> previousDimensionCounterSignal
   numeratorElementUpd   =
@@ -145,7 +133,6 @@ streamHeadAttentionAddrIO startSignal sequencePositionSignal queryVectorSignal c
                               numeratorVectorSignal)
         numeratorVectorSignal
 
-  -- Finalize: output[d] = numerator[d] / sAcc
   outputVectorSignal = regEn (repeat 0 :: Vec HeadDimension Float) enableSignal nextOutputVectorSignal
   outputElementDiv   = (/ ) <$> numeratorElementPrev <*> sumAccumulatorSignal
   canFinalize        = warmupSignal .&&. isFinalizePhase
@@ -158,7 +145,6 @@ streamHeadAttentionAddrIO startSignal sequencePositionSignal queryVectorSignal c
                          outputVectorSignal)
         outputVectorSignal
 
-  -- Phase/counter progression
   nextPhaseSignal =
     liftA5
       (\ph warm dLast tLast dotB ->

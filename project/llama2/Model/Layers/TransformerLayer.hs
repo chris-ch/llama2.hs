@@ -36,13 +36,6 @@ transformerLogits decoder tokenVector = logits where
     CArray2D vocabRows = vocab
     logits = map (`dotProduct` tokenWithRms) vocabRows
 
--- ====== NEW: tapped layer variant ======
--- Emits a 1-cycle pulse at the end of Cycle3 for this layer with:
---   - dbgXHat:        x after rms_att (same shape as ModelDim)
---   - dbgWoHeads:     sum_h (W_O^h @ head_h) BEFORE residual
---   - dbgXAfterAttn:  x + sum_h(...)  (AFTER residual)
--- All three vectors are the exact quantities you see as
--- (a) xHat, (c) WO@head_concat, (d) x_after_attn in the C trace.
 multiCycleTransformerLayer
   :: HiddenClockResetEnable dom
   => TransformerLayerComponent
@@ -105,7 +98,7 @@ multiCycleTransformerLayer transformerLayerComponent kvRamOwner layerIndex proce
 
   -- x_after_attn = x + WO@heads
   xAfterAttnSignal =
-    (zipWith (+) P.. inputVector P.<$> intermediateDataSignal) <*> woHeadsSignal
+    (zipWith (+) . inputVector <$> intermediateDataSignal) <*> woHeadsSignal
 
   -- Commit attention output only on this layer’s attn done pulse in Cycle3
   nextIntermediateDataSignal =
@@ -118,11 +111,11 @@ multiCycleTransformerLayer transformerLayerComponent kvRamOwner layerIndex proce
            else currentIntermediateData)
       processingStateSignal baseNextIntermediateDataSignal xAfterAttnSignal attentionDoneThisLayerSignal
 
-  -- Layer write done = AND across banks (now used in Cycle2)
+  -- Layer write done = AND across banks (Cycle4 writeback)
   writeDoneThisLayerSignal =
     let allBanksDoneSignal = fmap and (sequenceA perBankWriteDoneVec)
     in  (\procState banksDone ->
-           processingStage procState == Cycle2_ComputeQKV &&
+           processingStage procState == Cycle4_WriteCache &&
            processingLayer procState == layerIndex &&
            banksDone)
         <$> processingStateSignal <*> allBanksDoneSignal
@@ -138,7 +131,7 @@ multiCycleTransformerLayer transformerLayerComponent kvRamOwner layerIndex proce
           else currentIntermediateData)
       processingStateSignal intermediateDataSignal xAfterAttnSignal attentionDoneThisLayerSignal
 
-  -- Default per-stage work within this layer (unchanged)
+  -- Default per-stage work within this layer
   baseNextIntermediateDataSignal =
     liftA2 (Layer.processCycle multiHeadAttentionComponent feedForwardNetworkComponent layerIndex)
            processingStateSignal
