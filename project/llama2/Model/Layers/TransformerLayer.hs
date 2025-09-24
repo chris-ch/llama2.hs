@@ -6,13 +6,12 @@ module Model.Layers.TransformerLayer (
 ) where
 
 import Clash.Prelude
-import qualified Prelude as P
 import Helpers (ModelDim, VocabSize, CArray2D (..), EmbeddingComponent (..),
     NumLayers,
     rmsNorm, dotProduct, matrixVectorMult, liftA4)
 import qualified Model.Memory.KVCacheBank as Cache
 import Model.Core.Types (ProcessingState (..), IntermediateData (..), CycleStage (..))
-import qualified Model.Layer as Layer (processCycle, fillOneBank)
+import qualified Model.Layer as Layer (processStage, fillOneBank)
 import qualified Model.Layers.FeedForward.FeedForwardNetwork as FeedForwardNetwork
 import qualified Model.Layers.Attention.MultiHeadAttention as MultiHeadAttention
 
@@ -100,22 +99,22 @@ multiCycleTransformerLayer transformerLayerComponent kvRamOwner layerIndex proce
   xAfterAttnSignal =
     (zipWith (+) . inputVector <$> intermediateDataSignal) <*> woHeadsSignal
 
-  -- Commit attention output only on this layer’s attn done pulse in Cycle3
+  -- Commit attention output only on this layer’s attn done pulse in Stage3
   nextIntermediateDataSignal =
     liftA4
       (\procState currentIntermediateData attentionOutput doneSignal ->
          if processingLayer procState == layerIndex
-            && processingStage procState == Cycle3_ComputeAttention
+            && processingStage procState == Stage3_Attend
             && doneSignal
            then currentIntermediateData { attentionOutput = attentionOutput }
            else currentIntermediateData)
       processingStateSignal baseNextIntermediateDataSignal xAfterAttnSignal attentionDoneThisLayerSignal
 
-  -- Layer write done = AND across banks (Cycle4 writeback)
+  -- Layer write done = AND across banks (Stage4 writeback)
   writeDoneThisLayerSignal =
     let allBanksDoneSignal = fmap and (sequenceA perBankWriteDoneVec)
     in  (\procState banksDone ->
-           processingStage procState == Cycle4_WriteCache &&
+           processingStage procState == Stage4_WriteKV  &&
            processingLayer procState == layerIndex &&
            banksDone)
         <$> processingStateSignal <*> allBanksDoneSignal
@@ -125,7 +124,7 @@ multiCycleTransformerLayer transformerLayerComponent kvRamOwner layerIndex proce
     liftA4
       (\procState currentIntermediateData attentionOutput doneSignal ->
         if processingLayer procState == layerIndex
-           && processingStage procState == Cycle3_ComputeAttention
+           && processingStage procState == Stage3_Attend
            && doneSignal
           then currentIntermediateData { attentionOutput = attentionOutput }
           else currentIntermediateData)
@@ -133,6 +132,6 @@ multiCycleTransformerLayer transformerLayerComponent kvRamOwner layerIndex proce
 
   -- Default per-stage work within this layer
   baseNextIntermediateDataSignal =
-    liftA2 (Layer.processCycle multiHeadAttentionComponent feedForwardNetworkComponent layerIndex)
+    liftA2 (Layer.processStage multiHeadAttentionComponent feedForwardNetworkComponent layerIndex)
            processingStateSignal
            intermediateDataSignal

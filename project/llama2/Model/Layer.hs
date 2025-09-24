@@ -1,6 +1,6 @@
 module Model.Layer
   ( StepCount(..),
-    getQueryVector, getKeyVector, getValueVector, processCycle, fillOneBank, applyRotaryToHead
+    getQueryVector, getKeyVector, getValueVector, processStage, fillOneBank, applyRotaryToHead
   ) where
 
 import Clash.Prelude
@@ -73,8 +73,8 @@ fillOneBank layerIndex processingStateSignal kvRamOwner intermediateDataSignal (
       liftA2 (\ps _ -> processingStage ps == st && processingLayer ps == layerIndex)
              processingStateSignal (pure ())
 
-    isCycle3Attention = stageEquals Cycle3_ComputeAttention
-    isCycle4Write     = stageEquals Cycle4_WriteCache
+    isStage3Attention = stageEquals Stage3_Attend
+    isStage4Write     = stageEquals Stage4_WriteKV
 
     seqPosSignal = sequencePosition <$> processingStateSignal
 
@@ -93,68 +93,66 @@ fillOneBank layerIndex processingStateSignal kvRamOwner intermediateDataSignal (
     keyVec   = getKeyVector   intermediateDataSignal keyValueHeadIndex
     valueVec = getValueVector intermediateDataSignal keyValueHeadIndex
 
-    -- Cycle3: two attention engines, one per RAM port (read-only)
+    -- Stage3: run two attention engines in parallel (one per RAM port)
     (addrA0, out0, _busy0, done0) =
       AttentionHead.streamHeadAttentionAddrIO
-        isCycle3Attention seqPosSignal query0 keyVec valueVec keyOutA valOutA
+        isStage3Attention seqPosSignal query0 keyVec valueVec keyOutA valOutA
 
     (addrB1, out1raw, _busy1, done1raw) =
       AttentionHead.streamHeadAttentionAddrIO
-        isCycle3Attention seqPosSignal query1 keyVec valueVec keyOutB valOutB
+        isStage3Attention seqPosSignal query1 keyVec valueVec keyOutB valOutB
 
-    -- If there is no second head on this bank, treat head1 as “instantly done” and zero output
     out1  = if hasQ1 then out1raw else pure (repeat 0)
     done1 = if hasQ1 then done1raw else done0
+    doneBoth = done0 .&&. done1      -- align pulses for this bank
 
-    -- Align both head-done pulses to the same cycle so the layer-wide AND reduces cleanly
-    doneBoth = done0 .&&. done1
-
-    -- Cycle4: write K,V for current pos (one element per cycle) on Port B
+    -- Stage4: write K,V for current pos (one element per cycle) on Port B
     keyValuePairSignal = liftA2 (,) keyVec valueVec
     (writeAddrSig, keyWriteSig, valWriteSig, writeDoneThisBank) =
-      Cache.writeSequencer isCycle4Write seqPosSignal keyValuePairSignal
+      Cache.writeSequencer isStage4Write seqPosSignal keyValuePairSignal
 
     -- Dual-port RAM wiring
-    --   Cycle3: Port A -> head0 addresses, Port B -> head1 addresses, no writes
-    --   Cycle4: Port B -> KV writes, Port A idle read
-    addrA = mux isCycle3Attention addrA0 writeAddrSig
-    addrB = mux isCycle3Attention addrB1 writeAddrSig
+    --   Stage3: Port A <- head0 addresses, Port B <- head1 addresses, no writes
+    --   Stage4: Port B <- write sequencer; Port A parked (read-only, no write)
+    addrA = mux isStage3Attention addrA0 (pure 0)          -- park A in Stage4
+    addrB = mux isStage3Attention addrB1 writeAddrSig
 
     wrK_A = pure Nothing
     wrV_A = pure Nothing
-    wrK_B = mux isCycle4Write keyWriteSig (pure Nothing)
-    wrV_B = mux isCycle4Write valWriteSig (pure Nothing)
+    wrK_B = mux isStage4Write keyWriteSig (pure Nothing)
+    wrV_B = mux isStage4Write valWriteSig (pure Nothing)
 
-    (keyOutA, keyOutB) = runKey (addrA, wrK_A) (addrB, wrK_B)
-    (valOutA, valOutB) = runVal (addrA, wrV_A) (addrB, wrV_B)
+    (keyOutA, _keyOutB_unused) = runKey (addrA, wrK_A) (addrB, wrK_B)
+    (valOutA, _valOutB_unused) = runVal (addrA, wrV_A) (addrB, wrV_B)
+    -- IMPORTANT: head0 consumes Port A readouts; head1 consumes Port B readouts
+    -- For head1, re-run the same RAMs’ Port B outputs as inputs to the streamers:
+    keyOutB = snd (runKey (addrA, wrK_A) (addrB, wrK_B))
+    valOutB = snd (runVal (addrA, wrV_A) (addrB, wrV_B))
 
-    -- Accumulate outputs and aligned done pulses for just the heads this bank owns
+    -- Accumulate outputs and aligned done pulses
     headOutputAcc0 = replace qIdx0 out0 headOutputAcc
     headDoneAcc0   = replace qIdx0 doneBoth headDoneAcc
     headOutputAcc1 = if hasQ1 then replace qIdx1 out1 headOutputAcc0 else headOutputAcc0
     headDoneAcc1   = if hasQ1 then replace qIdx1 doneBoth headDoneAcc0 else headDoneAcc0
 
     writeDoneAcc1  = replace keyValueHeadIndex writeDoneThisBank writeDoneAcc
+
   in
     (headOutputAcc1, headDoneAcc1, writeDoneAcc1)
 
--- Stateless per-cycle computation for a single layer:
---   - In Cycle2 computes Q/K/V (with RoPE)
---   - In Cycle5 computes feed-forward network
---   - Otherwise passes IntermediateData through unchanged
-processCycle
+processStage
   :: MultiHeadAttention.MultiHeadAttentionComponent
   -> FeedForwardNetwork.FeedForwardNetworkComponent
   -> Index NumLayers
   -> ProcessingState
   -> IntermediateData
   -> IntermediateData
-processCycle multiHeadAttentionComponent feedForwardNetworkComponent layerIndex processingState intermediateData
+processStage multiHeadAttentionComponent feedForwardNetworkComponent layerIndex processingState intermediateData
   | processingLayer processingState /= layerIndex = intermediateData
   | otherwise =
       case processingStage processingState of
-        Cycle1_ReadCache -> intermediateData
-        Cycle2_ComputeQKV ->
+        Stage1_LoadKV -> intermediateData
+        Stage2_ProjectQKV ->
           let
             normalizedInput = rmsNorm (inputVector intermediateData) (MultiHeadAttention.rmsAtt multiHeadAttentionComponent)
             -- Queries: one per Q head (with RoPE on Q)
@@ -183,9 +181,9 @@ processCycle multiHeadAttentionComponent feedForwardNetworkComponent layerIndex 
                 in (keyRotated, value)) indicesI
             (keys, values) = unzip keysAndValues
           in intermediateData { queryVectors = queries, keyVectors = keys, valueVectors = values }
-        Cycle3_ComputeAttention -> intermediateData
-        Cycle4_WriteCache  -> intermediateData
-        Cycle5_ComputeFeedForward  ->
+        Stage3_Attend -> intermediateData
+        Stage4_WriteKV  -> intermediateData
+        Stage5_FeedForward  ->
           let ffnOutput = FeedForwardNetwork.computeFeedForward feedForwardNetworkComponent (attentionOutput intermediateData)
           in intermediateData { feedForwardOutput = ffnOutput }
 

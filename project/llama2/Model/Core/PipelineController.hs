@@ -34,7 +34,7 @@ runPipelineController attnDoneThisLayer writeDoneThisLayer = outs
   posIx    = sequencePosition <$> procState
 
   isLastLayerFFN =
-    liftA2 (\ps _ -> processingStage ps == Cycle5_ComputeFeedForward
+    liftA2 (\ps _ -> processingStage ps == Stage5_FeedForward
                   && processingLayer ps == maxBound)
            procState (pure ())
   readyPulseRaw =
@@ -43,11 +43,11 @@ runPipelineController attnDoneThisLayer writeDoneThisLayer = outs
 
   isStage st = (== st) <$> stageSig
   stageFinishedSig =
-    mux (isStage Cycle1_ReadCache)           (pure True)               $
-    mux (isStage Cycle2_ComputeQKV)          (pure True)               $
-    mux (isStage Cycle3_ComputeAttention)    attnDoneThisLayer         $
-    mux (isStage Cycle4_WriteCache)          writeDoneThisLayer        $
-    mux (isStage Cycle5_ComputeFeedForward)  (not <$> readyPulseRaw)   $
+    mux (isStage Stage1_LoadKV)           (pure True)               $
+    mux (isStage Stage2_ProjectQKV)          (pure True)               $
+    mux (isStage Stage3_Attend)    attnDoneThisLayer         $
+    mux (isStage Stage4_WriteKV)          writeDoneThisLayer        $
+    mux (isStage Stage5_FeedForward)  (not <$> readyPulseRaw)   $
     pure False
 
   outs = PipelineOutputs

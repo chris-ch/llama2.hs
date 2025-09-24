@@ -53,11 +53,11 @@ type TrueDualPortRunner dom n a =
 --   4. WriteCache     (store new K/V to RAM)
 --   5. ComputeFeedForward (FFN)
 data CycleStage =
-    Cycle1_ReadCache
-  | Cycle2_ComputeQKV
-  | Cycle3_ComputeAttention
-  | Cycle4_WriteCache
-  | Cycle5_ComputeFeedForward
+    Stage1_LoadKV
+  | Stage2_ProjectQKV
+  | Stage3_Attend
+  | Stage4_WriteKV
+  | Stage5_FeedForward
   deriving (Show, Eq, Enum, Bounded, Generic)
 
 instance NFDataX CycleStage where
@@ -80,7 +80,7 @@ data ProcessingState = ProcessingState
 
 initialProcessingState :: ProcessingState
 initialProcessingState = ProcessingState
-  { processingStage  = Cycle1_ReadCache
+  { processingStage  = Stage1_LoadKV
   , processingLayer  = 0
   , sequencePosition = 0
   }
@@ -88,18 +88,18 @@ initialProcessingState = ProcessingState
 -- Single state transition function (one step)
 nextProcessingState :: ProcessingState -> ProcessingState
 nextProcessingState state = case processingStage state of
-  Cycle1_ReadCache          -> state { processingStage = Cycle2_ComputeQKV }
-  Cycle2_ComputeQKV         -> state { processingStage = Cycle3_ComputeAttention }
-  Cycle3_ComputeAttention   -> state { processingStage = Cycle4_WriteCache }
-  Cycle4_WriteCache         -> state { processingStage = Cycle5_ComputeFeedForward }
-  Cycle5_ComputeFeedForward ->
+  Stage1_LoadKV          -> state { processingStage = Stage2_ProjectQKV }
+  Stage2_ProjectQKV         -> state { processingStage = Stage3_Attend }
+  Stage3_Attend   -> state { processingStage = Stage4_WriteKV }
+  Stage4_WriteKV         -> state { processingStage = Stage5_FeedForward }
+  Stage5_FeedForward ->
     if processingLayer state == maxBound
-      then state { processingStage  = Cycle1_ReadCache
+      then state { processingStage  = Stage1_LoadKV
                  , processingLayer  = 0
                  , sequencePosition = if sequencePosition state == maxBound
                                         then 0 else succ (sequencePosition state)
                  }
-      else state { processingStage  = Cycle1_ReadCache
+      else state { processingStage  = Stage1_LoadKV
                  , processingLayer  = succ (processingLayer state)
                  }
 

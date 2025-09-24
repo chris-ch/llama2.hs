@@ -124,11 +124,11 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
   -- Storage for IntermediateData
   intermediateDataSignal = register initialIntermediateData nextIntermediateDataSignal
 
-  -- Load input at Cycle1
+  -- Load input at Stage1
   inputLoadedSignal =
     liftA3
       (\ps current tokenEmbedding ->
-         if processingStage ps == Cycle1_ReadCache
+         if processingStage ps == Stage1_LoadKV
            then if processingLayer ps == 0
                   then current { inputVector = tokenEmbedding }
                   else current { inputVector = feedForwardOutput current }
@@ -160,7 +160,7 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
           liftA4
             (\ps oldD newD c3D ->
                if processingLayer ps == lIx
-                  then if processingStage ps == Cycle3_ComputeAttention
+                  then if processingStage ps == Stage3_Attend
                          then c3D
                          else newD
                   else oldD)
