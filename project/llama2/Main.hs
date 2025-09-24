@@ -79,6 +79,22 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
     _ -> putStrLn "Need at least two tokens in the prompt to run pos0/pos1 tracer."
 
   putStrLn "✅ model loaded successfully"
+
+  let CArray2D embedding' = vocabulary $ modelEmbedding config
+  let rmsAtt0  = MultiHeadAttention.rmsAtt $ multiHeadAttention $ modelLayers config C.!! (1 :: Int)    
+  let rmsFfn0  = FeedForwardNetwork.fRMSFfn $ feedforwardNetwork $ modelLayers config C.!! (1 :: Int)
+  let rmsFinal = rmsFinalWeight $ modelEmbedding config       -- final RMS weight
+  putStrLn $ "embedding vector 0 (first 10): " ++ show (take 10 $ C.toList $ embedding' C.!! (0::Int))
+  putStrLn $ "embedding vector 1 (first 10): " ++ show (take 10 $ C.toList $ embedding' C.!! (1::Int))
+  putStrLn $ "Layer0 RMS-Attn weight (first 10): "
+          ++ show (take 10 (C.toList rmsAtt0))
+
+  putStrLn $ "Layer0 RMS-FFN weight (first 10): "
+          ++ show (take 10 (C.toList rmsFfn0))
+
+  putStrLn $ "Final RMS weight (first 10): "
+          ++ show (take 10 (C.toList rmsFinal))
+  
   putStrLn "<s>"
   startTime <- getPOSIXTime
 
@@ -356,7 +372,6 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
           let (lI, pI) = showPos l p
           -- Token (decoded as a piece) – you can also print the raw integer
           let decoded = T.decodePiece tokenizer (fromIntegral tok) (fromIntegral tok)
-
 
           -- 1️⃣  Ready flag
           putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
