@@ -37,14 +37,13 @@ import Helpers
       HiddenDim,
       ModelDim,
       FreqDim, Temperature, Seed )
-import qualified Model.Top as Top ( topEntity, topEntityWithTap )
+import qualified Model.Top as Top ( topEntity )
 import qualified Tokenizer as T (buildTokenizer, encodeTokens, Tokenizer, decodePiece)
 import Model.Layers.TransformerLayer (TransformerDecoderComponent (..), TransformerLayerComponent (..))
 import qualified Model.Layer as Layer
 import qualified Model.Layers.FeedForward.FeedForwardNetwork as FeedForwardNetwork
 import qualified Model.Layers.Attention.MultiHeadAttention as MultiHeadAttention
 import GHC.Base (when)
-import qualified Model.Layers.TransformerLayer as TransformerLayer
 
 --------------------------------------------------------------------------------
 -- Main entry point
@@ -277,9 +276,6 @@ parseModelConfigFile = do
 --------------------------------------------------------------------------------
 -- Token Generation with Clash Simulation
 --------------------------------------------------------------------------------
---------------------------------------------------------------------------------
--- Token Generation with Clash Simulation
---------------------------------------------------------------------------------
 
 -- | Autoregressive token generation, one token at a time.
 generateTokensSimAutoregressive
@@ -297,105 +293,13 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
   putStr "Generated: "
   hFlush stdout
 
-  -- Constant input streams
-  let temps   = repeat temperature
-      seeds   = repeat seed
-
-  -- One simulation run; inputs depend on the token stream,
-  -- which depends on outputs (knot-tying).
-  let outputs :: [(Token, Bool)]
-      outputs = CS.simulate (bundledOutputs decoder) (DL.zip3 tokenStream temps seeds)
-
-      (outTokens, readyFlags) = unzip outputs
-
-      -- Drive the input token:
-      -- Hold current token until a ready pulse.
-      -- On ready: consume next prompt token if any, else feed back the last sampled token.
-      tokenStream :: [Token]
-      tokenStream =
-        let (cur0, restPrompt) =
-              case promptTokens of
-                (t0:ts) -> (t0, ts)
-                []      -> (1, []) -- start from BOS if no prompt
-        in drive cur0 restPrompt readyFlags outTokens
-        where
-          drive :: Token -> [Token] -> [Bool] -> [Token] -> [Token]
-          drive cur ps (r:rs) (o:os) =
-            cur : if not r
-                    then drive cur ps rs os
-                    else case ps of
-                           (p:ps') -> drive p  ps'  rs os
-                           []      -> drive o  []    rs os
-          drive cur _ _ _ = repeat cur  -- totality guard
-
-      -- Tokens produced by the DUT at ready pulses
-      sampledAll :: [Token]
-      sampledAll = [ t | (t,r) <- outputs, r ]
-
-  -- We want to EMIT: first the entire prompt (forced), then the samples.
-  let promptLen = length promptTokens
-      forcedEmitted = promptTokens                         -- emit full prompt
-      sampledAfterPrompt = drop promptLen sampledAll       -- then model outputs
-      emittedAll = forcedEmitted ++ sampledAfterPrompt
-
-      totalWanted = promptLen + fromIntegral nSteps
-      emittedLimited = take totalWanted emittedAll
-
-  -- Print
-  -- Build (prev,next) transitions like llama2.c
-  let emitted = emittedLimited
-      trans   = zip emitted (drop 1 emitted)
-
-  mapM_
-    (\(prev, nxt) ->
-        BSC.putStr (T.decodePiece tokenizer (fromIntegral prev) (fromIntegral nxt))
-        >> hFlush stdout)
-    trans
-  putStrLn ""
-  -- Only the generated tokens (exclude the prompt portion)
-  let generated = take (fromIntegral nSteps) (drop promptLen emittedLimited)
-  pure (generated, Layer.StepCount nSteps)
-
-bundledOutputs :: TransformerDecoderComponent -> CS.Signal CS.System (Token, Temperature, Seed) -> CS.Signal C.System (Token, Bool)
-bundledOutputs decoder = CS.bundle . CS.exposeClockResetEnable
-    (topEntityBundled @CS.System decoder)
-    CS.systemClockGen
-    CS.resetGen
-    CS.enableGen
-
--- Helper function to create a bundled version of topEntity
-topEntityBundled
-  :: CS.HiddenClockResetEnable dom
-  => TransformerDecoderComponent
-  -> C.Signal dom (Token, Temperature, Seed)
-  -> (C.Signal dom Token, C.Signal dom Bool)
-topEntityBundled decoder bundledInputs = Top.topEntity decoder inputToken temp rngSeed
-  where
-    (inputToken, temp, rngSeed) = C.unbundle bundledInputs
-
--- | Autoregressive token generation, one token at a time.
-generateTokensSimAutoregressiveWithTap
-  :: TransformerDecoderComponent
-  -> T.Tokenizer
-  -> C.Unsigned 32
-  -> [Token]
-  -> Temperature
-  -> Seed
-  -> IO ([Token], Layer.StepCount)
-generateTokensSimAutoregressiveWithTap decoder tokenizer nSteps promptTokens temperature seed = do
-
-  putStrLn $ "✅ Prompt: " ++ show promptTokens
-  putStr "<s>\n"
-  putStr "Generated: "
-  hFlush stdout
-
   let temps   = repeat temperature
       seeds   = repeat seed
 
   let outputs :: [( Token, Bool, Bool
                   , C.Index NumLayers, C.Index SeqLen
                   , C.Vec ModelDim Float, C.Vec ModelDim Float, C.Vec ModelDim Float)]
-      outputs = CS.simulate (bundledOutputsWithTap decoder) (DL.zip3 tokenStream temps seeds)
+      outputs = CS.simulate (bundledOutputs decoder) (DL.zip3 tokenStream temps seeds)
 
       outTokens   = [ t  | (t, _, _, _, _, _, _, _) <- outputs ]
       readyFlags  = [ r  | (_, r, _, _, _, _, _, _) <- outputs ]
@@ -429,10 +333,10 @@ generateTokensSimAutoregressiveWithTap decoder tokenizer nSteps promptTokens tem
   -- Print taps with layer/pos labeling aligned to the C trace:
   -- For taps coming from the last layer, display P+1 (the C log prints the next pos after sampling).
   let fmt8 :: C.Vec n Float -> String
-      fmt8 v = DL.intercalate " " (DL.map show (DL.take 8 (C.toList v)))
+      fmt8 v = unwords (DL.map show (DL.take 8 (C.toList v)))
 
       -- saturated succ for Index
-      succIdx :: forall n. (Bounded (C.Index n), Enum (C.Index n), Eq (C.Index n)) => C.Index n -> C.Index n
+      succIdx :: forall n. (Bounded (C.Index n), Enum (C.Index n)) => C.Index n -> C.Index n
       succIdx p = if p == maxBound then p else succ p
 
       showPos :: C.Index NumLayers -> C.Index SeqLen -> (Int, Int)
@@ -471,7 +375,7 @@ generateTokensSimAutoregressiveWithTap decoder tokenizer nSteps promptTokens tem
   let generated = take (fromIntegral nSteps) (drop promptLen emittedLimited)
   pure (generated, Layer.StepCount nSteps)
 
-bundledOutputsWithTap
+bundledOutputs
   :: TransformerDecoderComponent
   -> C.Signal C.System (Token, Temperature, Seed)
   -> C.Signal C.System  ( Token
@@ -482,15 +386,15 @@ bundledOutputsWithTap
                          , C.Vec ModelDim Float
                          , C.Vec ModelDim Float
                          , C.Vec ModelDim Float )
-bundledOutputsWithTap decoder =
+bundledOutputs decoder =
   C.bundle . C.exposeClockResetEnable
-    (topEntityBundledWithTap @CS.System decoder)
+    (topEntityBundled @CS.System decoder)
     CS.systemClockGen
     CS.resetGen
     CS.enableGen
 
--- Helper function to create a bundled version of topEntityWithTap
-topEntityBundledWithTap :: CS.HiddenClockResetEnable dom
+-- Helper function to create a bundled version of topEntity
+topEntityBundled :: CS.HiddenClockResetEnable dom
   => TransformerDecoderComponent
   -> C.Signal dom (Token, Temperature, Seed)
   -> ( C.Signal dom Token
@@ -501,8 +405,7 @@ topEntityBundledWithTap :: CS.HiddenClockResetEnable dom
     , C.Signal dom (C.Vec ModelDim Float)
     , C.Signal dom (C.Vec ModelDim Float)
     , C.Signal dom (C.Vec ModelDim Float ))
-topEntityBundledWithTap decoder bundledInputs =
-  Top.topEntityWithTap decoder inputToken temp rngSeed
+topEntityBundled decoder bundledInputs =
+  Top.topEntity decoder inputToken temp rngSeed
   where
     (inputToken, temp, rngSeed) = C.unbundle bundledInputs
-  

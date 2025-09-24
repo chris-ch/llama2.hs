@@ -1,6 +1,5 @@
 module Model.Top.Transformer (
     multiCycleTransformer,
-    multiCycleTransformerWithTap,
     argMax
 ) where
 
@@ -10,115 +9,11 @@ import Helpers (NumLayers, Temperature, Seed, EmbeddingComponent (..), liftA4, C
 import Model.Core.Types (IntermediateData(..), nextProcessingState, initialProcessingState, initialIntermediateData, ProcessingState (..), CycleStage (..))
 
 import qualified Model.Memory.KVCacheBank as Cache
-import qualified Model.Layers.TransformerLayer as TransformerLayer (TransformerLayerComponent(..), TransformerDecoderComponent(..), multiCycleTransformerLayer, multiCycleTransformerLayerTap)
+import qualified Model.Layers.TransformerLayer as TransformerLayer (TransformerLayerComponent(..), TransformerDecoderComponent(..), multiCycleTransformerLayer)
 import Model.Layers.TransformerLayer (TransformerDecoderComponent(..), transformerLogits)
 import qualified Clash.Sized.Vector as CV
 import Data.Maybe (fromMaybe)
 import qualified Model.Embedding.PRNG as PRNG
-
--- One fold step over layers:
---   - Run a single transformer layer (multi-cycle)
---   - Collect its write-done and attention-done pulses into vectors
---   - Merge the new IntermediateData with the pipeline’s current data depending on stage
-transformerLayerFold :: HiddenClockResetEnable dom
-  => Signal dom ProcessingState
-  -> ( Signal dom IntermediateData
-      , Vec NumLayers (Signal dom Bool)  -- writeDone by layer
-      , Vec NumLayers (Signal dom Bool)) -- attnDone  by layer (rising edge)
-  -> (TransformerLayer.TransformerLayerComponent, Cache.KVRamOwner dom, Index NumLayers)
-  -> ( Signal dom IntermediateData
-      , Vec NumLayers (Signal dom Bool)
-      , Vec NumLayers (Signal dom Bool))
-transformerLayerFold processingStateSignal (currentDataSignal, writeDoneVector, attnDoneVector)
-              (transformerLayerComponent, cacheOwner, layerIndex) =
-  let (newIntermediateDataSignal, writeDoneSignal, attnDoneSignal, commitCycle3Signal) =
-        TransformerLayer.multiCycleTransformerLayer transformerLayerComponent cacheOwner layerIndex processingStateSignal currentDataSignal
-
-      selectedIntermediateDataSignal = liftA4
-        (\processingState oldData newData commitCycle3Data ->
-            if processingLayer processingState == layerIndex
-              then if processingStage processingState == Cycle3_ComputeAttention
-                    then commitCycle3Data
-                    else newData
-              else oldData)
-        processingStateSignal currentDataSignal newIntermediateDataSignal commitCycle3Signal
-  in ( selectedIntermediateDataSignal
-      , replace layerIndex writeDoneSignal writeDoneVector
-      , replace layerIndex attnDoneSignal  attnDoneVector)
-
--- Full multi-cycle transformer decoder with a 1-cycle pause after sampling
--- so L0 Cycle1 consumes the new token embedding (fixes boundary race).
-multiCycleTransformer :: forall dom
-   . HiddenClockResetEnable dom
-  => TransformerLayer.TransformerDecoderComponent
-  -> Vec NumLayers (Cache.KVRamOwner dom)
-  -> Signal dom (Unsigned 32)  -- Input token signal
-  -> Signal dom Temperature    -- Temperature signal
-  -> Signal dom Seed           -- PRNG seed signal
-  -> (Signal dom (Unsigned 32), Signal dom Bool)
-multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal seedSignal =
-  (outputTokenSignal readyPulseRaw temperatureSignal seedSignal decoder nextIntermediateDataSignal, readyPulseOut)
- where
-  embeddingComponent      = modelEmbedding decoder
-  transformerLayers       = modelLayers decoder
-  tokenEmbeddingSignal    = embed (vocabulary embeddingComponent) <$> inputTokenSignal
-
-  advanceProcessingState currentState stageFinished =
-    if stageFinished then nextProcessingState currentState else currentState
-
-  processingStateSignal =
-    register initialProcessingState (advanceProcessingState <$> processingStateSignal <*> stageFinishedSignal)
-
-  intermediateDataSignal = register initialIntermediateData nextIntermediateDataSignal
-
-  -- Load layer input at Cycle1
-  inputLoadedSignal =
-    liftA3
-      (\processingState currentIntermediateData tokenEmbedding ->
-         if processingStage processingState == Cycle1_ReadCache
-           then if processingLayer processingState == 0
-                  then currentIntermediateData { inputVector = tokenEmbedding }                
-                  else currentIntermediateData { inputVector = feedForwardOutput currentIntermediateData }
-           else currentIntermediateData)
-      processingStateSignal intermediateDataSignal tokenEmbeddingSignal
-
-  ( nextIntermediateDataSignal
-    , writeDoneVector
-    , attnDoneVector) =
-    foldl (transformerLayerFold processingStateSignal) (inputLoadedSignal, repeat (pure False), repeat (pure False))
-                        (zip3 transformerLayers cacheOwners indicesI)
-
-  layerIndexSignal   = processingLayer <$> processingStateSignal
-  writeDoneThisLayer = (!!) <$> sequenceA writeDoneVector <*> layerIndexSignal
-  attnDoneThisLayer  = (!!) <$> sequenceA attnDoneVector  <*> layerIndexSignal
-
-  -- Stage selector
-  stageSignal = processingStage <$> processingStateSignal
-  isStage cycleStage = (== cycleStage) <$> stageSignal
-
-  -- Ready pulse at last layer FFN completion (unchanged)
-  isLastLayerFFN  = liftA2 (\processingState _ ->
-                             processingStage processingState == Cycle5_ComputeFeedForward &&
-                             processingLayer processingState == maxBound)
-                           processingStateSignal (pure ())
-  readyPulseRaw = liftA2 (\now prev -> now && not prev)
-                         isLastLayerFFN (register False isLastLayerFFN)
-
-  -- One-cycle pause after sampling so the new token appears on input
-  pauseAfterReady :: Signal dom Bool
-  pauseAfterReady = register False readyPulseRaw
-
-  -- Stage done selection with pause on Cycle5
-  stageFinishedSignal =
-    mux (isStage Cycle1_ReadCache)              (pure True)   $
-    mux (isStage Cycle2_ComputeQKV)             (pure True)   $
-    mux (isStage Cycle3_ComputeAttention)       attnDoneThisLayer  $
-    mux (isStage Cycle4_WriteCache)             writeDoneThisLayer $
-    mux (isStage Cycle5_ComputeFeedForward)     (not <$> pauseAfterReady) $
-    pure False
-
-  -- Export the ready pulse (unchanged externally)
-  readyPulseOut = readyPulseRaw
 
 -- logits from the current data
 logitsSignal :: TransformerLayer.TransformerDecoderComponent -> Signal dom IntermediateData -> Signal dom (Vec VocabSize Float)
@@ -193,7 +88,7 @@ embed :: CArray2D VocabSize ModelDim -> Token -> Vec ModelDim Float
 embed (CArray2D vocab) tokenCode = vocab !! (fromIntegral tokenCode :: Int)
 
 -- ====== NEW: top-level with per-layer attention tap ======
-multiCycleTransformerWithTap :: forall dom
+multiCycleTransformer :: forall dom
    . HiddenClockResetEnable dom
   => TransformerLayer.TransformerDecoderComponent
   -> Vec NumLayers (Cache.KVRamOwner dom)
@@ -209,7 +104,7 @@ multiCycleTransformerWithTap :: forall dom
      , Signal dom (Vec ModelDim Float)
      , Signal dom (Vec ModelDim Float)
      )
-multiCycleTransformerWithTap decoder cacheOwners inputTokenSignal temperatureSignal seedSignal =
+multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal seedSignal =
   ( outputTokenSignal readyPulseRaw temperatureSignal seedSignal decoder nextIntermediateDataSignal
   , readyPulseRaw
   , tapPulseAny
@@ -256,10 +151,10 @@ multiCycleTransformerWithTap decoder cacheOwners inputTokenSignal temperatureSig
        , Vec NumLayers (Signal dom (Vec ModelDim Float))
        , Vec NumLayers (Signal dom (Vec ModelDim Float))
        , Vec NumLayers (Signal dom (Vec ModelDim Float)) )
-  layerStep (currData, wDoneVec, attnDoneVec, tapVec, xHatVec, woVec, xaaVec)
+  layerStep (currData, wDoneVec, attnDoneVec, _tapVec, _xHatVec, _woVec, _xaaVec)
             (layerComp, cacheOwner, lIx) =
     let (newData, wDone, attnDone, commitC3, tapPulse, dbgXHat, dbgWo, dbgXAfter) =
-          TransformerLayer.multiCycleTransformerLayerTap layerComp cacheOwner lIx processingStateSignal currData
+          TransformerLayer.multiCycleTransformerLayer layerComp cacheOwner lIx processingStateSignal currData
         selectedData =
           liftA4
             (\ps oldD newD c3D ->
@@ -272,10 +167,10 @@ multiCycleTransformerWithTap decoder cacheOwners inputTokenSignal temperatureSig
     in  ( selectedData
         , replace lIx wDone wDoneVec
         , replace lIx attnDone attnDoneVec
-        , replace lIx tapPulse tapVec
-        , replace lIx dbgXHat xHatVec
-        , replace lIx dbgWo   woVec
-        , replace lIx dbgXAfter xaaVec
+        , replace lIx tapPulse _tapVec
+        , replace lIx dbgXHat _xHatVec
+        , replace lIx dbgWo   _woVec
+        , replace lIx dbgXAfter _xaaVec
         )
 
   ( nextIntermediateDataSignal
