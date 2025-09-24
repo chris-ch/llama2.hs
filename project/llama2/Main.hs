@@ -356,13 +356,22 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
           let (lI, pI) = showPos l p
           -- Token (decoded as a piece) – you can also print the raw integer
           let decoded = T.decodePiece tokenizer (fromIntegral tok) (fromIntegral tok)
+
+
+          -- 1️⃣  Ready flag
           putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
+          putStr $ "READY=" ++ show tp ++ " "
+
+          -- 2️⃣  Token (already printed before)
           putStr $ "token=" ++ show tok ++ " (" ++ BSC.unpack decoded ++ ") "
-          putStrLn ("xHat=" ++ fmt8 xhat)
+
+          -- 3️⃣  Rest of the diagnostics
+          putStrLn $ "xHat=" ++ fmt8 xhat ++ "\n"
           putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
-          putStrLn ("WO@heads=" ++ fmt8 woh)
+          putStrLn $ "WO@heads=" ++ fmt8 woh ++ "\n"
           putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
-          putStrLn ("x_after_attn=" ++ fmt8 xaa)
+          putStrLn $ "x_after_attn=" ++ fmt8 xaa ++ "\n"
+
           hFlush stdout
     )
     (DL.zip7 tokens   -- token stream
