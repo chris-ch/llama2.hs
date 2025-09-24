@@ -19,12 +19,10 @@ data PipelineOutputs dom = PipelineOutputs
   , stageFinished     :: Signal dom Bool
   }
 
--- Drive the global FSM and readyPulse. The two inputs are already
--- selected for “this layer” (i.e. post (!!) mux).
 runPipelineController
   :: HiddenClockResetEnable dom
   => Signal dom Bool  -- attnDoneThisLayer (Cycle3)
-  -> Signal dom Bool  -- writeDoneThisLayer (Cycle4)
+  -> Signal dom Bool  -- writeDoneThisLayer (Cycle2)
   -> PipelineOutputs dom
 runPipelineController attnDoneThisLayer writeDoneThisLayer = outs
  where
@@ -32,30 +30,32 @@ runPipelineController attnDoneThisLayer writeDoneThisLayer = outs
   advance s done = if done then nextProcessingState s else s
   procState = register initialProcessingState (advance <$> procState <*> stageFinishedSig)
 
-  -- Track if all layers have completed Cycle4
-  allLayersWritten = register False (mux (isStage Cycle4_WriteCache .&&. writeDoneThisLayer .&&. fmap (== maxBound) (processingLayer <$> procState)) (pure True) (pure False))
-
   -- Convenience fields
   stageSig = processingStage <$> procState
   layerIx  = processingLayer <$> procState
   posIx    = sequencePosition <$> procState
 
-  -- Ready pulse: last layer finishing Cycle5 AND all writes completed
+  -- Ready pulse: last layer finishing Cycle5
   isLastLayerFFN =
     liftA2 (\ps _ -> processingStage ps == Cycle5_ComputeFeedForward
                   && processingLayer ps == maxBound)
            procState (pure ())
   readyPulseRaw =
     let rising now prev = now && not prev
-    in liftA3 (\ffn written prev -> rising (ffn && written) prev) isLastLayerFFN allLayersWritten (register False (isLastLayerFFN .&&. allLayersWritten))
+    in liftA2 rising isLastLayerFFN (register False isLastLayerFFN)
 
-  -- “when to advance” policy
+  -- Stage-done policy for the simplified schedule:
+  --   C1: immediate
+  --   C2: wait for KV writeDone (now produced in Cycle2)
+  --   C3: wait for attention done (all heads)
+  --   C4: immediate (no-op in this schedule)
+  --   C5: one cycle; emit readyPulse on last layer
   isStage st = (== st) <$> stageSig
   stageFinishedSig =
     mux (isStage Cycle1_ReadCache)           (pure True)               $
-    mux (isStage Cycle2_ComputeQKV)          (pure True)               $
+    mux (isStage Cycle2_ComputeQKV)          writeDoneThisLayer        $
     mux (isStage Cycle3_ComputeAttention)    attnDoneThisLayer         $
-    mux (isStage Cycle4_WriteCache)          writeDoneThisLayer        $
+    mux (isStage Cycle4_WriteCache)          (pure True)               $
     mux (isStage Cycle5_ComputeFeedForward)  (not <$> readyPulseRaw)   $
     pure False
 
@@ -67,4 +67,3 @@ runPipelineController attnDoneThisLayer writeDoneThisLayer = outs
     , readyPulse      = readyPulseRaw
     , stageFinished   = stageFinishedSig
     }
-  

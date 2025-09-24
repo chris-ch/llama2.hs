@@ -54,11 +54,6 @@ hasSecondQueryHead keyValueHeadIndex = queryHeadsPerKeyValueHead >= 2 && (baseQu
 queryHeadIndex1 :: Index NumKeyValueHeads -> Index NumQueryHeads
 queryHeadIndex1 keyValueHeadIndex = if hasSecondQueryHead keyValueHeadIndex then toEnum (baseQueryIndex keyValueHeadIndex + 1) else queryHeadIndex0 keyValueHeadIndex
 
--- For one K/V bank:
---   - Runs attention for one or two query heads mapped to this bank
---   - Reads K/V from RAM (or bypass at current t)
---   - Writes new K/V during Cycle4
--- Accumulates head outputs and per-bank writeDone pulses.
 fillOneBank
   :: HiddenClockResetEnable dom
   => Index NumLayers
@@ -74,56 +69,66 @@ fillOneBank
      , Vec NumKeyValueHeads (Signal dom Bool))
 fillOneBank layerIndex processingStateSignal kvRamOwner intermediateDataSignal (headOutputAcc, headDoneAcc, writeDoneAcc) keyValueHeadIndex =
   let
-    stageEquals cycleStage =
-      liftA2 (\procState _ -> processingStage procState == cycleStage && processingLayer procState == layerIndex)
+    stageEquals st =
+      liftA2 (\ps _ -> processingStage ps == st && processingLayer ps == layerIndex)
              processingStateSignal (pure ())
 
+    isCycle2Write     = stageEquals Cycle2_ComputeQKV
     isCycle3Attention = stageEquals Cycle3_ComputeAttention
-    isCycle4Write     = stageEquals Cycle4_WriteCache
-    attentionStartSignal = isCycle3Attention
-    sequencePositionSignal = sequencePosition <$> processingStateSignal
+
+    seqPosSignal = sequencePosition <$> processingStateSignal
 
     bank   = Cache.kvBanks kvRamOwner !! keyValueHeadIndex
     runKey = Cache.runKeyBank bank
     runVal = Cache.runValueBank bank
 
-    queryVectorSignal0 = getQueryVector intermediateDataSignal (queryHeadIndex0 keyValueHeadIndex)
-    queryVectorSignal1 = if hasSecondQueryHead keyValueHeadIndex then getQueryVector intermediateDataSignal (queryHeadIndex1 keyValueHeadIndex)
-                                               else pure (repeat 0)
+    -- Head mapping for this KV bank
+    qIdx0 = queryHeadIndex0 keyValueHeadIndex
+    hasQ1 = hasSecondQueryHead keyValueHeadIndex
+    qIdx1 = queryHeadIndex1 keyValueHeadIndex
 
-    keyVectorSignal   = getKeyVector intermediateDataSignal keyValueHeadIndex
-    valueVectorSignal = getValueVector intermediateDataSignal keyValueHeadIndex
+    query0 = getQueryVector intermediateDataSignal qIdx0
+    query1 = if hasQ1 then getQueryVector intermediateDataSignal qIdx1 else pure (repeat 0)
 
-    (address0, headOutput0, _busy0, done0) =
+    keyVec   = getKeyVector   intermediateDataSignal keyValueHeadIndex
+    valueVec = getValueVector intermediateDataSignal keyValueHeadIndex
+
+    -- Cycle2: write K,V at current pos (port B)
+    keyValuePairSignal = liftA2 (,) keyVec valueVec
+    (writeAddrSig, keyWriteSig, valWriteSig, writeDoneThisBank) =
+      Cache.writeSequencer isCycle2Write seqPosSignal keyValuePairSignal
+
+    -- Cycle3: attention on port A (read-only). Serialize heads per bank.
+    (addrA0, out0, _busy0, done0) =
       AttentionHead.streamHeadAttentionAddrIO
-        attentionStartSignal sequencePositionSignal
-        queryVectorSignal0 keyVectorSignal valueVectorSignal keyRamOutput0 valueRamOutput0
-    (address1, headOutput1, _busy1, done1) =
+        isCycle3Attention seqPosSignal query0 keyVec valueVec keyOutA valOutA
+
+    startHead1 = isCycle3Attention .&&. register False done0
+    (addrA1, out1, _busy1, done1raw) =
       AttentionHead.streamHeadAttentionAddrIO
-        attentionStartSignal sequencePositionSignal
-        queryVectorSignal1 keyVectorSignal valueVectorSignal keyRamOutput1 valueRamOutput1
+        startHead1 seqPosSignal query1 keyVec valueVec keyOutA valOutA
 
-    keyValuePairSignal                      = liftA2 (,) keyVectorSignal valueVectorSignal
-    (writeAddressSignal, keyWriteSignal, valueWriteSignal, writeDoneBankSignal) =
-      Cache.writeSequencer isCycle4Write sequencePositionSignal keyValuePairSignal
+    -- Combined 'done' for both heads (align pulses to the same cycle)
+    combinedDone = if hasQ1 then done1raw else done0
 
-    addressA = address0
-    writeA   = pure Nothing
-    addressBForCycle3 = if hasSecondQueryHead keyValueHeadIndex then address1 else address0
-    addressB = mux isCycle3Attention addressBForCycle3 writeAddressSignal
-    keyWriteB  = mux isCycle3Attention (pure Nothing) keyWriteSignal
-    valueWriteB= mux isCycle3Attention (pure Nothing) valueWriteSignal
+    -- Dual-port RAM wiring:
+    --   Port A -> attention addresses (head0 or head1)
+    --   Port B -> KV writes in Cycle2, idle otherwise
+    addrA = mux startHead1 addrA1 addrA0
+    addrB = writeAddrSig
+    wrK_B = mux isCycle2Write keyWriteSig (pure Nothing)
+    wrV_B = mux isCycle2Write valWriteSig (pure Nothing)
 
-    (keyRamOutput0, keyRamOutput1) = runKey (addressA, writeA) (addressB, keyWriteB)
-    (valueRamOutput0, valueRamOutput1) = runVal (addressA, writeA) (addressB, valueWriteB)
+    (keyOutA, _keyOutB) = runKey (addrA, pure Nothing) (addrB, wrK_B)
+    (valOutA, _valOutB) = runVal (addrA, pure Nothing) (addrB, wrV_B)
 
-    headOutputAcc0  = replace (queryHeadIndex0 keyValueHeadIndex) headOutput0 headOutputAcc
-    headDoneAcc0    = replace (queryHeadIndex0 keyValueHeadIndex) done0 headDoneAcc
+    -- Accumulate outputs and aligned done pulses
+    headOutputAcc0 = replace qIdx0 out0 headOutputAcc
+    headDoneAcc0   = replace qIdx0 combinedDone headDoneAcc
+    headOutputAcc1 = if hasQ1 then replace qIdx1 out1 headOutputAcc0 else headOutputAcc0
+    headDoneAcc1   = if hasQ1 then replace qIdx1 combinedDone headDoneAcc0 else headDoneAcc0
 
-    headOutputAcc1  = if hasSecondQueryHead keyValueHeadIndex then replace (queryHeadIndex1 keyValueHeadIndex) headOutput1 headOutputAcc0 else headOutputAcc0
-    headDoneAcc1    = if hasSecondQueryHead keyValueHeadIndex then replace (queryHeadIndex1 keyValueHeadIndex) done1 headDoneAcc0 else headDoneAcc0
-
-    writeDoneAcc1   = replace keyValueHeadIndex writeDoneBankSignal writeDoneAcc
+    writeDoneAcc1  = replace keyValueHeadIndex writeDoneThisBank writeDoneAcc
   in
     (headOutputAcc1, headDoneAcc1, writeDoneAcc1)
 

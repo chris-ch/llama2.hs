@@ -118,11 +118,11 @@ multiCycleTransformerLayer transformerLayerComponent kvRamOwner layerIndex proce
            else currentIntermediateData)
       processingStateSignal baseNextIntermediateDataSignal xAfterAttnSignal attentionDoneThisLayerSignal
 
-  -- Layer write done = AND across banks (as in your original)
+  -- Layer write done = AND across banks (now used in Cycle2)
   writeDoneThisLayerSignal =
     let allBanksDoneSignal = fmap and (sequenceA perBankWriteDoneVec)
     in  (\procState banksDone ->
-           processingStage procState == Cycle4_WriteCache &&
+           processingStage procState == Cycle2_ComputeQKV &&
            processingLayer procState == layerIndex &&
            banksDone)
         <$> processingStateSignal <*> allBanksDoneSignal
