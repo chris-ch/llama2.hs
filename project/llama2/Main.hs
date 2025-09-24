@@ -273,6 +273,11 @@ parseModelConfigFile = do
 
   return decoder
 
+printToken :: Token -> T.Tokenizer -> IO ()
+printToken tok tokenizer = do
+    BSC.putStr (T.decodePiece tokenizer (fromIntegral tok) (fromIntegral tok))
+    hFlush stdout
+
 --------------------------------------------------------------------------------
 -- Token Generation with Clash Simulation
 --------------------------------------------------------------------------------
@@ -344,32 +349,49 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
         let lInt = fromEnum l
             pAdj = if l == maxBound then succIdx p else p
         in (lInt, fromEnum pAdj)
-
+  let tokens = map (\(t,_,_,_,_,_,_,_) -> t) outputs
   mapM_
-    (\(tp, l, p, xhat, woh, xaa) ->
+    (\(tok, tp, l, p, xhat, woh, xaa) -> do
         when tp $ do
           let (lI, pI) = showPos l p
-          putStr "[L" >> putStr (show lI) >> putStr " P" >> putStr (show pI) >> putStr "] "
-          putStr "xHat: "         >> putStrLn (fmt8 xhat)
-          putStr "[L" >> putStr (show lI) >> putStr " P" >> putStr (show pI) >> putStr "] "
-          putStr "WO@heads: "     >> putStrLn (fmt8 woh)
-          putStr "[L" >> putStr (show lI) >> putStr " P" >> putStr (show pI) >> putStr "] "
-          putStr "x_after_attn: " >> putStrLn (fmt8 xaa)
-    ) (DL.zip6 tapFlags tapLayers tapSeqs dbgXHats dbgWOs dbgXAfters)
+          -- Token (decoded as a piece) – you can also print the raw integer
+          let decoded = T.decodePiece tokenizer (fromIntegral tok) (fromIntegral tok)
+          putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
+          putStr $ "token=" ++ show tok ++ " (" ++ BSC.unpack decoded ++ ") "
+          putStrLn ("xHat=" ++ fmt8 xhat)
+          putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
+          putStrLn ("WO@heads=" ++ fmt8 woh)
+          putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
+          putStrLn ("x_after_attn=" ++ fmt8 xaa)
+          hFlush stdout
+    )
+    (DL.zip7 tokens   -- token stream
+            tapFlags
+            tapLayers
+            tapSeqs
+            dbgXHats
+            dbgWOs
+            dbgXAfters)
 
-  let promptLen = length promptTokens
-      forcedEmitted = promptTokens                         -- emit full prompt
-      sampledAfterPrompt = drop promptLen sampledAll       -- then model outputs
-      emittedAll = forcedEmitted ++ sampledAfterPrompt
-      totalWanted = promptLen + fromIntegral nSteps
+  -- Stream tokens as soon as they are ready
+  let streamTokens :: [Token] -> IO ()
+      streamTokens [] = pure ()
+      streamTokens (t:ts) = do
+          printToken t tokenizer
+          streamTokens ts
+
+  -- The list of tokens we actually want to output:
+  --   • the whole prompt (forced emission)
+  --   • then the sampled tokens after the prompt
+  let promptLen      = length promptTokens
+      forcedEmitted  = promptTokens
+      sampledAfterPrompt = drop promptLen sampledAll
+      emittedAll     = forcedEmitted ++ sampledAfterPrompt
+      totalWanted    = promptLen + fromIntegral nSteps
       emittedLimited = take totalWanted emittedAll
-      trans   = zip emittedLimited (drop 1 emittedLimited)
 
-  mapM_
-    (\(prev, nxt) ->
-        BSC.putStr (T.decodePiece tokenizer (fromIntegral prev) (fromIntegral nxt))
-        >> hFlush stdout)
-    trans
+  -- Output them one‑by‑one
+  streamTokens emittedLimited
   putStrLn ""
 
   let generated = take (fromIntegral nSteps) (drop promptLen emittedLimited)
