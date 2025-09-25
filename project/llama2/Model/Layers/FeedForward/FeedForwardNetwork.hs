@@ -4,7 +4,8 @@ module Model.Layers.FeedForward.FeedForwardNetwork (
 
 import Clash.Prelude
 
-import Helpers (CArray2D, ModelDim, HiddenDim, rmsNorm, matrixVectorMult)
+import Model.Core.Types (CArray2D, ModelDim, HiddenDim)
+import Helpers (rmsNorm, matrixVectorMult)
 
 data FeedForwardNetworkComponent = FeedForwardNetworkComponent
   { fW1 :: CArray2D HiddenDim ModelDim,

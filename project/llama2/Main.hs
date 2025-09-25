@@ -20,7 +20,7 @@ import Data.Time.Clock.POSIX (getPOSIXTime)
 import System.IO (hFlush, stdout)
 import Control.Monad (replicateM_)
 import Text.Printf (printf)
-import Helpers
+import Model.Core.Types
     (
       SingleHeadComponent(SingleHeadComponent, rotary, wqHead, wkHead,
                           wvHead),
@@ -40,7 +40,7 @@ import Helpers
 import qualified Model.Top as Top ( topEntity )
 import qualified Tokenizer as T (buildTokenizer, encodeTokens, Tokenizer, decodePiece)
 import Model.Layers.TransformerLayer (TransformerDecoderComponent (..), TransformerLayerComponent (..))
-import qualified Model.Layer as Layer
+import qualified Model.Layers.TransformerLayer as Layer
 import qualified Model.Layers.FeedForward.FeedForwardNetwork as FeedForwardNetwork
 import qualified Model.Layers.Attention.MultiHeadAttention as MultiHeadAttention
 import GHC.Base (when)

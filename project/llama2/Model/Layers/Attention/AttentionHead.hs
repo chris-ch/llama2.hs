@@ -4,9 +4,9 @@ module Model.Layers.Attention.AttentionHead (
   , streamHeadAttentionAddrIO
 ) where
 
-import Model.Core.Types ( CacheDepth, CacheAddress, BankAddress )
+import Model.Core.Types (HeadDimension, SeqLen, CacheDepth, CacheAddress, BankAddress )
 import Clash.Prelude
-import Helpers (HeadDimension, SeqLen, liftA5, liftA4)
+import Helpers (liftA5, liftA4)
 import qualified Model.Memory.Addressing as Addressing
 
 data AttnPhase = PhaseDot | PhaseAcc | PhaseFinalize

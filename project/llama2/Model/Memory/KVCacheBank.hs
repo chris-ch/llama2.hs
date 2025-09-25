@@ -8,8 +8,7 @@ module Model.Memory.KVCacheBank (
 import Clash.Prelude
 import qualified Prelude as P
 
-import Model.Core.Types (TrueDualPortRunner, BankDepth, BankAddress)
-import Helpers (NumKeyValueHeads, HeadDimension, SeqLen)
+import Model.Core.Types (TrueDualPortRunner, BankDepth, BankAddress, NumKeyValueHeads, HeadDimension, SeqLen)
 import qualified Model.Memory.RamOps as RamOps (toRamOperation)
 import qualified Model.Memory.Addressing as Addressing
 

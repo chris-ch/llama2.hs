@@ -25,12 +25,11 @@ executable llama2
   other-modules:
     Helpers,
     Tokenizer,
+    Model.Core.Transformer,
     Model.Core.Types,
-    Model.Core.IntermediateData,
     Model.Core.PipelineController,
     Model.Embedding.PRNG,
     Model.Embedding.TokenEmbedding,
-    Model.Layer,
     Model.Layers.Attention.MultiHeadAttention,
     Model.Layers.Attention.AttentionHead,
     Model.Layers.FeedForward.FeedForwardNetwork,
@@ -38,8 +37,7 @@ executable llama2
     Model.Memory.Addressing,
     Model.Memory.KVCacheBank,
     Model.Memory.RamOps,
-    Model.Top,
-    Model.Top.Transformer
+    Model.Top
   hs-source-dirs:
       project/llama2
   build-depends: base,

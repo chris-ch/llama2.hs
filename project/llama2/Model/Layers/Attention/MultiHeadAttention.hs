@@ -4,7 +4,8 @@ module Model.Layers.Attention.MultiHeadAttention (
 
 import Clash.Prelude
 
-import Helpers (NumQueryHeads, ModelDim, NumKeyValueHeads, SeqLen, HeadDimension, CArray2D, SingleHeadComponent, matrixVectorMult, dotVec)
+import Model.Core.Types (NumQueryHeads, ModelDim, NumKeyValueHeads, SeqLen, HeadDimension, CArray2D, SingleHeadComponent)
+import Helpers (matrixVectorMult, dotVec)
 
 data MultiHeadAttentionComponent = MultiHeadAttentionComponent
   { heads  :: Vec NumQueryHeads SingleHeadComponent

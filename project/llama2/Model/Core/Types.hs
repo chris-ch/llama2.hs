@@ -2,25 +2,95 @@ module Model.Core.Types
   ( -- State machine
     CycleStage(..)
   , ProcessingState(..)
-  , initialProcessingState
-  , nextProcessingState
-    -- Intermediate data
   , IntermediateData(..)
-  , initialIntermediateData
     -- Geometry and helpers
   , BankDepth
   , BankAddress
   , CacheDepth
   , CacheAddress
   , TrueDualPortRunner
+  , Token
+  , Temperature
+  , Seed
+  , HiddenDim
+  , ModelDim
+  ,  NumQueryHeads
+  , NumLayers
+  , NumKeyValueHeads
+  , SeqLen
+  , HeadDimension
+  , FreqDim
+  , VocabSize
+  , SingleHeadComponent(..)
+  , RotaryEncodingComponent(..)
+  , EmbeddingComponent(..)
+  , CArray2D(..)
   ) where
 
 import Clash.Prelude
 import qualified GHC.TypeNats
 import GHC.Stack (HasCallStack)
 
-import Helpers
-  ( NumQueryHeads, NumKeyValueHeads, NumLayers, SeqLen, HeadDimension, ModelDim )
+{- 
+-- model config 260K
+type ModelDim = 64
+type HiddenDim = 172
+type NumLayers = 5
+type NumQueryHeads = 8
+type NumKeyValueHeads = 4
+type HeadDimension  = 8
+type FreqDim = 4
+type VocabSize = 512 :: Nat
+vocabSize :: Int
+vocabSize = natToNum @VocabSize
+type SeqLen         = 512
+seqLen :: Int
+seqLen = natToNum @SeqLen
+ -}
+
+-- model config 15M
+type ModelDim = 288
+type HiddenDim = 768
+type NumLayers = 6
+type NumQueryHeads = 6
+type NumKeyValueHeads = 6
+type HeadDimension  = 48
+type FreqDim = 24
+type VocabSize = 32000 :: Nat
+type SeqLen         = 256
+
+{- 
+-- model config 42M
+type ModelDim = 512
+type HiddenDim = 1376
+type NumLayers = 8
+type NumQueryHeads = 8
+type NumKeyValueHeads = 8
+type HeadDimension  = 64
+type FreqDim = 32
+type VocabSize = 32000 :: Nat
+vocabSize :: Int
+vocabSize = natToNum @VocabSize
+type SeqLen         = 1024
+seqLen :: Int
+seqLen = natToNum @SeqLen
+ -}
+{-
+-- model config 110M
+type ModelDim = 768
+type HiddenDim = 2048
+type NumLayers = 12
+type NumQueryHeads = 12
+type NumKeyValueHeads = 12
+type HeadDimension  = 64
+type FreqDim = 32
+type VocabSize = 32000 :: Nat
+vocabSize :: Int
+vocabSize = natToNum @VocabSize
+type SeqLen         = 1024
+seqLen :: Int
+seqLen = natToNum @SeqLen
+-}
 
 -- ============================================================================
 -- Bank and Cache Geometry
@@ -78,31 +148,6 @@ data ProcessingState = ProcessingState
   , sequencePosition :: Index SeqLen
   } deriving (Show, Generic, NFDataX)
 
-initialProcessingState :: ProcessingState
-initialProcessingState = ProcessingState
-  { processingStage  = Stage1_LoadKV
-  , processingLayer  = 0
-  , sequencePosition = 0
-  }
-
--- Single state transition function (one step)
-nextProcessingState :: ProcessingState -> ProcessingState
-nextProcessingState state = case processingStage state of
-  Stage1_LoadKV          -> state { processingStage = Stage2_ProjectQKV }
-  Stage2_ProjectQKV         -> state { processingStage = Stage3_Attend }
-  Stage3_Attend   -> state { processingStage = Stage4_WriteKV }
-  Stage4_WriteKV         -> state { processingStage = Stage5_FeedForward }
-  Stage5_FeedForward ->
-    if processingLayer state == maxBound
-      then state { processingStage  = Stage1_LoadKV
-                 , processingLayer  = 0
-                 , sequencePosition = if sequencePosition state == maxBound
-                                        then 0 else succ (sequencePosition state)
-                 }
-      else state { processingStage  = Stage1_LoadKV
-                 , processingLayer  = succ (processingLayer state)
-                 }
-
 -- ============================================================================
 -- Intermediate Data Storage
 -- ============================================================================
@@ -118,12 +163,27 @@ data IntermediateData = IntermediateData
   , feedForwardOutput :: Vec ModelDim Float
   } deriving (Show, Generic, NFDataX)
 
-initialIntermediateData :: IntermediateData
-initialIntermediateData = IntermediateData
-  { inputVector       = repeat 0
-  , queryVectors      = repeat (repeat 0)
-  , keyVectors        = repeat (repeat 0)
-  , valueVectors      = repeat (repeat 0)
-  , attentionOutput   = repeat 0
-  , feedForwardOutput = repeat 0
-  }
+newtype CArray2D (n :: Nat) (m :: Nat) = CArray2D (Vec n (Vec m Float)) deriving (Show)
+
+type Token = Unsigned 32
+type Temperature = Float
+type Seed = Unsigned 32
+
+-- Data definitions for LLM architecture
+
+data EmbeddingComponent = EmbeddingComponent
+  { vocabulary :: CArray2D VocabSize ModelDim,
+    rmsFinalWeight :: Vec ModelDim Float
+  } deriving (Show)
+
+data RotaryEncodingComponent = RotaryEncodingComponent
+  { freqCos :: CArray2D SeqLen FreqDim,
+    freqSin :: CArray2D SeqLen FreqDim
+  } deriving (Show)
+
+data SingleHeadComponent = SingleHeadComponent
+  { wqHead :: CArray2D HeadDimension ModelDim
+  , wkHead :: CArray2D HeadDimension ModelDim
+  , wvHead :: CArray2D HeadDimension ModelDim
+  , rotary :: RotaryEncodingComponent
+  } deriving (Show)

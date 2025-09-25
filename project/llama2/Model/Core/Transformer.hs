@@ -1,11 +1,10 @@
-module Model.Top.Transformer (
-    multiCycleTransformer,
-    argMax
+module Model.Core.Transformer (
+    multiCycleTransformer
 ) where
 
 import Clash.Prelude
-import Helpers (NumLayers, Temperature, Seed, EmbeddingComponent (..), liftA4, CArray2D (..), VocabSize, Token, ModelDim, SeqLen)
-import Model.Core.Types (IntermediateData(..), initialIntermediateData, ProcessingState (..), CycleStage (..))
+import Helpers (liftA4)
+import Model.Core.Types (IntermediateData(..), ProcessingState (..), CycleStage (..), NumLayers, Temperature, Seed, EmbeddingComponent (..), CArray2D (..), VocabSize, Token, ModelDim, SeqLen)
 import qualified Model.Memory.KVCacheBank as Cache
 import qualified Model.Layers.TransformerLayer as TransformerLayer (TransformerLayerComponent(..), TransformerDecoderComponent(..), multiCycleTransformerLayer)
 import Model.Layers.TransformerLayer (TransformerDecoderComponent(..), transformerLogits)
@@ -13,6 +12,16 @@ import qualified Clash.Sized.Vector as CV
 import Data.Maybe (fromMaybe, isJust)
 import qualified Model.Embedding.PRNG as PRNG
 import qualified Model.Core.PipelineController as PipelineController (runPipelineController, PipelineOutputs (..))
+
+initialIntermediateData :: IntermediateData
+initialIntermediateData = IntermediateData
+  { inputVector       = repeat 0
+  , queryVectors      = repeat (repeat 0)
+  , keyVectors        = repeat (repeat 0)
+  , valueVectors      = repeat (repeat 0)
+  , attentionOutput   = repeat 0
+  , feedForwardOutput = repeat 0
+  }
 
 -- logits from the current data
 logitsSignal :: TransformerLayer.TransformerDecoderComponent -> Signal dom IntermediateData -> Signal dom (Vec VocabSize Float)
@@ -94,10 +103,10 @@ multiCycleTransformer :: forall dom
    . HiddenClockResetEnable dom
   => TransformerLayer.TransformerDecoderComponent
   -> Vec NumLayers (Cache.KVRamOwner dom)
-  -> Signal dom (Unsigned 32)
+  -> Signal dom Token
   -> Signal dom Temperature
   -> Signal dom Seed
-  -> ( Signal dom (Unsigned 32)
+  -> ( Signal dom Token
      , Signal dom Bool
      , Signal dom Bool
      , Signal dom (Index NumLayers)
@@ -135,7 +144,7 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
            else current)
       (PipelineController.processingState ctrl) intermediateDataSignal tokenEmbeddingSignal
 
-  -- Per-layer step: same function you had, unchanged
+  -- Per-layer step
   layerStep
     :: ( Signal dom IntermediateData
        , Vec NumLayers (Signal dom Bool)

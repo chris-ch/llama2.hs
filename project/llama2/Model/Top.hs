@@ -4,14 +4,14 @@ module Model.Top
 
 import Clash.Prelude
 
-import Helpers
+import Model.Core.Types
   (
   Temperature, Seed, ModelDim, NumLayers, SeqLen
   )
 
 import qualified Model.Memory.KVCacheBank as Cache
 import qualified Model.Layers.TransformerLayer as TransformerLayer (TransformerDecoderComponent)
-import qualified Model.Top.Transformer as Transformer
+import qualified Model.Core.Transformer as Transformer
 
 -- ====== NEW: top with attention tap out ======
 topEntity

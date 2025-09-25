@@ -4,8 +4,7 @@ module Model.Memory.Addressing (
 
 import Clash.Prelude
 
-import Helpers (SeqLen, HeadDimension)
-import Model.Core.Types (BankAddress)
+import Model.Core.Types (BankAddress, SeqLen, HeadDimension)
 
 -- Compute bank address from sequence index and head-dimension index
 -- Assumes headDimIndex in [0, HeadDimension-1], sequenceIndex in [0, SeqLen-1].
