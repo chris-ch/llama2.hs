@@ -1,4 +1,4 @@
-/* Inference for Llama-2 Transformer model in pure C */
+/* Inference for Llama-2 Transformer model in pure C with debugging */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +13,28 @@
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+
+// Debug flag - set to 1 to enable detailed tracing
+int DEBUG_MODE = 1;
+
+// Debug helper function to print first 8 elements of an array
+void debug_print_array(const char* name, float* arr, int size, int layer, int pos) {
+    if (!DEBUG_MODE) return;
+    printf("[L%d P%d] %s: ", layer, pos, name);
+    int limit = size < 8 ? size : 8;
+    for (int i = 0; i < limit; i++) {
+        printf("%.7g ", arr[i]);
+    }
+    if (size > 8) printf("...");
+    printf("\n");
+}
+
+// Debug helper for single values
+void debug_print_value(const char* name, float value, int layer, int pos) {
+    if (!DEBUG_MODE) return;
+    printf("[L%d P%d] %s: %.7g\n", layer, pos, name, value);
+}
+
 // ----------------------------------------------------------------------------
 // Transformer model
 
@@ -241,15 +263,32 @@ float* forward(Transformer* transformer, int token, int pos) {
     int hidden_dim =  p->hidden_dim;
     int head_size = dim / p->n_heads;
 
+    // Debug: Print token info
+    if (DEBUG_MODE) {
+        printf("[TRACE] token=%d pos=%d\n", token, pos);
+    }
+
     // copy the token embedding into x
     float* content_row = w->token_embedding_table + token * dim;
     memcpy(x, content_row, dim*sizeof(*x));
+    
+    if (DEBUG_MODE) {
+        debug_print_array("token_embedding", x, dim, -1, pos);
+    }
 
     // forward all the layers
     for(unsigned long long l = 0; l < p->n_layers; l++) {
 
+        if (DEBUG_MODE) {
+            debug_print_array("x_input", x, dim, l, pos);
+        }
+
         // attention rmsnorm
         rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+        
+        if (DEBUG_MODE) {
+            debug_print_array("(a) xHat", s->xb, dim, l, pos);
+        }
 
         // key and value point to the kv cache
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
@@ -260,6 +299,12 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+
+        if (DEBUG_MODE) {
+            debug_print_array("q_before_rope", s->q, dim, l, pos);
+            debug_print_array("k_before_rope", s->k, kv_dim, l, pos);
+            debug_print_array("v", s->v, kv_dim, l, pos);
+        }
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         for (int i = 0; i < dim; i+=2) {
@@ -276,6 +321,11 @@ float* forward(Transformer* transformer, int token, int pos) {
                 vec[i]   = v0 * fcr - v1 * fci;
                 vec[i+1] = v0 * fci + v1 * fcr;
             }
+        }
+
+        if (DEBUG_MODE) {
+            debug_print_array("q_after_rope", s->q, dim, l, pos);
+            debug_print_array("k_after_rope", s->k, kv_dim, l, pos);
         }
 
         // multihead attention. iterate over all heads
@@ -318,21 +368,42 @@ float* forward(Transformer* transformer, int token, int pos) {
             }
         }
 
+        if (DEBUG_MODE) {
+            debug_print_array("(b) concat_head", s->xb, dim, l, pos);
+        }
+
         // final matmul to get the output of the attention
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+        
+        if (DEBUG_MODE) {
+            debug_print_array("(c) WO@head_concat", s->xb2, dim, l, pos);
+        }
 
         // residual connection back into x
         for (int i = 0; i < dim; i++) {
             x[i] += s->xb2[i];
         }
+        
+        if (DEBUG_MODE) {
+            debug_print_array("(d) x_after_attn", x, dim, l, pos);
+        }
 
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+        
+        if (DEBUG_MODE) {
+            debug_print_array("(e) xHat_ffn", s->xb, dim, l, pos);
+        }
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
         matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
         matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+
+        if (DEBUG_MODE) {
+            debug_print_array("(f) W1*xHat_ffn", s->hb, hidden_dim, l, pos);
+            debug_print_array("(g) W3*xHat_ffn", s->hb2, hidden_dim, l, pos);
+        }
 
         // SwiGLU non-linearity
         for (int i = 0; i < hidden_dim; i++) {
@@ -344,6 +415,10 @@ float* forward(Transformer* transformer, int token, int pos) {
             s->hb[i] = val;
         }
 
+        if (DEBUG_MODE) {
+            debug_print_array("(h) ffn_core", s->hb, hidden_dim, l, pos);
+        }
+
         // final matmul to get the output of the ffn
         matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
 
@@ -351,13 +426,27 @@ float* forward(Transformer* transformer, int token, int pos) {
         for (int i = 0; i < dim; i++) {
             x[i] += s->xb[i];
         }
+        
+        if (DEBUG_MODE) {
+            debug_print_array("(i) x_after_ffn", x, dim, l, pos);
+            printf("\n"); // Add spacing between layers
+        }
     }
 
     // final rmsnorm
     rmsnorm(x, x, w->rms_final_weight, dim);
+    
+    if (DEBUG_MODE) {
+        debug_print_array("final_rmsnorm", x, dim, -1, pos);
+    }
 
     // classifier into logits
     matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    
+    if (DEBUG_MODE) {
+        debug_print_array("logits", s->logits, p->vocab_size, -1, pos);
+    }
+    
     return s->logits;
 }
 
@@ -900,6 +989,7 @@ void error_usage() {
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
     fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
     fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
+    fprintf(stderr, "  -d          enable debug mode (shows intermediate computations)\n");
     exit(EXIT_FAILURE);
 }
 
@@ -920,7 +1010,15 @@ int main(int argc, char *argv[]) {
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
     for (int i = 2; i < argc; i+=2) {
         // do some basic validation
-        if (i + 1 >= argc) { error_usage(); } // must have arg after flag
+        if (i + 1 >= argc) { 
+            // Check if this is the debug flag which doesn't need an argument
+            if (strcmp(argv[i], "-d") == 0) {
+                DEBUG_MODE = 1;
+                i--; // decrement i to account for single flag
+                continue;
+            }
+            error_usage(); 
+        } 
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
         if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
         // read in the args
@@ -932,6 +1030,10 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'z') { tokenizer_path = argv[i + 1]; }
         else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
         else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
+        else if (argv[i][1] == 'd') { 
+            DEBUG_MODE = 1; 
+            i--; // decrement i to account for single flag
+        }
         else { error_usage(); }
     }
 
