@@ -3,7 +3,7 @@ module Model.Layers.Attention.AttentionHead (
   , streamHeadAttentionAddrIO
 ) where
 
-import Model.Core.Types (HeadDimension, SeqLen, CacheDepth, CacheAddress, BankAddress )
+import Model.Core.Types (HeadDimension, SeqLen, CacheAddress, BankAddress )
 import Clash.Prelude
 import Helpers (liftA5, liftA4)
 import qualified Model.Memory.Addressing as Addressing
@@ -14,12 +14,6 @@ data AttnPhase = PhaseDot | PhaseAcc | PhaseFinalize
 data AttentionCache dom = AttentionCache
   { keyCacheRam   :: Signal dom CacheAddress -> Signal dom (Maybe (CacheAddress, Float)) -> Signal dom Float
   , valueCacheRam :: Signal dom CacheAddress -> Signal dom (Maybe (CacheAddress, Float)) -> Signal dom Float
-  }
-
-initAttentionCache :: forall dom. HiddenClockResetEnable dom => AttentionCache dom
-initAttentionCache = AttentionCache
-  { keyCacheRam   = blockRam (replicate (SNat @CacheDepth) 0)
-  , valueCacheRam = blockRam (replicate (SNat @CacheDepth) 0)
   }
 
 -- Streaming single-head attention with online softmax and t==pos bypass for K,V.
