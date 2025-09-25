@@ -16,6 +16,7 @@ import qualified Model.Memory.KVCacheBank as Cache
 import qualified Model.Layers.FeedForward.FeedForwardNetwork as FeedForwardNetwork
 import qualified Model.Layers.Attention.MultiHeadAttention as MultiHeadAttention
 import qualified Model.Layers.Attention.AttentionHead as AttentionHead
+import qualified Clash.Sized.Vector as CV
 
 data TransformerLayerComponent = TransformerLayerComponent
   { multiHeadAttention :: MultiHeadAttention.MultiHeadAttentionComponent
@@ -40,8 +41,9 @@ multiCycleTransformerLayer
      , Signal dom IntermediateData             -- commitCycle3 (gated write-back)
      , Signal dom Bool                         -- tapPulse  (1-cycle on attnDone rising)
      , Signal dom (Vec ModelDim Float)         -- dbgXHat
-     , Signal dom (Vec ModelDim Float)         -- dbgWoHeads
-     , Signal dom (Vec ModelDim Float) )       -- dbgXAfterAttn
+     , Signal dom (Vec ModelDim Float)         -- dbgConcatHeads  (pre-WO)
+     , Signal dom (Vec ModelDim Float)         -- dbgWOHeads      (sum of per-head WO)
+     , Signal dom (Vec ModelDim Float) )       -- dbgXAfterAttn   (residual add)
 multiCycleTransformerLayer layer kvRamOwner layerIndex processingStateSignal intermediateDataSignal =
   ( nextIntermediateDataSignal
   , writeDoneThisLayerSignal
@@ -49,6 +51,7 @@ multiCycleTransformerLayer layer kvRamOwner layerIndex processingStateSignal int
   , commitCycle3Signal
   , attentionDoneThisLayerSignal
   , xHatSignal
+  , concatHeadsSignal
   , woHeadsSignal
   , xAfterAttnSignal
   )
@@ -76,7 +79,12 @@ multiCycleTransformerLayer layer kvRamOwner layerIndex processingStateSignal int
   xHatSignal =
     (\idata -> rmsNorm (inputVector idata) (MultiHeadAttention.rmsAtt mha)) <$> intermediateDataSignal
 
-  -- Per-head WO @ head, then sum across heads
+  -- Pre-WO concatenation of all heads (matches C's concat_head)
+  -- sequenceA :: Vec H (Signal (Vec D Float)) -> Signal (Vec H (Vec D Float))
+  -- CV.concat :: Vec H (Vec D a) -> Vec (H*D) a  == Vec ModelDim a
+  concatHeadsSignal = CV.concat <$> sequenceA perHeadOutputSignalsVec
+
+  -- Per-head WO @ head, then sum across heads (equivalent to WO @ concatHeads)
   perHeadProjectedSignalsVec =
     zipWith (\wo hSig -> matrixVectorMult wo <$> hSig) (MultiHeadAttention.mWo mha) perHeadOutputSignalsVec
   perHeadProjectedSignal = sequenceA perHeadProjectedSignalsVec

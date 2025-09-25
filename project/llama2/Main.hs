@@ -318,17 +318,18 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
 
   let outputs :: [( Token, Bool, Bool
                   , C.Index NumLayers, C.Index SeqLen
-                  , C.Vec ModelDim Float, C.Vec ModelDim Float, C.Vec ModelDim Float)]
+                  , C.Vec ModelDim Float, C.Vec ModelDim Float, C.Vec ModelDim Float, C.Vec ModelDim Float)]
       outputs = CS.simulate (bundledOutputs decoder) (DL.zip3 tokenStream temps seeds)
 
-      outTokens   = [ t  | (t, _, _, _, _, _, _, _) <- outputs ]
-      readyFlags  = [ r  | (_, r, _, _, _, _, _, _) <- outputs ]
-      tapFlags    = [ tp | (_, _, tp, _, _, _, _, _) <- outputs ]
-      tapLayers   = [ l  | (_, _, _, l, _, _, _, _) <- outputs ]
-      tapSeqs     = [ p  | (_, _, _, _, p, _, _, _) <- outputs ]
-      dbgXHats    = [ xv | (_, _, _, _, _, xv, _, _) <- outputs ]
-      dbgWOs      = [ wv | (_, _, _, _, _, _, wv, _) <- outputs ]
-      dbgXAfters  = [ av | (_, _, _, _, _, _, _, av) <- outputs ]
+      outTokens      = [ t  | (t, _, _, _, _, _, _, _, _) <- outputs ]
+      readyFlags     = [ r  | (_, r, _, _, _, _, _, _, _) <- outputs ]
+      tapFlags       = [ tp | (_, _, tp, _, _, _, _, _, _) <- outputs ]
+      tapLayers      = [ l  | (_, _, _, l, _, _, _, _, _) <- outputs ]
+      tapSeqs        = [ p  | (_, _, _, _, p, _, _, _, _) <- outputs ]
+      dbgXHats       = [ xv | (_, _, _, _, _, xv, _, _, _) <- outputs ]
+      dbgConcatHeads = [ ch | (_, _, _, _, _, _, ch, _, _) <- outputs ]
+      dbgWOs         = [ wv | (_, _, _, _, _, _, _, wv, _) <- outputs ]
+      dbgXAfters     = [ av | (_, _, _, _, _, _, _, _, av) <- outputs ]
 
       tokenStream :: [Token]
       tokenStream =
@@ -348,7 +349,7 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
           drive cur _ _ _ = repeat cur
 
       sampledAll :: [Token]
-      sampledAll = [ t | (t,r,_,_,_,_,_,_) <- outputs, r ]
+      sampledAll = [ t | (t,r,_,_,_,_,_,_,_) <- outputs, r ]
 
   -- Print taps with layer/pos labeling aligned to the C trace:
   -- For taps coming from the last layer, display P+1 (the C log prints the next pos after sampling).
@@ -364,9 +365,9 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
         let lInt = fromEnum l
             pAdj = if l == maxBound then succIdx p else p
         in (lInt, fromEnum pAdj)
-  let tokens = map (\(t,_,_,_,_,_,_,_) -> t) outputs
+  let tokens = map (\(t,_,_,_,_,_,_,_,_) -> t) outputs
   mapM_
-    (\(tok, tp, l, p, xhat, woh, xaa) -> do
+    (\(tok, tp, l, p, xhat, ch, woh, xaa) -> do
         when tp $ do
           let (lI, pI) = showPos l p
           -- Token (decoded as a piece) – you can also print the raw integer
@@ -380,19 +381,22 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
           putStr $ "token=" ++ show tok ++ " (" ++ BSC.unpack decoded ++ ") "
 
           -- 3️⃣  Rest of the diagnostics
-          putStrLn $ "xHat=" ++ fmt8 xhat ++ "\n"
+          putStrLn $ "xHat=" ++ fmt8 xhat
           putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
-          putStrLn $ "WO@heads=" ++ fmt8 woh ++ "\n"
+          putStrLn $ "Concat@heads=" ++ fmt8 ch
           putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
-          putStrLn $ "x_after_attn=" ++ fmt8 xaa ++ "\n"
+          putStrLn $ "WO@heads=" ++ fmt8 woh
+          putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
+          putStrLn $ "x_after_attn=" ++ fmt8 xaa
 
           hFlush stdout
     )
-    (DL.zip7 tokens   -- token stream
+    (zip8 tokens   -- token stream
             tapFlags
             tapLayers
             tapSeqs
             dbgXHats
+            dbgConcatHeads
             dbgWOs
             dbgXAfters)
 
@@ -420,6 +424,13 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
   let generated = take (fromIntegral nSteps) (drop promptLen emittedLimited)
   pure (generated, MultiHeadAttention.StepCount nSteps)
 
+-- | Zip eight lists together.
+--   The resulting list is as long as the shortest input list.
+zip8 :: [a] -> [b] -> [c] -> [d] -> [e] -> [f] -> [g] -> [h] -> [(a,b,c,d,e,f,g,h)]
+zip8 (a:as) (b:bs) (c:cs) (d:ds) (e:es) (f:fs) (g:gs) (h:hs) =
+    (a,b,c,d,e,f,g,h) : zip8 as bs cs ds es fs gs hs
+zip8 _ _ _ _ _ _ _ _ = []   -- stop when any list runs out
+
 bundledOutputs
   :: TransformerDecoderComponent
   -> C.Signal C.System (Token, Temperature, Seed)
@@ -428,6 +439,7 @@ bundledOutputs
                          , Bool
                          , C.Index NumLayers
                          , C.Index SeqLen
+                         , C.Vec ModelDim Float
                          , C.Vec ModelDim Float
                          , C.Vec ModelDim Float
                          , C.Vec ModelDim Float )
@@ -447,6 +459,7 @@ topEntityBundled :: CS.HiddenClockResetEnable dom
      , C.Signal dom Bool
     , C.Signal dom (C.Index NumLayers)
     , C.Signal dom (C.Index SeqLen)
+    , C.Signal dom (C.Vec ModelDim Float)
     , C.Signal dom (C.Vec ModelDim Float)
     , C.Signal dom (C.Vec ModelDim Float)
     , C.Signal dom (C.Vec ModelDim Float ))
