@@ -71,6 +71,17 @@ applyRotation rot step tokenVec =
       sinFrequencies = getRow step (freqSin rot)
   in applyRotaryPositionEncoding tokenVec cosFrequencies sinFrequencies
 
+-- Compute Q/K/V for a head, with optional rotary on Q/K
+computeHeadQKV
+  :: SingleHeadComponent
+  -> StepCount
+  -> Vec ModelDim Float
+  -> (Vec HeadDimension Float, Vec HeadDimension Float, Vec HeadDimension Float)
+computeHeadQKV headComp step xHat =
+  let (q, k, v) = runSingleHeadQKV headComp xHat
+      (qRot, kRot) = applyRotaryToHead headComp step (q, k)
+  in (qRot, kRot, v)
+
 projectQKV :: MultiHeadAttentionComponent
   -> ProcessingState
   -> Vec ModelDim Float
@@ -80,15 +91,13 @@ projectQKV :: MultiHeadAttentionComponent
 projectQKV multiHeadAttentionComponent processingState inputVector = 
   let
     normalizedInput = rmsNorm inputVector (rmsAtt multiHeadAttentionComponent)
+    stepCount = (StepCount $ fromIntegral $ sequencePosition processingState)
     -- Queries: one per Q head (with RoPE on Q)
     queries =
       imap (\queryHeadIdx _ ->
-        let headComponent = heads multiHeadAttentionComponent !! queryHeadIdx
-            (query, _, _)   = runSingleHeadQKV headComponent normalizedInput
-            (queryRotated, _kU) =
-              applyRotaryToHead headComponent
-                                (StepCount $ fromIntegral $ sequencePosition processingState)
-                                (query, repeat 0)
+        let
+          headComponent = heads multiHeadAttentionComponent !! queryHeadIdx
+          (queryRotated, _, _) = computeHeadQKV headComponent stepCount normalizedInput
         in queryRotated) indicesI
 
     -- Keys/Values: one per KV head (apply RoPE to K only)
@@ -97,12 +106,8 @@ projectQKV multiHeadAttentionComponent processingState inputVector =
         let qIdx0 = fromEnum keyValueHeadIdx *
                       (natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads)
             queryIndex = toEnum (min (natToNum @NumQueryHeads - 1) qIdx0) :: Index NumQueryHeads
-            headComponent     = heads multiHeadAttentionComponent !! queryIndex
-            (_q, key, value)   = runSingleHeadQKV headComponent normalizedInput
-            (_qU, keyRotated)  =
-              applyRotaryToHead headComponent
-                                (StepCount $ fromIntegral $ sequencePosition processingState)
-                                (repeat 0, key)
-        in (keyRotated, value)) indicesI
+            headComponent = heads multiHeadAttentionComponent !! queryIndex
+            (_q, keyRotated, valueRotated) = computeHeadQKV headComponent stepCount normalizedInput
+        in (keyRotated, valueRotated)) indicesI
     (keys, values) = unzip keysAndValues
   in (queries, keys, values)

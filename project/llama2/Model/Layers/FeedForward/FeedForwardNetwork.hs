@@ -26,15 +26,9 @@ computeFeedForward ffn x =
 
 runFeedForward :: FeedForwardNetworkComponent -> Vec ModelDim Float -> Vec ModelDim Float
 runFeedForward ffn xHat =
-  let
-    w1 = fW1 ffn
-    w2 = fW2 ffn
-    w3 = fW3 ffn
-    gatePre   = matrixVectorMult w1 xHat
-    upPre     = matrixVectorMult w3 xHat
-    gate      = map sigmoidLinearUnit gatePre
-  in
-    matrixVectorMult w2 (zipWith (*) gate upPre)
+  let gate = map sigmoidLinearUnit $ matrixVectorMult (fW1 ffn) xHat
+      up   = matrixVectorMult (fW3 ffn) xHat
+  in matrixVectorMult (fW2 ffn) (zipWith (*) gate up)
 
 -- Activation
 sigmoidLinearUnit :: Float -> Float
