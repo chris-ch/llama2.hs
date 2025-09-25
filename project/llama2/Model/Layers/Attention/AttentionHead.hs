@@ -1,20 +1,14 @@
 module Model.Layers.Attention.AttentionHead (
-    AttentionCache(..)
-  , streamHeadAttentionAddrIO
+  streamHeadAttentionAddrIO
 ) where
 
-import Model.Core.Types (HeadDimension, SeqLen, CacheAddress, BankAddress )
+import Model.Core.Types (HeadDimension, SeqLen, BankAddress )
 import Clash.Prelude
 import Helpers (liftA5, liftA4)
 import qualified Model.Memory.Addressing as Addressing
 
 data AttnPhase = PhaseDot | PhaseAcc | PhaseFinalize
   deriving (Generic, NFDataX, Eq, Show)
-
-data AttentionCache dom = AttentionCache
-  { keyCacheRam   :: Signal dom CacheAddress -> Signal dom (Maybe (CacheAddress, Float)) -> Signal dom Float
-  , valueCacheRam :: Signal dom CacheAddress -> Signal dom (Maybe (CacheAddress, Float)) -> Signal dom Float
-  }
 
 -- Streaming single-head attention with online softmax and t==pos bypass for K,V.
 -- BRAM is 1-cycle latent: the data we see this cycle corresponds to last cycle's address,

@@ -4,14 +4,30 @@ module Model.Core.Transformer (
 
 import Clash.Prelude
 import Helpers (liftA4)
-import Model.Core.Types (IntermediateData(..), ProcessingState (..), CycleStage (..), NumLayers, Temperature, Seed, EmbeddingComponent (..), CArray2D (..), VocabSize, Token, ModelDim, SeqLen)
+import Model.Core.Types
+  ( IntermediateData(..)
+  , ProcessingState (..)
+  , CycleStage (..)
+  , NumLayers, Temperature, Seed
+  , EmbeddingComponent (..)
+  , CArray2D (..)
+  , VocabSize, Token, ModelDim, SeqLen
+  )
 import qualified Model.Memory.KVCacheBank as Cache
-import qualified Model.Layers.TransformerLayer as TransformerLayer (TransformerLayerComponent(..), TransformerDecoderComponent(..), multiCycleTransformerLayer)
+import qualified Model.Layers.TransformerLayer as TransformerLayer
+  ( TransformerLayerComponent(..)
+  , TransformerDecoderComponent(..)
+  , multiCycleTransformerLayer
+  )
 import Model.Layers.TransformerLayer (TransformerDecoderComponent(..))
 import Data.Maybe (isJust)
 import qualified Model.Embedding.PRNG as PRNG
-import qualified Model.Core.PipelineController as PipelineController (runPipelineController, PipelineOutputs (..))
+import qualified Model.Core.PipelineController as PipelineController
+  ( runPipelineController
+  , PipelineOutputs (..)
+  )
 
+-- Initial contents for the per-token IntermediateData wave
 initialIntermediateData :: IntermediateData
 initialIntermediateData = IntermediateData
   { inputVector       = repeat 0
@@ -22,13 +38,21 @@ initialIntermediateData = IntermediateData
   , feedForwardOutput = repeat 0
   }
 
-outputTokenSignal :: forall dom
+-- Feed logits into the sampler and register the chosen token on readyPulse
+outputTokenSignal
+  :: forall dom
    . HiddenClockResetEnable dom
-  => Signal dom Bool -> Signal dom Temperature -> Signal dom (Unsigned 32) -> TransformerLayer.TransformerDecoderComponent -> Signal dom IntermediateData -> Signal dom (Unsigned 32)
+  => Signal dom Bool
+  -> Signal dom Temperature
+  -> Signal dom (Unsigned 32)
+  -> TransformerLayer.TransformerDecoderComponent
+  -> Signal dom IntermediateData
+  -> Signal dom (Unsigned 32)
 outputTokenSignal readyPulseSignal temperatureSignal seedSignal decoder nextIntermediateDataSignal =
-  regEn 0 readyPulseSignal (PRNG.sampledTokenSignal readyPulseSignal temperatureSignal seedSignal decoder nextIntermediateDataSignal)
+  regEn 0 readyPulseSignal
+        (PRNG.sampledTokenSignal readyPulseSignal temperatureSignal seedSignal decoder nextIntermediateDataSignal)
 
--- Embed a token
+-- Token embedding lookup (tied weights are handled in the classifier elsewhere)
 embed :: CArray2D VocabSize ModelDim -> Token -> Vec ModelDim Float
 embed (CArray2D vocab) tokenCode = vocab !! (fromIntegral tokenCode :: Int)
 
@@ -37,7 +61,8 @@ firstJustV :: Vec n (Maybe a) -> Maybe a
 firstJustV = foldr (\m acc -> case m of { Just _ -> m; Nothing -> acc }) Nothing
 
 -- Top transformer with centralized sequencing and cycle-aligned taps
-multiCycleTransformer :: forall dom
+multiCycleTransformer
+  :: forall dom
    . HiddenClockResetEnable dom
   => TransformerLayer.TransformerDecoderComponent
   -> Vec NumLayers (Cache.KVRamOwner dom)
@@ -68,14 +93,17 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
   transformerLayers       = modelLayers decoder
   tokenEmbeddingSignal    = embed (vocabulary embeddingComponent) <$> inputTokenSignal
 
-  -- Storage for IntermediateData
+  -- Storage for IntermediateData (registered once per cycle)
   intermediateDataSignal = register initialIntermediateData nextIntermediateDataSignal
 
-  -- Load input at Stage1
+  -- Load input at new Stage1 (ProjectQKV in Option B)
+  -- Layer 0 takes fresh token embedding; higher layers take previous layer's FFN output.
+  inputLoadedSignal ::
+       Signal dom IntermediateData
   inputLoadedSignal =
     liftA3
       (\ps current tokenEmbedding ->
-         if processingStage ps == Stage1_LoadKV
+         if processingStage ps == Stage1_ProjectQKV
            then if processingLayer ps == 0
                   then current { inputVector = tokenEmbedding }
                   else current { inputVector = feedForwardOutput current }
@@ -103,6 +131,7 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
             (layerComp, cacheOwner, lIx) =
     let (newData, wDone, attnDone, commitC3, tapPulse, dbgXHat, dbgWo, dbgXAfter) =
           TransformerLayer.multiCycleTransformerLayer layerComp cacheOwner lIx (PipelineController.processingState ctrl) currData
+        -- During Stage3_Attend we use the commitC3 view; otherwise, use newData.
         selectedData =
           liftA4
             (\ps oldD newD c3D ->
@@ -128,13 +157,13 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
     , xHatVec
     , woVec
     , xAfterVec ) =
-      foldl layerStep (inputLoadedSignal
+      foldl layerStep ( inputLoadedSignal
                       , repeat (pure False)
                       , repeat (pure False)
                       , repeat (pure False)
                       , repeat (pure (repeat 0))
                       , repeat (pure (repeat 0))
-                      , repeat (pure (repeat 0)))
+                      , repeat (pure (repeat 0)) )
             (zip3 transformerLayers cacheOwners indicesI)
 
   -- Select “this layer” done signals using the current FSM layer index
@@ -163,7 +192,7 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
         indicesI
 
   tapSelected = firstJustV <$> sequenceA tapPayloadPerLayer
-  tapValid = isJust <$> tapSelected
+  tapValid    = isJust <$> tapSelected
 
   tapLayerIdxOut = regEn 0           tapValid ((\(l,_,_,_,_) -> l) . fromJustX <$> tapSelected)
   tapSeqPosOut   = regEn 0           tapValid ((\(_,p,_,_,_) -> p) . fromJustX <$> tapSelected)

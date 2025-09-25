@@ -7,7 +7,6 @@ module Model.Core.Types
   , BankDepth
   , BankAddress
   , CacheDepth
-  , CacheAddress
   , TrueDualPortRunner
   , Token
   , Temperature
@@ -101,7 +100,6 @@ type BankAddress = Index BankDepth
 
 -- Global KV-cache geometry (all layers × KV heads × seq × headDim)
 type CacheDepth   = NumLayers GHC.TypeNats.* NumKeyValueHeads GHC.TypeNats.* SeqLen GHC.TypeNats.* HeadDimension
-type CacheAddress = Index CacheDepth
 
 -- Dual-port RAM runner type (true dual port)
 type TrueDualPortRunner dom n a =
@@ -116,18 +114,12 @@ type TrueDualPortRunner dom n a =
 -- Multi-Cycle State Machine
 -- ============================================================================
 
--- FSM stages for each layer:
---   1. ReadCache      (load K/V from RAM)
---   2. ComputeQKV     (compute Q/K/V from input)
---   3. ComputeAttention (stream attention)
---   4. WriteCache     (store new K/V to RAM)
---   5. ComputeFeedForward (FFN)
 data CycleStage =
-    Stage1_LoadKV
-  | Stage2_ProjectQKV
-  | Stage3_Attend
-  | Stage4_WriteKV
-  | Stage5_FeedForward
+    Stage1_ProjectQKV      -- compute Q,K,V for current layer & pos
+  | Stage2_WriteKV         -- write K,V(pos) to cache
+  | Stage3_Attend          -- read 0..pos and attend (Q uses current pos)
+  | Stage4_FeedForward     -- FFN and residual
+  | Stage5_Bookkeeping     -- layer+pos bookkeeping; raises readyPulse at last layer
   deriving (Show, Eq, Enum, Bounded, Generic)
 
 instance NFDataX CycleStage where

@@ -8,7 +8,7 @@ import Model.Core.Types (NumLayers, SeqLen, ProcessingState(..), CycleStage(..))
 
 initialProcessingState :: ProcessingState
 initialProcessingState = ProcessingState
-  { processingStage  = Stage1_LoadKV
+  { processingStage  = Stage1_ProjectQKV
   , processingLayer  = 0
   , sequencePosition = 0
   }
@@ -16,20 +16,22 @@ initialProcessingState = ProcessingState
 -- Single state transition function (one step)
 nextProcessingState :: ProcessingState -> ProcessingState
 nextProcessingState state = case processingStage state of
-  Stage1_LoadKV      -> state { processingStage = Stage2_ProjectQKV }
-  Stage2_ProjectQKV  -> state { processingStage = Stage3_Attend }
-  Stage3_Attend      -> state { processingStage = Stage4_WriteKV }
-  Stage4_WriteKV     -> state { processingStage = Stage5_FeedForward }
-  Stage5_FeedForward ->
+  Stage1_ProjectQKV -> state { processingStage = Stage2_WriteKV }
+  Stage2_WriteKV    -> state { processingStage = Stage3_Attend }
+  Stage3_Attend     -> state { processingStage = Stage4_FeedForward }
+  Stage4_FeedForward ->
     if processingLayer state == maxBound
-      then state { processingStage  = Stage1_LoadKV
-                 , processingLayer  = 0
-                 , sequencePosition = if sequencePosition state == maxBound
-                                        then 0 else succ (sequencePosition state)
-                 }
-      else state { processingStage  = Stage1_LoadKV
+      then state { processingStage  = Stage5_Bookkeeping }
+      else state { processingStage  = Stage1_ProjectQKV
                  , processingLayer  = succ (processingLayer state)
                  }
+  Stage5_Bookkeeping ->
+    state { processingStage  = Stage1_ProjectQKV
+          , processingLayer  = 0
+          , sequencePosition =
+              if sequencePosition state == maxBound
+                then 0 else succ (sequencePosition state)
+          }
 
 data PipelineOutputs dom = PipelineOutputs
   { processingState   :: Signal dom ProcessingState
@@ -55,20 +57,20 @@ runPipelineController attnDoneThisLayer writeDoneThisLayer = outs
   posIx    = sequencePosition <$> procState
 
   isLastLayerFFN =
-    liftA2 (\ps _ -> processingStage ps == Stage5_FeedForward
+    liftA2 (\ps _ -> processingStage ps == Stage4_FeedForward
                   && processingLayer ps == maxBound)
            procState (pure ())
   readyPulseRaw =
     let rising now prev = now && not prev
-    in liftA2 rising isLastLayerFFN (register False isLastLayerFFN)
+    in  liftA2 rising isLastLayerFFN (register False isLastLayerFFN)
 
   isStage st = (== st) <$> stageSig
   stageFinishedSig =
-    mux (isStage Stage1_LoadKV)      (pure True)               $
-    mux (isStage Stage2_ProjectQKV)  (pure True)               $
-    mux (isStage Stage3_Attend)      attnDoneThisLayer         $
-    mux (isStage Stage4_WriteKV)     writeDoneThisLayer        $
-    mux (isStage Stage5_FeedForward) (not <$> readyPulseRaw)   $
+    mux (isStage Stage1_ProjectQKV) (pure True)             $
+    mux (isStage Stage2_WriteKV)    writeDoneThisLayer      $
+    mux (isStage Stage3_Attend)     attnDoneThisLayer       $
+    mux (isStage Stage4_FeedForward)(not <$> readyPulseRaw) $
+    mux (isStage Stage5_Bookkeeping)(pure True)             $
     pure False
 
   outs = PipelineOutputs
