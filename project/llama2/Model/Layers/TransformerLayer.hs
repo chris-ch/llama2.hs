@@ -1,15 +1,14 @@
 module Model.Layers.TransformerLayer (
-    transformerLogits
-    , multiCycleTransformerLayer
+    multiCycleTransformerLayer
     , TransformerDecoderComponent(..)
     , TransformerLayerComponent(..)
 ) where
 
 import Clash.Prelude
-import Model.Core.Types (ModelDim, VocabSize, CArray2D (..), EmbeddingComponent (..),
+import Model.Core.Types (ModelDim, EmbeddingComponent (..),
     NumLayers, NumQueryHeads, NumKeyValueHeads,
     HeadDimension, ProcessingState (..), IntermediateData (..), CycleStage (..))
-import Helpers (rmsNorm, dotProduct, matrixVectorMult, liftA4)
+import Helpers (rmsNorm, matrixVectorMult, liftA4)
 
 import qualified Model.Memory.KVCacheBank as Cache
 import qualified Model.Layers.FeedForward.FeedForwardNetwork as FeedForwardNetwork
@@ -27,15 +26,6 @@ data TransformerDecoderComponent = TransformerDecoderComponent
   { modelEmbedding :: EmbeddingComponent,
     modelLayers :: Vec NumLayers TransformerLayerComponent
   } deriving (Show)
-
--- classifier logits for a given token vector
-transformerLogits :: TransformerDecoderComponent -> Vec ModelDim Float -> Vec VocabSize Float
-transformerLogits decoder tokenVector = logits where
-    vocab = vocabulary (modelEmbedding decoder)
-    rmsWeight = rmsFinalWeight (modelEmbedding decoder)
-    tokenWithRms = rmsNorm tokenVector rmsWeight
-    CArray2D vocabRows = vocab
-    logits = map (`dotProduct` tokenWithRms) vocabRows
 
 multiCycleTransformerLayer
   :: HiddenClockResetEnable dom

@@ -29,7 +29,6 @@ executable llama2
     Model.Core.Types,
     Model.Core.PipelineController,
     Model.Embedding.PRNG,
-    Model.Embedding.TokenEmbedding,
     Model.Layers.Attention.MultiHeadAttention,
     Model.Layers.Attention.AttentionHead,
     Model.Layers.FeedForward.FeedForwardNetwork,
