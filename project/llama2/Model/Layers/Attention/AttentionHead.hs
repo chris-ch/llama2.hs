@@ -1,6 +1,5 @@
 module Model.Layers.Attention.AttentionHead (
     AttentionCache(..)
-  , initAttentionCache
   , streamHeadAttentionAddrIO
 ) where
 

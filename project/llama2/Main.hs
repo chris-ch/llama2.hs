@@ -40,7 +40,6 @@ import Model.Core.Types
 import qualified Model.Top as Top ( topEntity )
 import qualified Tokenizer as T (buildTokenizer, encodeTokens, Tokenizer, decodePiece)
 import Model.Layers.TransformerLayer (TransformerDecoderComponent (..), TransformerLayerComponent (..))
-import qualified Model.Layers.TransformerLayer as Layer
 import qualified Model.Layers.FeedForward.FeedForwardNetwork as FeedForwardNetwork
 import qualified Model.Layers.Attention.MultiHeadAttention as MultiHeadAttention
 import GHC.Base (when)
@@ -98,7 +97,7 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
   putStrLn "<s>"
   startTime <- getPOSIXTime
 
-  (_, Layer.StepCount countTokens) <- generateTokensSimAutoregressive config tokenizer (fromIntegral steps) promptTokens temperature seedValue
+  (_, MultiHeadAttention.StepCount countTokens) <- generateTokensSimAutoregressive config tokenizer (fromIntegral steps) promptTokens temperature seedValue
 
   endTime <- getPOSIXTime
   let duration :: Integer
@@ -306,7 +305,7 @@ generateTokensSimAutoregressive
   -> [Token]
   -> Temperature
   -> Seed
-  -> IO ([Token], Layer.StepCount)
+  -> IO ([Token], MultiHeadAttention.StepCount)
 generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperature seed = do
 
   putStrLn $ "✅ Prompt: " ++ show promptTokens
@@ -419,7 +418,7 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
   putStrLn ""
 
   let generated = take (fromIntegral nSteps) (drop promptLen emittedLimited)
-  pure (generated, Layer.StepCount nSteps)
+  pure (generated, MultiHeadAttention.StepCount nSteps)
 
 bundledOutputs
   :: TransformerDecoderComponent
