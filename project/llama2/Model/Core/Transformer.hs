@@ -78,6 +78,8 @@ multiCycleTransformer
      , Signal dom (Vec ModelDim Float)
      , Signal dom (Vec ModelDim Float)
      , Signal dom (Vec ModelDim Float)
+     , Signal dom (Vec ModelDim Float)
+     , Signal dom (Vec ModelDim Float)
      )
 multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal seedSignal =
   ( outputTokenSignal (PipelineController.readyPulse ctrl) temperatureSignal seedSignal decoder nextIntermediateDataSignal
@@ -89,6 +91,8 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
   , dbgConcatHeadsOut
   , dbgWoOut
   , dbgXAfterOut
+  , dbgKAtPosOut
+  , dbgVAtPosOut
   )
  where
   embeddingComponent      = modelEmbedding decoder
@@ -121,7 +125,10 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
        , Vec NumLayers (Signal dom (Vec ModelDim Float))
        , Vec NumLayers (Signal dom (Vec ModelDim Float))
        , Vec NumLayers (Signal dom (Vec ModelDim Float))
-       , Vec NumLayers (Signal dom (Vec ModelDim Float)) )
+       , Vec NumLayers (Signal dom (Vec ModelDim Float))
+       , Vec NumLayers (Signal dom (Vec ModelDim Float))
+       , Vec NumLayers (Signal dom (Vec ModelDim Float))
+        )
     -> (TransformerLayer.TransformerLayerComponent, Cache.KVRamOwner dom, Index NumLayers)
     -> ( Signal dom IntermediateData
        , Vec NumLayers (Signal dom Bool)
@@ -130,10 +137,13 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
        , Vec NumLayers (Signal dom (Vec ModelDim Float))
        , Vec NumLayers (Signal dom (Vec ModelDim Float))
        , Vec NumLayers (Signal dom (Vec ModelDim Float))
-       , Vec NumLayers (Signal dom (Vec ModelDim Float)) )
-  layerStep (currData, wDoneVec, attnDoneVec, tapVecIn, xHatVecIn, concatHeadsVecIn, woVecIn, xaaVecIn)
+       , Vec NumLayers (Signal dom (Vec ModelDim Float)) 
+       , Vec NumLayers (Signal dom (Vec ModelDim Float))
+       , Vec NumLayers (Signal dom (Vec ModelDim Float))
+       )
+  layerStep (currData, wDoneVec, attnDoneVec, tapVecIn, xHatVecIn, concatHeadsVecIn, woVecIn, xaaVecIn, kPosVecIn, vPosVecIn)
             (layerComp, cacheOwner, lIx) =
-    let (newData, wDone, attnDone, commitC3, tapPulse, dbgXHat, dbgConcatHeads, dbgWo, dbgXAfter) =
+    let (newData, wDone, attnDone, commitC3, tapPulse, dbgXHat, dbgConcatHeads, dbgWo, dbgXAfter, dbgKPos, dbgVPos) =
           TransformerLayer.multiCycleTransformerLayer layerComp cacheOwner lIx (PipelineController.processingState ctrl) currData
         -- During Stage3_Attend we use the commitC3 view; otherwise, use newData.
         selectedData =
@@ -153,6 +163,8 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
         , replace lIx dbgConcatHeads concatHeadsVecIn
         , replace lIx dbgWo    woVecIn
         , replace lIx dbgXAfter xaaVecIn
+        , replace lIx dbgKPos  kPosVecIn
+        , replace lIx dbgVPos  vPosVecIn 
         )
 
   ( nextIntermediateDataSignal
@@ -162,7 +174,10 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
     , xHatVec
     , chVec
     , woVec
-    , xAfterVec ) =
+    , xAfterVec 
+    , kPosVec
+    , vPosVec
+    ) =
       foldl layerStep ( inputLoadedSignal
                       , repeat (pure False)
                       , repeat (pure False)
@@ -170,7 +185,10 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
                       , repeat (pure (repeat 0))
                       , repeat (pure (repeat 0))
                       , repeat (pure (repeat 0))
-                      , repeat (pure (repeat 0)) )
+                      , repeat (pure (repeat 0)) 
+                      , repeat (pure (repeat 0))
+                      , repeat (pure (repeat 0))
+                      )
             (zip3 transformerLayers cacheOwners indicesI)
 
   -- Select “this layer” done signals using the current FSM layer index
@@ -187,7 +205,10 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
                                         , Vec ModelDim Float
                                         , Vec ModelDim Float
                                         , Vec ModelDim Float
-                                        , Vec ModelDim Float )))
+                                        , Vec ModelDim Float 
+                                        , Vec ModelDim Float
+                                        , Vec ModelDim Float
+                                        )))
   tapPayloadPerLayer =
     map (\lIx ->
           let pulse = tapVec    !! lIx
@@ -195,7 +216,9 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
               wo    = woVec     !! lIx
               ch    = chVec     !! lIx
               xa    = xAfterVec !! lIx
-              tup   = bundle (pure lIx, PipelineController.seqPos ctrl, xh, ch, wo, xa)
+              kpos = kPosVec !! lIx
+              vpos = vPosVec !! lIx
+              tup   = bundle (pure lIx, PipelineController.seqPos ctrl, xh, ch, wo, xa, kpos, vpos)
           in mux pulse (Just <$> tup) (pure Nothing)
         )
         indicesI
@@ -203,9 +226,11 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
   tapSelected = firstJustV <$> sequenceA tapPayloadPerLayer
   tapValid    = isJust <$> tapSelected
 
-  tapLayerIdxOut    = regEn 0           tapValid ((\(l,_,_,_,_,_) -> l) . fromJustX <$> tapSelected)
-  tapSeqPosOut      = regEn 0           tapValid ((\(_,p,_,_,_,_) -> p) . fromJustX <$> tapSelected)
-  dbgXHatOut        = regEn (repeat 0)  tapValid ((\(_,_,xh,_,_,_) -> xh) . fromJustX <$> tapSelected)
-  dbgConcatHeadsOut = regEn (repeat 0)  tapValid ((\(_,_,_,ch,_,_) -> ch) . fromJustX <$> tapSelected)
-  dbgWoOut          = regEn (repeat 0)  tapValid ((\(_,_,_,_,wo,_) -> wo) . fromJustX <$> tapSelected)
-  dbgXAfterOut      = regEn (repeat 0)  tapValid ((\(_,_,_,_,_,xa) -> xa) . fromJustX <$> tapSelected)
+  tapLayerIdxOut    = regEn 0           tapValid ((\(l,_,_,_,_,_,_,_) -> l) . fromJustX <$> tapSelected)
+  tapSeqPosOut      = regEn 0           tapValid ((\(_,p,_,_,_,_,_,_) -> p) . fromJustX <$> tapSelected)
+  dbgXHatOut        = regEn (repeat 0)  tapValid ((\(_,_,xh,_,_,_,_,_) -> xh) . fromJustX <$> tapSelected)
+  dbgConcatHeadsOut = regEn (repeat 0)  tapValid ((\(_,_,_,ch,_,_,_,_) -> ch) . fromJustX <$> tapSelected)
+  dbgWoOut          = regEn (repeat 0)  tapValid ((\(_,_,_,_,wo,_,_,_) -> wo) . fromJustX <$> tapSelected)
+  dbgXAfterOut      = regEn (repeat 0)  tapValid ((\(_,_,_,_,_,xa,_,_) -> xa) . fromJustX <$> tapSelected)
+  dbgKAtPosOut      = regEn (repeat 0) tapValid ((\(_,_,_,_,_,_,k,_) -> k) . fromJustX <$> tapSelected)
+  dbgVAtPosOut      = regEn (repeat 0) tapValid ((\(_,_,_,_,_,_,_,v) -> v) . fromJustX <$> tapSelected)

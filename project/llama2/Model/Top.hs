@@ -29,6 +29,8 @@ topEntity
      , Signal dom (Vec ModelDim Float) -- dbgConcatHeads (pre-WO)
      , Signal dom (Vec ModelDim Float) -- dbgWOHeads
      , Signal dom (Vec ModelDim Float) -- dbgXAfterAttn
+     , Signal dom (Vec ModelDim Float) -- dbgKAtPos
+     , Signal dom (Vec ModelDim Float) -- dbgVAtPos
      )
 topEntity decoder =
   Transformer.multiCycleTransformer decoder (repeat Cache.makeRamOwnerKV)

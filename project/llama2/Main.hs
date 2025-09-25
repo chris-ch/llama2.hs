@@ -318,18 +318,27 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
 
   let outputs :: [( Token, Bool, Bool
                   , C.Index NumLayers, C.Index SeqLen
-                  , C.Vec ModelDim Float, C.Vec ModelDim Float, C.Vec ModelDim Float, C.Vec ModelDim Float)]
+                  , C.Vec ModelDim Float
+                  , C.Vec ModelDim Float
+                  ,  C.Vec ModelDim Float
+                  ,  C.Vec ModelDim Float
+                  ,  C.Vec ModelDim Float
+                  ,  C.Vec ModelDim Float
+                    )
+                    ]
       outputs = CS.simulate (bundledOutputs decoder) (DL.zip3 tokenStream temps seeds)
 
-      outTokens      = [ t  | (t, _, _, _, _, _, _, _, _) <- outputs ]
-      readyFlags     = [ r  | (_, r, _, _, _, _, _, _, _) <- outputs ]
-      tapFlags       = [ tp | (_, _, tp, _, _, _, _, _, _) <- outputs ]
-      tapLayers      = [ l  | (_, _, _, l, _, _, _, _, _) <- outputs ]
-      tapSeqs        = [ p  | (_, _, _, _, p, _, _, _, _) <- outputs ]
-      dbgXHats       = [ xv | (_, _, _, _, _, xv, _, _, _) <- outputs ]
-      dbgConcatHeads = [ ch | (_, _, _, _, _, _, ch, _, _) <- outputs ]
-      dbgWOs         = [ wv | (_, _, _, _, _, _, _, wv, _) <- outputs ]
-      dbgXAfters     = [ av | (_, _, _, _, _, _, _, _, av) <- outputs ]
+      outTokens      = [ t  | (t, _, _, _, _, _, _, _, _, _, _) <- outputs ]
+      readyFlags     = [ r  | (_, r, _, _, _, _, _, _, _, _, _) <- outputs ]
+      tapFlags       = [ tp | (_, _, tp, _, _, _, _, _, _, _, _) <- outputs ]
+      tapLayers      = [ l  | (_, _, _, l, _, _, _, _, _, _, _) <- outputs ]
+      tapSeqs        = [ p  | (_, _, _, _, p, _, _, _, _, _, _) <- outputs ]
+      dbgXHats       = [ xv | (_, _, _, _, _, xv, _, _, _, _, _) <- outputs ]
+      dbgConcatHeads = [ ch | (_, _, _, _, _, _, ch, _, _, _, _) <- outputs ]
+      dbgWOs         = [ wv | (_, _, _, _, _, _, _, wv, _, _, _) <- outputs ]
+      dbgXAfters     = [ av | (_, _, _, _, _, _, _, _, av, _, _) <- outputs ]
+      dbgKAtPos      = [ k | (_, _, _, _, _, _, _, _, _, k, _) <- outputs ]
+      dbgVAtPos      = [ v | (_, _, _, _, _, _, _, _, _, _, v) <- outputs ]
 
       tokenStream :: [Token]
       tokenStream =
@@ -349,7 +358,7 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
           drive cur _ _ _ = repeat cur
 
       sampledAll :: [Token]
-      sampledAll = [ t | (t,r,_,_,_,_,_,_,_) <- outputs, r ]
+      sampledAll = [ t | (t,r,_,_,_,_,_,_,_,_,_) <- outputs, r ]
 
   -- Print taps with layer/pos labeling aligned to the C trace:
   -- For taps coming from the last layer, display P+1 (the C log prints the next pos after sampling).
@@ -365,9 +374,9 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
         let lInt = fromEnum l
             pAdj = if l == maxBound then succIdx p else p
         in (lInt, fromEnum pAdj)
-  let tokens = map (\(t,_,_,_,_,_,_,_,_) -> t) outputs
+  let tokens = map (\(t,_,_,_,_,_,_,_,_,_,_) -> t) outputs
   mapM_
-    (\(tok, tp, l, p, xhat, ch, woh, xaa) -> do
+    (\(tok, tp, l, p, xhat, ch, woh, xaa, k, v) -> do
         when tp $ do
           let (lI, pI) = showPos l p
           -- Token (decoded as a piece) – you can also print the raw integer
@@ -383,6 +392,10 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
           -- 3️⃣  Rest of the diagnostics
           putStrLn $ "xHat=" ++ fmt8 xhat
           putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
+          putStrLn $ "k=" ++ fmt8 k
+          putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
+          putStrLn $ "v=" ++ fmt8 v
+          putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
           putStrLn $ "Concat@heads=" ++ fmt8 ch
           putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
           putStrLn $ "WO@heads=" ++ fmt8 woh
@@ -391,14 +404,17 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
 
           hFlush stdout
     )
-    (zip8 tokens   -- token stream
+    (zip10 tokens   -- token stream
             tapFlags
             tapLayers
             tapSeqs
             dbgXHats
             dbgConcatHeads
             dbgWOs
-            dbgXAfters)
+            dbgXAfters
+            dbgKAtPos
+            dbgVAtPos
+            )
 
   -- Stream tokens as soon as they are ready
   let streamTokens :: [Token] -> IO ()
@@ -426,10 +442,10 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
 
 -- | Zip eight lists together.
 --   The resulting list is as long as the shortest input list.
-zip8 :: [a] -> [b] -> [c] -> [d] -> [e] -> [f] -> [g] -> [h] -> [(a,b,c,d,e,f,g,h)]
-zip8 (a:as) (b:bs) (c:cs) (d:ds) (e:es) (f:fs) (g:gs) (h:hs) =
-    (a,b,c,d,e,f,g,h) : zip8 as bs cs ds es fs gs hs
-zip8 _ _ _ _ _ _ _ _ = []   -- stop when any list runs out
+zip10 :: [a] -> [b] -> [c] -> [d] -> [e] -> [f] -> [g] -> [h] -> [i] -> [j] -> [(a,b,c,d,e,f,g,h,i,j)]
+zip10 (a:as) (b:bs) (c:cs) (d:ds) (e:es) (f:fs) (g:gs) (h:hs) (i:is) (j:js) =
+    (a,b,c,d,e,f,g,h,i,j) : zip10 as bs cs ds es fs gs hs is js
+zip10 _ _ _ _ _ _ _ _ _ _ = []   -- stop when any list runs out
 
 bundledOutputs
   :: TransformerDecoderComponent
@@ -442,7 +458,10 @@ bundledOutputs
                          , C.Vec ModelDim Float
                          , C.Vec ModelDim Float
                          , C.Vec ModelDim Float
-                         , C.Vec ModelDim Float )
+                         , C.Vec ModelDim Float 
+                         , C.Vec ModelDim Float
+                         , C.Vec ModelDim Float 
+                         )
 bundledOutputs decoder =
   C.bundle . C.exposeClockResetEnable
     (topEntityBundled @CS.System decoder)
@@ -462,7 +481,10 @@ topEntityBundled :: CS.HiddenClockResetEnable dom
     , C.Signal dom (C.Vec ModelDim Float)
     , C.Signal dom (C.Vec ModelDim Float)
     , C.Signal dom (C.Vec ModelDim Float)
-    , C.Signal dom (C.Vec ModelDim Float ))
+    , C.Signal dom (C.Vec ModelDim Float )
+    , C.Signal dom (C.Vec ModelDim Float) -- dbgKAtPos
+    , C.Signal dom (C.Vec ModelDim Float) -- dbgVAtPos
+    )
 topEntityBundled decoder bundledInputs =
   Top.topEntity decoder inputToken temp rngSeed
   where

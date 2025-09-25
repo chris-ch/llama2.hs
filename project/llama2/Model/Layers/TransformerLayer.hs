@@ -43,7 +43,9 @@ multiCycleTransformerLayer
      , Signal dom (Vec ModelDim Float)         -- dbgXHat
      , Signal dom (Vec ModelDim Float)         -- dbgConcatHeads  (pre-WO)
      , Signal dom (Vec ModelDim Float)         -- dbgWOHeads      (sum of per-head WO)
-     , Signal dom (Vec ModelDim Float) )       -- dbgXAfterAttn   (residual add)
+     , Signal dom (Vec ModelDim Float)         -- dbgXAfterAttn   (residual add)
+     , Signal dom (Vec ModelDim Float)   -- dbgKAtPos (concat all KV heads)
+     , Signal dom (Vec ModelDim Float) ) -- dbgVAtPos (concat all KV heads)
 multiCycleTransformerLayer layer kvRamOwner layerIndex processingStateSignal intermediateDataSignal =
   ( nextIntermediateDataSignal
   , writeDoneThisLayerSignal
@@ -54,10 +56,16 @@ multiCycleTransformerLayer layer kvRamOwner layerIndex processingStateSignal int
   , concatHeadsSignal
   , woHeadsSignal
   , xAfterAttnSignal
+  , kAtPosSignal
+  , vAtPosSignal
   )
  where
   mha  = multiHeadAttention layer
   ffn  = feedforwardNetwork layer
+
+  -- K/V after RoPE for active layer/pos (as produced in Stage1)
+  kAtPosSignal = CV.concat . keyVectors  <$> intermediateDataSignal
+  vAtPosSignal = CV.concat . valueVectors <$> intermediateDataSignal
 
   -- Drive all KV banks; collect per-head outputs, head-done pulses, and per-bank write-done
   (perHeadOutputSignalsVec, perHeadDoneSignalsVec, perBankWriteDoneVec) =
