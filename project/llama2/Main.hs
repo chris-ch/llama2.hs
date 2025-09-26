@@ -64,18 +64,29 @@ runModel modelFileContent tokenizerFileContent temperature steps prompt seed = d
     initModel = BG.runGet parseModelConfigFile
     config    = initModel modelFileContent
     tokenizer = T.buildTokenizer tokenizerFileContent (C.natToNum @VocabSize)
-    prompt'   = fromMaybe "" prompt
-  let
-    promptTokensI = T.encodeTokens tokenizer (BSC.pack prompt') True False
-    promptTokens  = map fromIntegral promptTokensI :: [Token]
-
-  -- After promptTokens are built:
-  case promptTokens of
-    (t0:t1:_) -> do
-      putStrLn $ "[TRACE] token0=" ++ show t0
-      putStrLn $ "[TRACE] token1=" ++ show t1
-      -- Run pure tracer: compares directly to your C prints for pos 0 and pos 1
-    _ -> putStrLn "Need at least two tokens in the prompt to run pos0/pos1 tracer."
+    
+  -- Handle prompt tokenization more carefully
+  promptTokens <- case prompt of
+    Nothing -> do
+      -- No prompt provided, start with BOS token only
+      putStrLn "No prompt provided, starting with BOS token (1)"
+      return [1]
+    Just promptStr -> do
+      let promptTokensI = T.encodeTokens tokenizer (BSC.pack promptStr) True False
+          promptTokens' = map fromIntegral promptTokensI :: [Token]
+      case promptTokens' of
+        [] -> do
+          -- Empty tokenization, ensure we have BOS
+          putStrLn "Empty tokenization, adding BOS token (1)"
+          return [1]
+        (1:_) -> do
+          -- Already starts with BOS, good
+          putStrLn $ "Prompt already starts with BOS: " ++ show promptTokens'
+          return promptTokens'
+        _ -> do
+          -- Doesn't start with BOS, prepend it
+          putStrLn $ "Prepending BOS to prompt tokens: " ++ show (1 : promptTokens')
+          return (1 : promptTokens')
 
   putStrLn "✅ model loaded successfully"
 
