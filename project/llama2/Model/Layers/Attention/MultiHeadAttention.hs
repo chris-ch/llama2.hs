@@ -9,6 +9,7 @@ import Model.Core.Types (NumQueryHeads, ModelDim, NumKeyValueHeads,
   FreqDim, RotaryEncodingComponent (..), ProcessingState (..))
 import Helpers (matrixVectorMult, rmsNorm)
 import qualified Prelude as P
+import Debug.Trace (trace)
 
 newtype StepCount = StepCount (Unsigned 32) deriving (Show, Eq, Ord)
 
@@ -26,6 +27,11 @@ runSingleHeadQKV headComp normalizedInput = (q, k, v) where
     q = matrixVectorMult (wqHead headComp) normalizedInput  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
     k = matrixVectorMult (wkHead headComp) normalizedInput  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
     v = matrixVectorMult (wvHead headComp) normalizedInput  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
+
+    -- Trace a preview of wkHead before using it
+    CArray2D wK = wkHead headComp
+    !_ = trace ("wkHead row0 first 8 elems = " P.++ show (P.take 8 $ toList $ wK !! 0)) ()
+
 
 applyRotaryPositionEncoding :: Vec HeadDimension Float    -- input vector
   -> Vec FreqDim Float  -- cosFrequencies
