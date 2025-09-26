@@ -18,6 +18,7 @@ topEntity
    . HiddenClockResetEnable dom
   => TransformerLayer.TransformerDecoderComponent
   -> Signal dom Token  -- Input token
+  -> Signal dom Bool           -- ^ inputTokenValid: high when inputTokenSignal carries the prompt token (pos 0)
   -> Signal dom Temperature
   -> Signal dom Seed
   -> ( Signal dom Token                -- sampled token
@@ -32,5 +33,4 @@ topEntity
      , Signal dom (Vec ModelDim Float) -- dbgKAtPos
      , Signal dom (Vec ModelDim Float) -- dbgVAtPos
      )
-topEntity decoder =
-  Transformer.multiCycleTransformer decoder (repeat Cache.makeRamOwnerKV)
+topEntity decoder = Transformer.multiCycleTransformer decoder (repeat Cache.makeRamOwnerKV)

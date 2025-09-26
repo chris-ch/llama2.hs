@@ -27,7 +27,6 @@ import qualified Model.Core.PipelineController as PipelineController
   , PipelineOutputs (..)
   )
 
--- Initial contents for the per-token IntermediateData wave
 initialIntermediateData :: IntermediateData
 initialIntermediateData = IntermediateData
   { inputVector       = repeat 0
@@ -38,7 +37,6 @@ initialIntermediateData = IntermediateData
   , feedForwardOutput = repeat 0
   }
 
--- Feed logits into the sampler and register the chosen token on readyPulse
 outputTokenSignal
   :: forall dom
    . HiddenClockResetEnable dom
@@ -52,21 +50,19 @@ outputTokenSignal readyPulseSignal temperatureSignal seedSignal decoder nextInte
   regEn 0 readyPulseSignal
         (PRNG.sampledTokenSignal readyPulseSignal temperatureSignal seedSignal decoder nextIntermediateDataSignal)
 
--- Token embedding lookup (tied weights are handled in the classifier elsewhere)
 embed :: CArray2D VocabSize ModelDim -> Token -> Vec ModelDim Float
 embed (CArray2D vocab) tokenCode = vocab !! (fromIntegral tokenCode :: Int)
 
--- Select first Just in a Vec
 firstJustV :: Vec n (Maybe a) -> Maybe a
 firstJustV = foldr (\m acc -> case m of { Just _ -> m; Nothing -> acc }) Nothing
 
--- Top transformer with centralized sequencing and cycle-aligned taps
 multiCycleTransformer
   :: forall dom
    . HiddenClockResetEnable dom
   => TransformerLayer.TransformerDecoderComponent
   -> Vec NumLayers (Cache.KVRamOwner dom)
   -> Signal dom Token
+  -> Signal dom Bool            -- ^ inputTokenValid (True while external prompt is used)
   -> Signal dom Temperature
   -> Signal dom Seed
   -> ( Signal dom Token
@@ -81,8 +77,8 @@ multiCycleTransformer
      , Signal dom (Vec ModelDim Float)
      , Signal dom (Vec ModelDim Float)
      )
-multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal seedSignal =
-  ( outputTokenSignal (PipelineController.readyPulse ctrl) temperatureSignal seedSignal decoder nextIntermediateDataSignal
+multiCycleTransformer decoder cacheOwners inputTokenSignal inputTokenValid temperatureSignal seedSignal =
+  ( selectedTokenSignal
   , PipelineController.readyPulse ctrl
   , tapValid
   , tapLayerIdxOut
@@ -95,17 +91,37 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
   , dbgVAtPosOut
   )
  where
-  embeddingComponent      = modelEmbedding decoder
-  transformerLayers       = modelLayers decoder
-  tokenEmbeddingSignal    = embed (vocabulary embeddingComponent) <$> inputTokenSignal
+  embeddingComponent = modelEmbedding decoder
+  transformerLayers  = modelLayers decoder
 
-  -- Storage for IntermediateData (registered once per cycle)
+  -- Done flags are selected after layer fan-in (mutual recursion via registers is fine)
+  writeDoneThisLayer = (!!) <$> sequenceA writeDoneVector <*> PipelineController.layerIndex ctrl
+  attnDoneThisLayer  = (!!) <$> sequenceA attnDoneVector  <*> PipelineController.layerIndex ctrl
+
+  -- Controller now takes inputTokenValid to gate Stage1 at layer 0 every position
+  ctrl = PipelineController.runPipelineController attnDoneThisLayer writeDoneThisLayer inputTokenValid
+
+  -- Feedback (sampled) token: latched on readyPulse
+  feedbackTokenSignal :: Signal dom Token
+  feedbackTokenSignal =
+    outputTokenSignal (PipelineController.readyPulse ctrl)
+                      temperatureSignal
+                      seedSignal
+                      decoder
+                      nextIntermediateDataSignal
+
+  -- External prompt overrides feedback whenever inputTokenValid is True
+  selectedTokenSignal :: Signal dom Token
+  selectedTokenSignal =
+    mux inputTokenValid inputTokenSignal feedbackTokenSignal
+
+  tokenEmbeddingSignal = embed (vocabulary embeddingComponent) <$> selectedTokenSignal
+
+  -- Per-position intermediate data register
   intermediateDataSignal = register initialIntermediateData nextIntermediateDataSignal
 
-  -- Load input at new Stage1 (ProjectQKV in Option B)
-  -- Layer 0 takes fresh token embedding; higher layers take previous layer's FFN output.
-  inputLoadedSignal ::
-       Signal dom IntermediateData
+  -- Load input for Stage1: L0 takes token embedding; higher layers take previous FFN
+  inputLoadedSignal :: Signal dom IntermediateData
   inputLoadedSignal =
     liftA3
       (\ps current tokenEmbedding ->
@@ -116,7 +132,7 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
            else current)
       (PipelineController.processingState ctrl) intermediateDataSignal tokenEmbeddingSignal
 
-  -- Per-layer step
+  -- One layer step
   layerStep
     :: ( Signal dom IntermediateData
        , Vec NumLayers (Signal dom Bool)
@@ -145,7 +161,6 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
             (layerComp, cacheOwner, lIx) =
     let (newData, wDone, attnDone, commitC3, tapPulse, dbgXHat, dbgConcatHeads, dbgWo, dbgXAfter, dbgKPos, dbgVPos) =
           TransformerLayer.multiCycleTransformerLayer layerComp cacheOwner lIx (PipelineController.processingState ctrl) currData
-        -- During Stage3_Attend we use the commitC3 view; otherwise, use newData.
         selectedData =
           liftA4
             (\ps oldD newD c3D ->
@@ -191,13 +206,6 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
                       )
             (zip3 transformerLayers cacheOwners indicesI)
 
-  -- Select “this layer” done signals using the current FSM layer index
-  writeDoneThisLayer = (!!) <$> sequenceA writeDoneVector <*> PipelineController.layerIndex ctrl
-  attnDoneThisLayer  = (!!) <$> sequenceA attnDoneVector  <*> PipelineController.layerIndex ctrl
-
-  -- Centralized FSM + readyPulse + stageFinished
-  ctrl = PipelineController.runPipelineController attnDoneThisLayer writeDoneThisLayer
-
   -- =================== Layer-accurate tap fan-in ====================
   tapPayloadPerLayer
     :: Vec NumLayers (Signal dom (Maybe ( Index NumLayers
@@ -216,8 +224,8 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
               wo    = woVec     !! lIx
               ch    = chVec     !! lIx
               xa    = xAfterVec !! lIx
-              kpos = kPosVec !! lIx
-              vpos = vPosVec !! lIx
+              kpos  = kPosVec   !! lIx
+              vpos  = vPosVec   !! lIx
               tup   = bundle (pure lIx, PipelineController.seqPos ctrl, xh, ch, wo, xa, kpos, vpos)
           in mux pulse (Just <$> tup) (pure Nothing)
         )
@@ -232,5 +240,5 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal temperatureSignal see
   dbgConcatHeadsOut = regEn (repeat 0)  tapValid ((\(_,_,_,ch,_,_,_,_) -> ch) . fromJustX <$> tapSelected)
   dbgWoOut          = regEn (repeat 0)  tapValid ((\(_,_,_,_,wo,_,_,_) -> wo) . fromJustX <$> tapSelected)
   dbgXAfterOut      = regEn (repeat 0)  tapValid ((\(_,_,_,_,_,xa,_,_) -> xa) . fromJustX <$> tapSelected)
-  dbgKAtPosOut      = regEn (repeat 0) tapValid ((\(_,_,_,_,_,_,k,_) -> k) . fromJustX <$> tapSelected)
-  dbgVAtPosOut      = regEn (repeat 0) tapValid ((\(_,_,_,_,_,_,_,v) -> v) . fromJustX <$> tapSelected)
+  dbgKAtPosOut      = regEn (repeat 0)  tapValid ((\(_,_,_,_,_,_,k,_) -> k) . fromJustX <$> tapSelected)
+  dbgVAtPosOut      = regEn (repeat 0)  tapValid ((\(_,_,_,_,_,_,_,v) -> v) . fromJustX <$> tapSelected)

@@ -318,65 +318,69 @@ generateTokensSimAutoregressive
   -> Seed
   -> IO ([Token], MultiHeadAttention.StepCount)
 generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperature seed = do
-
   putStrLn $ "✅ Prompt: " ++ show promptTokens
   putStr "<s>\n"
   putStr "Generated: "
   hFlush stdout
 
-  let temps   = repeat temperature
-      seeds   = repeat seed
+  let temps = repeat temperature
+      seeds = repeat seed
 
-  let outputs :: [( Token, Bool, Bool
+      (cur0, restPrompt0) =
+        case promptTokens of
+          (t0:ts) -> (t0, ts)
+          []      -> (1,  [])  -- BOS fallback
+
+      -- Run DUT; inputs depend on outputs only through tails (breaks <<loop>>)
+      outputs :: [( Token, Bool, Bool
                   , C.Index NumLayers, C.Index SeqLen
                   , C.Vec ModelDim Float
                   , C.Vec ModelDim Float
-                  ,  C.Vec ModelDim Float
-                  ,  C.Vec ModelDim Float
-                  ,  C.Vec ModelDim Float
-                  ,  C.Vec ModelDim Float
-                    )
-                    ]
-      outputs = CS.simulate (bundledOutputs decoder) (DL.zip3 tokenStream temps seeds)
+                  , C.Vec ModelDim Float
+                  , C.Vec ModelDim Float
+                  , C.Vec ModelDim Float
+                  , C.Vec ModelDim Float)]
+      outputs =
+        CS.simulate (bundledOutputs decoder)
+                    (DL.zip4 tokenStream inputValids temps seeds)
 
-      outTokens      = [ t  | (t, _, _, _, _, _, _, _, _, _, _) <- outputs ]
-      readyFlags     = [ r  | (_, r, _, _, _, _, _, _, _, _, _) <- outputs ]
-      tapFlags       = [ tp | (_, _, tp, _, _, _, _, _, _, _, _) <- outputs ]
-      tapLayers      = [ l  | (_, _, _, l, _, _, _, _, _, _, _) <- outputs ]
-      tapSeqs        = [ p  | (_, _, _, _, p, _, _, _, _, _, _) <- outputs ]
-      dbgXHats       = [ xv | (_, _, _, _, _, xv, _, _, _, _, _) <- outputs ]
-      dbgConcatHeads = [ ch | (_, _, _, _, _, _, ch, _, _, _, _) <- outputs ]
-      dbgWOs         = [ wv | (_, _, _, _, _, _, _, wv, _, _, _) <- outputs ]
-      dbgXAfters     = [ av | (_, _, _, _, _, _, _, _, av, _, _) <- outputs ]
-      dbgKAtPos      = [ k | (_, _, _, _, _, _, _, _, _, k, _) <- outputs ]
-      dbgVAtPos      = [ v | (_, _, _, _, _, _, _, _, _, _, v) <- outputs ]
+      outTokens  = [ t | (t,_,_,_,_,_,_,_,_,_,_) <- outputs ]
+      readyFlags = [ r | (_,r,_,_,_,_,_,_,_,_,_) <- outputs ]
 
-      tokenStream :: [Token]
-      tokenStream =
-        let (cur0, restPrompt) =
-              case promptTokens of
-                (t0:ts) -> (t0, ts)
-                []      -> (1, [])
-        in drive cur0 restPrompt readyFlags outTokens
-        where
-          drive :: Token -> [Token] -> [Bool] -> [Token] -> [Token]
-          drive cur ps (r:rs) (o:os) =
-            cur : if not r
-                    then drive cur ps rs os
-                    else case ps of
-                           (p:ps') -> drive p  ps'  rs os
-                           []      -> drive o  []    rs os
-          drive cur _ _ _ = repeat cur
+      -- State per cycle n>=0: (currentToken, remainingPrompt, usingPrompt?)
+      -- Cycle 0 is seeded; tail states are built from (ready, sampled) tails
+      rTail = drop 1 readyFlags
+      oTail = drop 1 outTokens
+
+      step :: (Token, [Token], Bool) -> (Bool, Token) -> (Token, [Token], Bool)
+      step (cur, ps, usingP) (r, o)
+        | not r     = (cur, ps, usingP)                  -- hold until ready
+        | otherwise = case ps of
+            (p:ps') -> (p, ps', True)                    -- still consuming prompt
+            []      -> (o, [],  False)                   -- switch to sampled
+
+      statesTail = Prelude.scanl step (cur0, restPrompt0, True) (Prelude.zip rTail oTail)
+
+      tokenStream  = cur0  : [ cur  | (cur,_,_) <- statesTail ]
+      inputValids  = True  : [ useP | (_,_,useP) <- statesTail ]
+
+      tapFlags       = [ tp | (_,_,tp,_,_,_,_,_,_,_,_) <- outputs ]
+      tapLayers      = [ l  | (_,_,_,l,_,_,_,_,_,_,_) <- outputs ]
+      tapSeqs        = [ p  | (_,_,_,_,p,_,_,_,_,_,_) <- outputs ]
+      dbgXHats       = [ xv | (_,_,_,_,_,xv,_,_,_,_,_) <- outputs ]
+      dbgConcatHeads = [ ch | (_,_,_,_,_,_,ch,_,_,_,_) <- outputs ]
+      dbgWOs         = [ wv | (_,_,_,_,_,_,_,wv,_,_,_) <- outputs ]
+      dbgXAfters     = [ av | (_,_,_,_,_,_,_,_,av,_,_) <- outputs ]
+      dbgKAtPos      = [ k  | (_,_,_,_,_,_,_,_,_,k,_) <- outputs ]
+      dbgVAtPos      = [ v  | (_,_,_,_,_,_,_,_,_,_,v) <- outputs ]
 
       sampledAll :: [Token]
       sampledAll = [ t | (t,r,_,_,_,_,_,_,_,_,_) <- outputs, r ]
 
-  -- Print taps with layer/pos labeling aligned to the C trace:
-  -- For taps coming from the last layer, display P+1 (the C log prints the next pos after sampling).
+  -- Pretty-print taps
   let fmt8 :: C.Vec n Float -> String
-      fmt8 v = unwords (DL.map show (DL.take 8 (C.toList v)))
+      fmt8 v = unwords (Prelude.map show (Prelude.take 8 (C.toList v)))
 
-      -- saturated succ for Index
       succIdx :: forall n. (Bounded (C.Index n), Enum (C.Index n)) => C.Index n -> C.Index n
       succIdx p = if p == maxBound then p else succ p
 
@@ -385,22 +389,16 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
         let lInt = fromEnum l
             pAdj = if l == maxBound then succIdx p else p
         in (lInt, fromEnum pAdj)
-  let tokens = map (\(t,_,_,_,_,_,_,_,_,_,_) -> t) outputs
+
+  let tokens = Prelude.map (\(t,_,_,_,_,_,_,_,_,_,_) -> t) outputs
   mapM_
     (\(tok, tp, l, p, xhat, ch, woh, xaa, k, v) -> do
         when tp $ do
           let (lI, pI) = showPos l p
-          -- Token (decoded as a piece) – you can also print the raw integer
           let decoded = T.decodePiece tokenizer (fromIntegral tok) (fromIntegral tok)
-
-          -- 1️⃣  Ready flag
           putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
           putStr $ "READY=" ++ show tp ++ " "
-
-          -- 2️⃣  Token (already printed before)
           putStr $ "token=" ++ show tok ++ " (" ++ BSC.unpack decoded ++ ") "
-
-          -- 3️⃣  Rest of the diagnostics
           putStrLn $ "xHat=" ++ fmt8 xhat
           putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
           putStrLn $ "k=" ++ fmt8 k
@@ -412,39 +410,22 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
           putStrLn $ "WO@heads=" ++ fmt8 woh
           putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
           putStrLn $ "x_after_attn=" ++ fmt8 xaa
-
           hFlush stdout
     )
-    (zip10 tokens   -- token stream
-            tapFlags
-            tapLayers
-            tapSeqs
-            dbgXHats
-            dbgConcatHeads
-            dbgWOs
-            dbgXAfters
-            dbgKAtPos
-            dbgVAtPos
-            )
+    (zip10 tokens tapFlags tapLayers tapSeqs dbgXHats dbgConcatHeads dbgWOs dbgXAfters dbgKAtPos dbgVAtPos)
 
-  -- Stream tokens as soon as they are ready
-  let streamTokens :: [Token] -> IO ()
-      streamTokens [] = pure ()
-      streamTokens (t:ts) = do
-          printToken t tokenizer
-          streamTokens ts
-
-  -- The list of tokens we actually want to output:
-  --   • the whole prompt (forced emission)
-  --   • then the sampled tokens after the prompt
-  let promptLen      = length promptTokens
-      forcedEmitted  = promptTokens
+  -- Emit prompt verbatim, then sampled tokens after the prompt
+  let promptLen          = length promptTokens
+      forcedEmitted      = promptTokens
       sampledAfterPrompt = drop promptLen sampledAll
-      emittedAll     = forcedEmitted ++ sampledAfterPrompt
-      totalWanted    = promptLen + fromIntegral nSteps
-      emittedLimited = take totalWanted emittedAll
+      emittedAll         = forcedEmitted ++ sampledAfterPrompt
+      totalWanted        = promptLen + fromIntegral nSteps
+      emittedLimited     = take totalWanted emittedAll
 
-  -- Output them one‑by‑one
+  let streamTokens :: [Token] -> IO ()
+      streamTokens []     = pure ()
+      streamTokens (t:ts) = printToken t tokenizer >> streamTokens ts
+
   streamTokens emittedLimited
   putStrLn ""
 
@@ -460,7 +441,7 @@ zip10 _ _ _ _ _ _ _ _ _ _ = []   -- stop when any list runs out
 
 bundledOutputs
   :: TransformerDecoderComponent
-  -> C.Signal C.System (Token, Temperature, Seed)
+  -> C.Signal C.System (Token, Bool, Temperature, Seed)
   -> C.Signal C.System  ( Token
                          , Bool
                          , Bool
@@ -483,7 +464,7 @@ bundledOutputs decoder =
 -- Helper function to create a bundled version of topEntity
 topEntityBundled :: CS.HiddenClockResetEnable dom
   => TransformerDecoderComponent
-  -> C.Signal dom (Token, Temperature, Seed)
+  -> C.Signal dom (Token, Bool, Temperature, Seed)
   -> ( C.Signal dom Token
      , C.Signal dom Bool
      , C.Signal dom Bool
@@ -497,6 +478,6 @@ topEntityBundled :: CS.HiddenClockResetEnable dom
     , C.Signal dom (C.Vec ModelDim Float) -- dbgVAtPos
     )
 topEntityBundled decoder bundledInputs =
-  Top.topEntity decoder inputToken temp rngSeed
+  Top.topEntity decoder inputToken inputTokenValid temp rngSeed
   where
-    (inputToken, temp, rngSeed) = C.unbundle bundledInputs
+    (inputToken, inputTokenValid, temp, rngSeed) = C.unbundle bundledInputs

@@ -29,8 +29,8 @@ runSingleHeadQKV headComp normalizedInput = (q, k, v) where
     v = matrixVectorMult (wvHead headComp) normalizedInput  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
 
     -- Trace a preview of wkHead before using it
-    CArray2D wK = wkHead headComp
-    !_ = trace ("wkHead row0 first 8 elems = " P.++ show (P.take 8 $ toList $ wK !! 0)) ()
+    CArray2D _wK = wkHead headComp
+    !_ = trace ("wkHead row0 first 8 elems = " P.++ show (P.take 8 $ toList $ _wK !! 0)) ()
 
 
 applyRotaryPositionEncoding :: Vec HeadDimension Float    -- input vector
