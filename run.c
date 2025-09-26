@@ -21,9 +21,9 @@ int DEBUG_MODE = 1;
 void debug_print_array(const char* name, float* arr, int size, int layer, int pos) {
     if (!DEBUG_MODE) return;
     printf("[L%d P%d] %s: ", layer, pos, name);
-    int limit = size < 8 ? size : 8;
+    int limit = size < 4 ? size : 4;
     for (int i = 0; i < limit; i++) {
-        printf("%.7g ", arr[i]);
+        printf("%.8f ", arr[i]);
     }
     if (size > 8) printf("...");
     printf("\n");
@@ -301,6 +301,14 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 
         if (DEBUG_MODE) {
+            // base pointer to this layer’s WK weight matrix
+            float* wk_l = w->wk + l * dim * kv_dim;
+            debug_print_array("Wk[layer]", wk_l, dim * kv_dim, l, pos);
+            float* wv_l = w->wv + l * dim * kv_dim;
+            debug_print_array("Wv[layer]", wk_l, dim * kv_dim, l, pos);
+            float* wq_l = w->wq + l * dim * dim;
+            debug_print_array("Wq[layer]", wk_l, dim * kv_dim, l, pos);
+
             debug_print_array("q_before_rope", s->q, dim, l, pos);
             debug_print_array("k_before_rope", s->k, kv_dim, l, pos);
             debug_print_array("v", s->v, kv_dim, l, pos);
