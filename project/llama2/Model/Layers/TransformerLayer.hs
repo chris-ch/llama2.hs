@@ -16,7 +16,6 @@ import qualified Model.Memory.KVCacheBank as Cache
 import qualified Model.Layers.FeedForward.FeedForwardNetwork as FeedForwardNetwork
 import qualified Model.Layers.Attention.MultiHeadAttention as MultiHeadAttention
 import qualified Model.Layers.Attention.AttentionHead as AttentionHead
-import qualified Clash.Sized.Vector as CV
 
 data TransformerLayerComponent = TransformerLayerComponent
   { multiHeadAttention :: MultiHeadAttention.MultiHeadAttentionComponent
@@ -41,11 +40,7 @@ multiCycleTransformerLayer
      , Signal dom IntermediateData             -- commitCycle3 (gated write-back)
      , Signal dom Bool                         -- tapPulse  (1-cycle on attnDone rising)
      , Signal dom (Vec ModelDim Float)         -- dbgXHat
-     , Signal dom (Vec ModelDim Float)         -- dbgConcatHeads  (pre-WO)
-     , Signal dom (Vec ModelDim Float)         -- dbgWOHeads      (sum of per-head WO)
-     , Signal dom (Vec ModelDim Float)         -- dbgXAfterAttn   (residual add)
-     , Signal dom (Vec ModelDim Float)   -- dbgKAtPos (concat all KV heads)
-     , Signal dom (Vec ModelDim Float) ) -- dbgVAtPos (concat all KV heads)
+  )
 multiCycleTransformerLayer layer kvRamOwner layerIndex processingStateSignal intermediateDataSignal =
   ( nextIntermediateDataSignal
   , writeDoneThisLayerSignal
@@ -53,19 +48,10 @@ multiCycleTransformerLayer layer kvRamOwner layerIndex processingStateSignal int
   , commitCycle3Signal
   , attentionDoneThisLayerSignal
   , xHatSignal
-  , concatHeadsSignal
-  , woHeadsSignal
-  , xAfterAttnSignal
-  , kAtPosSignal
-  , vAtPosSignal
   )
  where
   mha  = multiHeadAttention layer
   ffn  = feedforwardNetwork layer
-
-  -- K/V after RoPE for active layer/pos (as produced in Stage1)
-  kAtPosSignal = CV.concat . keyVectors  <$> intermediateDataSignal
-  vAtPosSignal = CV.concat . valueVectors <$> intermediateDataSignal
 
   -- Drive all KV banks; collect per-head outputs, head-done pulses, and per-bank write-done
   (perHeadOutputSignalsVec, perHeadDoneSignalsVec, perBankWriteDoneVec) =
@@ -86,11 +72,6 @@ multiCycleTransformerLayer layer kvRamOwner layerIndex processingStateSignal int
   -- xHat = rmsnorm(x, rms_att) for debugging
   xHatSignal =
     (\idata -> rmsNorm (inputVector idata) (MultiHeadAttention.rmsAtt mha)) <$> intermediateDataSignal
-
-  -- Pre-WO concatenation of all heads (matches C's concat_head)
-  -- sequenceA :: Vec H (Signal (Vec D Float)) -> Signal (Vec H (Vec D Float))
-  -- CV.concat :: Vec H (Vec D a) -> Vec (H*D) a  == Vec ModelDim a
-  concatHeadsSignal = CV.concat <$> sequenceA perHeadOutputSignalsVec
 
   -- Per-head WO @ head, then sum across heads (equivalent to WO @ concatHeads)
   perHeadProjectedSignalsVec =
@@ -148,7 +129,7 @@ processStage mha ffn layerIndex ps idata
   | otherwise = case processingStage ps of
       -- Stage1: compute Q,K,V for current layer/pos
       Stage1_ProjectQKV ->
-        let (qs, ks, vs) = MultiHeadAttention.projectQKV mha ps (inputVector idata)
+        let (qs, ks, vs) = MultiHeadAttention.projectQKV mha ps (inputVector idata) layerIndex
         in  idata { queryVectors = qs, keyVectors = ks, valueVectors = vs }
       -- Stage2: write K,V(pos) to cache (sequenced outside in fillOneBank)
       Stage2_WriteKV    -> idata

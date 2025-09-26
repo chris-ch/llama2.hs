@@ -71,11 +71,6 @@ multiCycleTransformer
      , Signal dom (Index NumLayers)
      , Signal dom (Index SeqLen)
      , Signal dom (Vec ModelDim Float)
-     , Signal dom (Vec ModelDim Float)
-     , Signal dom (Vec ModelDim Float)
-     , Signal dom (Vec ModelDim Float)
-     , Signal dom (Vec ModelDim Float)
-     , Signal dom (Vec ModelDim Float)
      )
 multiCycleTransformer decoder cacheOwners inputTokenSignal inputTokenValid temperatureSignal seedSignal =
   ( selectedTokenSignal
@@ -84,11 +79,6 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal inputTokenValid tempe
   , tapLayerIdxOut
   , tapSeqPosOut
   , dbgXHatOut
-  , dbgConcatHeadsOut
-  , dbgWoOut
-  , dbgXAfterOut
-  , dbgKAtPosOut
-  , dbgVAtPosOut
   )
  where
   embeddingComponent = modelEmbedding decoder
@@ -139,11 +129,6 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal inputTokenValid tempe
        , Vec NumLayers (Signal dom Bool)
        , Vec NumLayers (Signal dom Bool)
        , Vec NumLayers (Signal dom (Vec ModelDim Float))
-       , Vec NumLayers (Signal dom (Vec ModelDim Float))
-       , Vec NumLayers (Signal dom (Vec ModelDim Float))
-       , Vec NumLayers (Signal dom (Vec ModelDim Float))
-       , Vec NumLayers (Signal dom (Vec ModelDim Float))
-       , Vec NumLayers (Signal dom (Vec ModelDim Float))
         )
     -> (TransformerLayer.TransformerLayerComponent, Cache.KVRamOwner dom, Index NumLayers)
     -> ( Signal dom IntermediateData
@@ -151,15 +136,10 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal inputTokenValid tempe
        , Vec NumLayers (Signal dom Bool)
        , Vec NumLayers (Signal dom Bool)
        , Vec NumLayers (Signal dom (Vec ModelDim Float))
-       , Vec NumLayers (Signal dom (Vec ModelDim Float))
-       , Vec NumLayers (Signal dom (Vec ModelDim Float))
-       , Vec NumLayers (Signal dom (Vec ModelDim Float)) 
-       , Vec NumLayers (Signal dom (Vec ModelDim Float))
-       , Vec NumLayers (Signal dom (Vec ModelDim Float))
        )
-  layerStep (currData, wDoneVec, attnDoneVec, tapVecIn, xHatVecIn, concatHeadsVecIn, woVecIn, xaaVecIn, kPosVecIn, vPosVecIn)
+  layerStep (currData, wDoneVec, attnDoneVec, tapVecIn, xHatVecIn)
             (layerComp, cacheOwner, lIx) =
-    let (newData, wDone, attnDone, commitC3, tapPulse, dbgXHat, dbgConcatHeads, dbgWo, dbgXAfter, dbgKPos, dbgVPos) =
+    let (newData, wDone, attnDone, commitC3, tapPulse, dbgXHat) =
           TransformerLayer.multiCycleTransformerLayer layerComp cacheOwner lIx (PipelineController.processingState ctrl) currData
         selectedData =
           liftA4
@@ -175,11 +155,6 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal inputTokenValid tempe
         , replace lIx attnDone attnDoneVec
         , replace lIx tapPulse tapVecIn
         , replace lIx dbgXHat  xHatVecIn
-        , replace lIx dbgConcatHeads concatHeadsVecIn
-        , replace lIx dbgWo    woVecIn
-        , replace lIx dbgXAfter xaaVecIn
-        , replace lIx dbgKPos  kPosVecIn
-        , replace lIx dbgVPos  vPosVecIn 
         )
 
   ( nextIntermediateDataSignal
@@ -187,46 +162,25 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal inputTokenValid tempe
     , attnDoneVector
     , tapVec
     , xHatVec
-    , chVec
-    , woVec
-    , xAfterVec 
-    , kPosVec
-    , vPosVec
     ) =
       foldl layerStep ( inputLoadedSignal
                       , repeat (pure False)
                       , repeat (pure False)
                       , repeat (pure False)
                       , repeat (pure (repeat 0))
-                      , repeat (pure (repeat 0))
-                      , repeat (pure (repeat 0))
-                      , repeat (pure (repeat 0)) 
-                      , repeat (pure (repeat 0))
-                      , repeat (pure (repeat 0))
                       )
             (zip3 transformerLayers cacheOwners indicesI)
 
   -- =================== Layer-accurate tap fan-in ====================
-  tapPayloadPerLayer
-    :: Vec NumLayers (Signal dom (Maybe ( Index NumLayers
+  tapPayloadPerLayer :: Vec NumLayers (Signal dom (Maybe ( Index NumLayers
                                         , Index SeqLen
-                                        , Vec ModelDim Float
-                                        , Vec ModelDim Float
-                                        , Vec ModelDim Float
-                                        , Vec ModelDim Float 
-                                        , Vec ModelDim Float
                                         , Vec ModelDim Float
                                         )))
   tapPayloadPerLayer =
     map (\lIx ->
           let pulse = tapVec    !! lIx
               xh    = xHatVec   !! lIx
-              wo    = woVec     !! lIx
-              ch    = chVec     !! lIx
-              xa    = xAfterVec !! lIx
-              kpos  = kPosVec   !! lIx
-              vpos  = vPosVec   !! lIx
-              tup   = bundle (pure lIx, PipelineController.seqPos ctrl, xh, ch, wo, xa, kpos, vpos)
+              tup   = bundle (pure lIx, PipelineController.seqPos ctrl, xh)
           in mux pulse (Just <$> tup) (pure Nothing)
         )
         indicesI
@@ -234,11 +188,6 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal inputTokenValid tempe
   tapSelected = firstJustV <$> sequenceA tapPayloadPerLayer
   tapValid    = isJust <$> tapSelected
 
-  tapLayerIdxOut    = regEn 0           tapValid ((\(l,_,_,_,_,_,_,_) -> l) . fromJustX <$> tapSelected)
-  tapSeqPosOut      = regEn 0           tapValid ((\(_,p,_,_,_,_,_,_) -> p) . fromJustX <$> tapSelected)
-  dbgXHatOut        = regEn (repeat 0)  tapValid ((\(_,_,xh,_,_,_,_,_) -> xh) . fromJustX <$> tapSelected)
-  dbgConcatHeadsOut = regEn (repeat 0)  tapValid ((\(_,_,_,ch,_,_,_,_) -> ch) . fromJustX <$> tapSelected)
-  dbgWoOut          = regEn (repeat 0)  tapValid ((\(_,_,_,_,wo,_,_,_) -> wo) . fromJustX <$> tapSelected)
-  dbgXAfterOut      = regEn (repeat 0)  tapValid ((\(_,_,_,_,_,xa,_,_) -> xa) . fromJustX <$> tapSelected)
-  dbgKAtPosOut      = regEn (repeat 0)  tapValid ((\(_,_,_,_,_,_,k,_) -> k) . fromJustX <$> tapSelected)
-  dbgVAtPosOut      = regEn (repeat 0)  tapValid ((\(_,_,_,_,_,_,_,v) -> v) . fromJustX <$> tapSelected)
+  tapLayerIdxOut    = regEn 0           tapValid ((\(l,_,_) -> l) . fromJustX <$> tapSelected)
+  tapSeqPosOut      = regEn 0           tapValid ((\(_,p,_) -> p) . fromJustX <$> tapSelected)
+  dbgXHatOut        = regEn (repeat 0)  tapValid ((\(_,_,xh) -> xh) . fromJustX <$> tapSelected)
