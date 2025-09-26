@@ -16,6 +16,8 @@ import qualified Model.Memory.KVCacheBank as Cache
 import qualified Model.Layers.FeedForward.FeedForwardNetwork as FeedForwardNetwork
 import qualified Model.Layers.Attention.MultiHeadAttention as MultiHeadAttention
 import qualified Model.Layers.Attention.AttentionHead as AttentionHead
+import Debug.Trace (trace)
+import qualified Prelude as P
 
 data TransformerLayerComponent = TransformerLayerComponent
   { multiHeadAttention :: MultiHeadAttention.MultiHeadAttentionComponent
@@ -127,20 +129,45 @@ processStage
 processStage mha ffn layerIndex ps idata
   | processingLayer ps /= layerIndex = idata
   | otherwise = case processingStage ps of
+
       -- Stage1: compute Q,K,V for current layer/pos
       Stage1_ProjectQKV ->
         let (qs, ks, vs) = MultiHeadAttention.projectQKV mha ps (inputVector idata) layerIndex
-        in  idata { queryVectors = qs, keyVectors = ks, valueVectors = vs }
-      -- Stage2: write K,V(pos) to cache (sequenced outside in fillOneBank)
-      Stage2_WriteKV    -> idata
-      -- Stage3: stream attention (sequenced outside in fillOneBank)
-      Stage3_Attend     -> idata
+            seqPos = sequencePosition ps
+            !_ = trace ("[TRACE][L" P.++ show layerIndex P.++
+                        " P" P.++ show seqPos P.++ "] x_input = " P.++
+                        show (P.take 4 (toList (inputVector idata)))) ()
+        in idata { queryVectors = qs, keyVectors = ks, valueVectors = vs }
+
+      -- Stage2: write K,V(pos) to cache
+      Stage2_WriteKV -> idata
+
+      -- Stage3: stream attention (sequenced outside)
+      Stage3_Attend ->
+        let seqPos = sequencePosition ps
+            attnOut = attentionOutput idata
+            !_ = trace ("[TRACE][L" P.++ show layerIndex P.++
+                        " P" P.++ show seqPos P.++ "] attnOut = " P.++
+                        show (P.take 4 (toList attnOut))) ()
+        in idata
+
       -- Stage4: FFN
       Stage4_FeedForward ->
-        let ffnOut = FeedForwardNetwork.computeFeedForward ffn (attentionOutput idata)
-        in  idata { feedForwardOutput = ffnOut }
+        let seqPos = sequencePosition ps
+            ffnOut = FeedForwardNetwork.computeFeedForward ffn (attentionOutput idata)
+            !_ = trace ("[TRACE][L" P.++ show layerIndex P.++
+                        " P" P.++ show seqPos P.++ "] x_after_ffn = " P.++
+                        show (P.take 4 (toList ffnOut))) ()
+        in idata { feedForwardOutput = ffnOut }
+
       -- Stage5: bookkeeping only
-      Stage5_Bookkeeping -> idata
+      Stage5_Bookkeeping ->
+        -- optional: trace summary of everything here if desired
+        let seqPos = sequencePosition ps
+            !_ = trace ("[TRACE][L" P.++ show layerIndex P.++
+                        " P" P.++ show seqPos P.++ "] bookkeeping") ()
+        in idata
+
 
 -- Query heads per KV head
 queryHeadsPerKeyValueHead :: Int

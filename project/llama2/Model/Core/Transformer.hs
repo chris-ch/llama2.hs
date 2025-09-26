@@ -26,6 +26,8 @@ import qualified Model.Core.PipelineController as PipelineController
   ( runPipelineController
   , PipelineOutputs (..)
   )
+import Debug.Trace (trace)
+import qualified Prelude as P
 
 initialIntermediateData :: IntermediateData
 initialIntermediateData = IntermediateData
@@ -73,7 +75,7 @@ multiCycleTransformer
      , Signal dom (Vec ModelDim Float)
      )
 multiCycleTransformer decoder cacheOwners inputTokenSignal inputTokenValid temperatureSignal seedSignal =
-  ( selectedTokenSignal
+  ( selectedTokenSignalDebug
   , PipelineController.readyPulse ctrl
   , tapValid
   , tapLayerIdxOut
@@ -105,7 +107,18 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal inputTokenValid tempe
   selectedTokenSignal =
     mux inputTokenValid inputTokenSignal feedbackTokenSignal
 
-  tokenEmbeddingSignal = embed (vocabulary embeddingComponent) <$> selectedTokenSignal
+  -- === DEBUG TRACE TOKEN only when readyPulse ===
+  selectedTokenSignalDebug :: Signal dom Token
+  selectedTokenSignalDebug =
+    liftA2
+      (\tok ready ->
+         if ready
+           then trace ("[TOKEN] " P.++ show tok) tok
+           else tok)
+      selectedTokenSignal
+      (PipelineController.readyPulse ctrl)
+
+  tokenEmbeddingSignal = embed (vocabulary embeddingComponent) <$> selectedTokenSignalDebug
 
   -- Per-position intermediate data register
   intermediateDataSignal = register initialIntermediateData nextIntermediateDataSignal
@@ -139,9 +152,10 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal inputTokenValid tempe
        )
   layerStep (currData, wDoneVec, attnDoneVec, tapVecIn, xHatVecIn)
             (layerComp, cacheOwner, lIx) =
-    let (newData, wDone, attnDone, commitC3, tapPulse, dbgXHat) =
+    let
+      (newData, wDone, attnDone, commitC3, tapPulse, dbgXHat) =
           TransformerLayer.multiCycleTransformerLayer layerComp cacheOwner lIx (PipelineController.processingState ctrl) currData
-        selectedData =
+      selectedData =
           liftA4
             (\ps oldD newD c3D ->
                if processingLayer ps == lIx

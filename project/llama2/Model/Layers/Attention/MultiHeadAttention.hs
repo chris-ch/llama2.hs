@@ -70,19 +70,27 @@ computeHeadKV headComp step xHat headIdx layerIdx =
     k = matrixVectorMult (wkHead headComp) xHat  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
     v = matrixVectorMult (wvHead headComp) xHat  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
     kRot = applyRotation (rotary headComp) step k
+    CArray2D _wQ = wqHead headComp
     CArray2D _wK = wkHead headComp
+    CArray2D _wV = wvHead headComp
     StepCount stp = step
     !_ = traceIf (headIdx == 0)
-                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] k before rot first 8 elems = " P.++ P.show (P.take 8 $ toList k))
+                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] k_before_rope = " P.++ P.show (P.take 4 $ toList k) P.++ "...")
                 ()
     !_ = traceIf (headIdx == 0)
-                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] wkHead row0 first 8 elems = " P.++ P.show (P.take 8 $ toList (_wK !! 0)))
+                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] Wk[layer] = " P.++ P.show (P.take 4 $ toList (_wK !! 0)) P.++ "...")
                 ()
     !_ = traceIf (headIdx == 0)
-                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] v first 8 elems = " P.++ P.show (P.take 8 $ toList v))
+                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] Wv[layer] = " P.++ P.show (P.take 4 $ toList (_wV !! 0)) P.++ "...")
                 ()
     !_ = traceIf (headIdx == 0)
-                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] k after rot first 8 elems = " P.++ P.show (P.take 8 $ toList kRot))
+                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] Wq[layer] = " P.++ P.show (P.take 4 $ toList (_wQ !! 0)) P.++ "...")
+                ()
+    !_ = traceIf (headIdx == 0)
+                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] v = " P.++ P.show (P.take 4 $ toList v) P.++ "...")
+                ()
+    !_ = traceIf (headIdx == 0)
+                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] k_after_rope = " P.++ P.show (P.take 4 $ toList kRot) P.++ "...")
                 ()
   in (kRot, v)
 
@@ -103,10 +111,10 @@ computeHeadQ headComp step xHat headIdx layerIdx =
     StepCount stp = step
     -- Trace only when we are processing the very first head (headIdx == 0)
     !_ = traceIf (headIdx == 0)
-                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] q before rot first 8 elems = " P.++ P.show (P.take 8 $ toList q))
+                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] q_before_rope = " P.++ P.show (P.take 4 $ toList q) P.++ "...")
                 ()
     !_ = traceIf (headIdx == 0)
-                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] q after rot first 8 elems = " P.++ P.show (P.take 8 $ toList qRot))
+                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] q_after_rope = " P.++ P.show (P.take 4 $ toList qRot) P.++ "...")
                 ()
   in qRot
 
