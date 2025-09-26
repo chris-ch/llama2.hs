@@ -304,10 +304,13 @@ float* forward(Transformer* transformer, int token, int pos) {
             // base pointer to this layer’s WK weight matrix
             float* wk_l = w->wk + l * dim * kv_dim;
             debug_print_array("Wk[layer]", wk_l, dim * kv_dim, l, pos);
+
             float* wv_l = w->wv + l * dim * kv_dim;
-            debug_print_array("Wv[layer]", wk_l, dim * kv_dim, l, pos);
+            debug_print_array("Wv[layer]", wv_l, dim * kv_dim, l, pos);
+
             float* wq_l = w->wq + l * dim * dim;
-            debug_print_array("Wq[layer]", wk_l, dim * kv_dim, l, pos);
+            debug_print_array("Wq[layer]", wq_l, dim * dim, l, pos);
+
 
             debug_print_array("q_before_rope", s->q, dim, l, pos);
             debug_print_array("k_before_rope", s->k, kv_dim, l, pos);
