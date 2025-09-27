@@ -2,162 +2,276 @@ module Model.Layers.Attention.AttentionHead (
   streamHeadAttentionAddrIO
 ) where
 
-import Model.Core.Types (HeadDimension, SeqLen, BankAddress )
+import Model.Core.Types (HeadDimension, SeqLen, BankAddress)
 import Clash.Prelude
-import Helpers (liftA5, liftA4)
 import qualified Model.Memory.Addressing as Addressing
 
-data AttnPhase = PhaseDot | PhaseAcc | PhaseFinalize
+-- FSM phases of the attention head
+data AttentionPhase = PhaseDotProduct | PhaseAccumulate | PhaseFinalize
   deriving (Generic, NFDataX, Eq, Show)
 
--- Streaming single-head attention with online softmax and t==pos bypass for K,V.
--- BRAM is 1-cycle latent: the data we see this cycle corresponds to last cycle's address,
--- which we track with previousTimeCounterSignal/previousDimensionCounterSignal.
+-- Full FSM / working state
+data AttentionState = AttentionState
+  { currentPhase      :: AttentionPhase
+  , isRunning         :: Bool
+  , prevStartSignal   :: Bool
+  , currentSeqIndex   :: Index SeqLen
+  , queryVector       :: Vec HeadDimension Float
+  , keyBypassVector   :: Vec HeadDimension Float
+  , valueBypassVector :: Vec HeadDimension Float
+  , seqIndexCounter   :: Index SeqLen
+  , headDimCounter    :: Index HeadDimension
+  , prevSeqIndex      :: Index SeqLen
+  , prevHeadDimIndex  :: Index HeadDimension
+  , prevDataValid     :: Bool
+  , prevKeyValue      :: Float
+  , prevValueValue    :: Float
+  , attentionScores   :: Vec SeqLen Float
+  , maxAttentionScore :: Float
+  , expDenominator    :: Float
+  , isSecondPass      :: Bool
+  , outputVector      :: Vec HeadDimension Float
+  , dotAccumulator    :: Float
+  , currentAddress    :: BankAddress
+  , donePulse         :: Bool
+  }
+  deriving (Generic, NFDataX)
+
+type AttentionInput =
+  ( Bool                           -- start
+  , Index SeqLen                   -- current sequence position
+  , Vec HeadDimension Float        -- query vector (Q)
+  , Vec HeadDimension Float        -- current key vector bypass (K[pos])
+  , Vec HeadDimension Float        -- current value vector bypass (V[pos])
+  , Float                          -- key RAM read data
+  , Float                          -- value RAM read data
+  )
+
+type AttentionOutput =
+  ( BankAddress
+  , Vec HeadDimension Float        -- attended head output vector
+  , Bool                           -- busy
+  , Bool                           -- done (1-cycle pulse)
+  )
+
 streamHeadAttentionAddrIO
-  :: HiddenClockResetEnable dom
-  => Signal dom Bool
-  -> Signal dom (Index SeqLen)
-  -> Signal dom (Vec HeadDimension Float)
-  -> Signal dom (Vec HeadDimension Float)
-  -> Signal dom (Vec HeadDimension Float)
-  -> Signal dom Float
-  -> Signal dom Float
+  :: (HiddenClockResetEnable dom)
+  => Signal dom Bool                               -- start (true during Stage3_Attend)
+  -> Signal dom (Index SeqLen)                     -- current sequence position
+  -> Signal dom (Vec HeadDimension Float)          -- query vector Q
+  -> Signal dom (Vec HeadDimension Float)          -- current key bypass K(pos)
+  -> Signal dom (Vec HeadDimension Float)          -- current value bypass V(pos)
+  -> Signal dom Float                              -- key RAM read data
+  -> Signal dom Float                              -- value RAM read data
   -> ( Signal dom BankAddress
      , Signal dom (Vec HeadDimension Float)
      , Signal dom Bool
      , Signal dom Bool )
-streamHeadAttentionAddrIO startSignal sequencePositionSignal queryVectorSignal currentKeySignal currentValueSignal keyFromRamSignal valueFromRamSignal =
-  (bankAddressSignal, outputVectorSignal, busySignal, donePulseSignal)
+streamHeadAttentionAddrIO startSignal seqIndexSignal qSignal kBypassSignal vBypassSignal kRamSignal vRamSignal =
+  (addressOut, outputVecOut, busyOut, doneOut)
  where
-  phaseSignal        = register PhaseDot nextPhaseSignal
-  isDotPhase         = (== PhaseDot)      <$> phaseSignal
-  isAccPhase         = (== PhaseAcc)      <$> phaseSignal
-  isFinalizePhase    = (== PhaseFinalize) <$> phaseSignal
+  -- Constants
+  scale :: Float
+  scale = 1.0 / sqrt ((natToNum @HeadDimension) :: Float)
 
-  startPrevSignal    = register False startSignal
-  startPulseSignal   = liftA2 (\now prev -> now && not prev) startSignal startPrevSignal
+  negBig :: Float
+  negBig = -1.0e30
 
-  enableSignal       = startPulseSignal .||. busySignal
-  busySignal         = busyReg where
-    busyReg = register False nextBusy
-    nextBusy =
-      mux startPulseSignal (pure True) $
-      mux donePulseSignal   (pure False) busyReg
+  initialState :: AttentionState
+  initialState = AttentionState
+    { currentPhase      = PhaseDotProduct
+    , isRunning         = False
+    , prevStartSignal   = False
+    , currentSeqIndex   = 0
+    , queryVector       = repeat 0
+    , keyBypassVector   = repeat 0
+    , valueBypassVector = repeat 0
+    , seqIndexCounter   = 0
+    , headDimCounter    = 0
+    , prevSeqIndex      = 0
+    , prevHeadDimIndex  = 0
+    , prevDataValid     = False
+    , prevKeyValue      = 0
+    , prevValueValue    = 0
+    , attentionScores   = repeat 0
+    , maxAttentionScore = negBig
+    , expDenominator    = 0
+    , isSecondPass      = False
+    , outputVector      = repeat 0
+    , dotAccumulator    = 0
+    , currentAddress    = 0
+    , donePulse         = False
+    }
 
-  timeCounterSignal              = regEn 0 enableSignal nextTimeCounterSignal
-  dimensionCounterSignal         = regEn 0 enableSignal nextDimensionCounterSignal
-  previousTimeCounterSignal      = register 0 timeCounterSignal
-  previousDimensionCounterSignal = register 0 dimensionCounterSignal
+  step :: AttentionState -> AttentionInput -> (AttentionState, AttentionOutput)
+  step st (startNow, seqIndexIn, qIn, kBypassIn, vBypassIn, kRamIn, vRamIn) =
+    let
+      -- detect rising edge of start signal
+      startRise = startNow && not (prevStartSignal st)
 
-  isLastDimensionSignal = (== maxBound) <$> dimensionCounterSignal
-  isLastTimeSignal      = (==) <$> timeCounterSignal <*> sequencePositionSignal
+      -- reset on new start
+      st0 = if startRise
+        then (initialState
+                { isRunning         = True
+                , currentPhase      = PhaseDotProduct
+                , currentSeqIndex   = seqIndexIn
+                , queryVector       = qIn
+                , keyBypassVector   = kBypassIn
+                , valueBypassVector = vBypassIn })
+        else st { donePulse = False }
 
-  bankAddressSignal = Addressing.computeBankAddress <$> timeCounterSignal <*> dimensionCounterSignal
+      seqIdx     = currentSeqIndex st0
+      qVec       = queryVector st0
+      kByp       = keyBypassVector st0
+      vByp       = valueBypassVector st0
 
-  queryElementSignal       = (!!) <$> queryVectorSignal        <*> previousDimensionCounterSignal
-  keyBypassElementSignal   = (!!) <$> currentKeySignal         <*> previousDimensionCounterSignal
-  valueBypassElementSignal = (!!) <$> currentValueSignal       <*> previousDimensionCounterSignal
+      incHeadDim d' = if d' == maxBound then 0 else succ d'
+      incSeqIdx t'  = if t' == maxBound then maxBound else succ t'
+      lastHeadDim d' = d' == maxBound
+      lastSeqIdx t' = t' == seqIdx
 
-  -- Unconditional selection for the current time (no warmup involved)
-  isReturnForCurrentTime   = (==) <$> previousTimeCounterSignal <*> sequencePositionSignal
-  keyElementSignal         = mux isReturnForCurrentTime  keyBypassElementSignal   keyFromRamSignal
-  valueElementSignal       = mux isReturnForCurrentTime  valueBypassElementSignal valueFromRamSignal
+      addressThisCycle =
+        case currentPhase st0 of
+          PhaseDotProduct ->
+            Addressing.computeBankAddress (seqIndexCounter st0) (headDimCounter st0)
+          PhaseAccumulate ->
+            if isSecondPass st0
+              then Addressing.computeBankAddress (seqIndexCounter st0) (headDimCounter st0)
+              else 0
+          PhaseFinalize -> 0
 
-  warmupSignal = regEn False enableSignal warmupNext
-  warmupNext   = mux startPulseSignal (pure False) $
-                 mux (isDotPhase .||. isAccPhase .||. isFinalizePhase) (pure True) warmupSignal
+      -- RAM read values align with previous issued address
+      kAligned = if prevSeqIndex st0 == seqIdx
+                   then kByp !! prevHeadDimIndex st0 else prevKeyValue st0
+      vAligned = if prevSeqIndex st0 == seqIdx
+                   then vByp !! prevHeadDimIndex st0 else prevValueValue st0
+      qAligned = qVec !! prevHeadDimIndex st0
 
-  dotAccumulatorSignal = regEn 0 enableSignal nextDotAccumulatorSignal
-  canAccumulateDot     = warmupSignal .&&. isDotPhase
-  nextDotAccumulatorSignal =
-    mux startPulseSignal (pure 0)
-    $ mux isDotPhase
-        (mux canAccumulateDot (dotAccumulatorSignal + (queryElementSignal * keyElementSignal))
-                              dotAccumulatorSignal)
-        dotAccumulatorSignal
+      dotAccNow =
+        if isRunning st0 && currentPhase st0 == PhaseDotProduct && prevDataValid st0
+          then dotAccumulator st0 + qAligned * kAligned
+          else dotAccumulator st0
 
-  dotBoundarySignal =
-    liftA3 (\ph warm dLast -> ph == PhaseDot && warm && dLast)
-           phaseSignal warmupSignal isLastDimensionSignal
+      endOfPrevVec = prevDataValid st0 && lastHeadDim (prevHeadDimIndex st0)
 
-  invSqrtHeadDim :: Float
-  invSqrtHeadDim = 1.0 / sqrt (snatToNum (SNat @HeadDimension) :: Float)
+      scoreThisStep = dotAccNow * scale
+      scores'       = if endOfPrevVec
+                        then replace (prevSeqIndex st0) scoreThisStep (attentionScores st0)
+                        else attentionScores st0
+      maxScore'     = if endOfPrevVec
+                        then max (maxAttentionScore st0) scoreThisStep
+                        else maxAttentionScore st0
+      dotAcc'       = if endOfPrevVec then 0 else dotAccNow
 
-  scoreThisTimeSignal =
-    (dotAccumulatorSignal + (queryElementSignal * keyElementSignal)) * pure invSqrtHeadDim
+      dotPhaseDone  = endOfPrevVec && lastSeqIdx (prevSeqIndex st0)
 
-  maxAccumulatorSignal = regEn (-(1/0)) enableSignal nextMaxAccumulatorSignal
-  sumAccumulatorSignal = regEn 0        enableSignal nextSumAccumulatorSignal
+      dNext = incHeadDim (headDimCounter st0)
+      tNext = if lastHeadDim (headDimCounter st0)
+                then (if lastSeqIdx (seqIndexCounter st0) then seqIndexCounter st0 else incSeqIdx (seqIndexCounter st0))
+                else seqIndexCounter st0
 
-  newMaxSignal   = max <$> maxAccumulatorSignal <*> scoreThisTimeSignal
-  scaleOldSignal = exp <$> ((-) <$> maxAccumulatorSignal <*> newMaxSignal)
-  scaleNewSignal = exp <$> ((-) <$> scoreThisTimeSignal <*> newMaxSignal)
-  newSumSignal   = (+) <$> ((* ) <$> sumAccumulatorSignal <*> scaleOldSignal) <*> scaleNewSignal
+      -- Next state after DOT phase
+      st1 = case currentPhase st0 of
+              PhaseDotProduct ->
+                if isRunning st0
+                  then if dotPhaseDone
+                         then st0 { currentPhase      = PhaseAccumulate
+                                  , seqIndexCounter   = 0
+                                  , headDimCounter    = 0
+                                  , prevDataValid     = False
+                                  , dotAccumulator    = 0
+                                  , attentionScores   = scores'
+                                  , maxAttentionScore = maxScore'
+                                  , currentAddress    = 0
+                                  }
+                         else st0 { seqIndexCounter   = tNext
+                                  , headDimCounter    = dNext
+                                  , dotAccumulator    = dotAcc'
+                                  , attentionScores   = scores'
+                                  , maxAttentionScore = maxScore'
+                                  , currentAddress    = addressThisCycle
+                                  }
+                  else st0 { currentAddress = 0 }
+              _ -> st0
 
-  nextMaxAccumulatorSignal =
-    mux startPulseSignal (pure (-(1/0)))
-    $ mux dotBoundarySignal newMaxSignal maxAccumulatorSignal
-  nextSumAccumulatorSignal =
-    mux startPulseSignal (pure 0)
-    $ mux dotBoundarySignal newSumSignal sumAccumulatorSignal
+      -- ACC phase passes
+      (denom', isSecondPass', outVec', addrAcc, accDoneNow) =
+        case currentPhase st1 of
+          PhaseAccumulate | isRunning st1 && not (isSecondPass st1) ->
+            let t'      = seqIndexCounter st1
+                sVal    = attentionScores st1 !! t'
+                addVal  = exp (sVal - maxAttentionScore st1)
+                denomN  = expDenominator st1 + addVal
+                lastT   = t' == seqIdx
+            in if lastT
+                 then (denomN, True,  outputVector st1, 0, False)
+                 else (denomN, False, outputVector st1, 0, False)
+          PhaseAccumulate | isRunning st1 && isSecondPass st1 ->
+            let outV   = outputVector st1
+                wUn    = if prevDataValid st1 then exp ( (attentionScores st1 !! prevSeqIndex st1) - maxAttentionScore st1) else 0
+                w      = if expDenominator st1 /= 0 then wUn / expDenominator st1 else 0
+                outAt  = (outV !! prevHeadDimIndex st1) + (if prevDataValid st1 then w * vAligned else 0)
+                outV'  = if prevDataValid st1 then replace (prevHeadDimIndex st1) outAt outV else outV
+                accDone = prevDataValid st1 && lastHeadDim (prevHeadDimIndex st1) && lastSeqIdx (prevSeqIndex st1)
+            in (expDenominator st1, isSecondPass st1, outV', Addressing.computeBankAddress (seqIndexCounter st1) (headDimCounter st1), accDone)
+          _ -> (expDenominator st1, isSecondPass st1, outputVector st1, 0, False)
 
-  scaleOldRegisterSignal = regEn 1 enableSignal (mux dotBoundarySignal scaleOldSignal scaleOldRegisterSignal)
-  scaleNewRegisterSignal = regEn 0 enableSignal (mux dotBoundarySignal scaleNewSignal scaleNewRegisterSignal)
+      st2 = case currentPhase st1 of
+              PhaseAccumulate | isRunning st1 && not (isSecondPass st1) ->
+                let t' = if seqIndexCounter st1 == seqIdx then seqIndexCounter st1 else incSeqIdx (seqIndexCounter st1)
+                in if isSecondPass'
+                     then st1 { isSecondPass   = True
+                              , expDenominator = denom'
+                              , seqIndexCounter = 0
+                              , headDimCounter  = 0
+                              , prevDataValid   = False
+                              , currentAddress  = 0
+                              }
+                     else st1 { expDenominator = denom', seqIndexCounter = t', currentAddress = 0 }
+              PhaseAccumulate | isRunning st1 && isSecondPass st1 ->
+                if accDoneNow
+                  then st1 { currentPhase = PhaseFinalize
+                           , outputVector = outVec'
+                           , currentAddress = 0
+                           }
+                  else st1 { outputVector = outVec'
+                           , seqIndexCounter = if lastHeadDim (headDimCounter st1) then (if lastSeqIdx (seqIndexCounter st1) then seqIndexCounter st1 else incSeqIdx (seqIndexCounter st1)) else seqIndexCounter st1
+                           , headDimCounter  = incHeadDim (headDimCounter st1)
+                           , currentAddress  = addrAcc
+                           }
+              _ -> st1
 
-  numeratorVectorSignal = regEn (repeat 0 :: Vec HeadDimension Float) enableSignal nextNumeratorVectorSignal
-  numeratorElementPrev  = (!!) <$> numeratorVectorSignal <*> previousDimensionCounterSignal
-  numeratorElementUpd   =
-    (\o v a b -> o * b + v * a) <$> numeratorElementPrev <*> valueElementSignal
-                                <*> scaleNewRegisterSignal <*> scaleOldRegisterSignal
+      -- Final phase
+      st3 = case currentPhase st2 of
+              PhaseFinalize ->
+                st2 { currentPhase = PhaseFinalize
+                    , isRunning    = False
+                    , donePulse    = True
+                    , currentAddress = 0
+                    }
+              _ -> st2
 
-  canAccumulateAcc = warmupSignal .&&. isAccPhase
-  nextNumeratorVectorSignal =
-    mux startPulseSignal (pure (repeat 0))
-    $ mux isAccPhase
-        (mux canAccumulateAcc (replace <$> previousDimensionCounterSignal
-                                       <*> numeratorElementUpd
-                                       <*> numeratorVectorSignal)
-                              numeratorVectorSignal)
-        numeratorVectorSignal
+      -- Update pipeline registers
+      st4 = st3
+        { prevStartSignal = startNow
+        , prevSeqIndex    = seqIndexCounter st3
+        , prevHeadDimIndex= headDimCounter st3
+        , prevDataValid   = case currentPhase st3 of
+                              PhaseDotProduct -> True
+                              PhaseAccumulate | isSecondPass st3 -> True
+                              _ -> False
+        , prevKeyValue    = kRamIn
+        , prevValueValue  = vRamIn
+        }
 
-  outputVectorSignal = regEn (repeat 0 :: Vec HeadDimension Float) enableSignal nextOutputVectorSignal
-  outputElementDiv   = (/ ) <$> numeratorElementPrev <*> sumAccumulatorSignal
-  canFinalize        = warmupSignal .&&. isFinalizePhase
-  nextOutputVectorSignal =
-    mux startPulseSignal (pure (repeat 0))
-    $ mux isFinalizePhase
-        (mux canFinalize (replace <$> previousDimensionCounterSignal
-                                  <*> outputElementDiv
-                                  <*> outputVectorSignal)
-                         outputVectorSignal)
-        outputVectorSignal
+      out :: AttentionOutput
+      out = ( currentAddress st4
+            , outputVector st4
+            , isRunning st4
+            , donePulse st4
+            )
+    in (st4, out)
 
-  nextPhaseSignal =
-    liftA5
-      (\ph warm dLast tLast dotB ->
-        case ph of
-          PhaseDot      -> if dotB then PhaseAcc else PhaseDot
-          PhaseAcc      -> if warm && dLast then (if tLast then PhaseFinalize else PhaseDot) else PhaseAcc
-          PhaseFinalize -> if warm && dLast then PhaseDot else PhaseFinalize)
-      phaseSignal warmupSignal isLastDimensionSignal isLastTimeSignal dotBoundarySignal
+  oSig = mealy step initialState (bundle (startSignal, seqIndexSignal, qSignal, kBypassSignal, vBypassSignal, kRamSignal, vRamSignal))
 
-  nextDimensionCounterSignal =
-    liftA4
-      (\ph warm dLast cur ->
-        case ph of
-          PhaseDot      -> if warm && dLast then 0 else if warm then succ cur else cur
-          PhaseAcc      -> if warm && dLast then 0 else if warm then succ cur else cur
-          PhaseFinalize -> if warm && dLast then 0 else if warm then succ cur else cur)
-      phaseSignal warmupSignal isLastDimensionSignal dimensionCounterSignal
-
-  nextTimeCounterSignal =
-    liftA5
-      (\ph warm dLast tLast cur ->
-        case ph of
-          PhaseDot      -> cur
-          PhaseAcc      -> if warm && dLast then (if tLast then 0 else succ cur) else cur
-          PhaseFinalize -> cur)
-      phaseSignal warmupSignal isLastDimensionSignal isLastTimeSignal timeCounterSignal
-
-  donePulseSignal =
-    register False $ (&&) <$> (isFinalizePhase .&&. warmupSignal) <*> isLastDimensionSignal
+  (addressOut, outputVecOut, busyOut, doneOut) = unbundle oSig

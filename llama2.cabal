@@ -72,6 +72,7 @@ executable llama2
     ImplicitParams
     InstanceSigs
     KindSignatures
+    LambdaCase
     MonoLocalBinds
     NamedFieldPuns
     NoImplicitPrelude
