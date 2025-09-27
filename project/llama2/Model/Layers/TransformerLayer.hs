@@ -49,11 +49,14 @@ multiCycleTransformerLayer layer kvRamOwner layerIndex processingStateSignal int
   , attentionDoneThisLayerSignal
   , commitCycle3Signal
   , attentionDoneThisLayerSignal
-  , xHatSignal
+  , xHatSignalDbg
   )
  where
   mha  = multiHeadAttention layer
   ffn  = feedforwardNetwork layer
+
+  -- xHat = rmsnorm(x, rms_att) for debugging
+  xHatSignalDbg = (\idata -> rmsNorm (inputVector idata) (MultiHeadAttention.rmsAtt mha)) <$> intermediateDataSignal
 
   -- Drive all KV banks; collect per-head outputs, head-done pulses, and per-bank write-done
   (perHeadOutputSignalsVec, perHeadDoneSignalsVec, perBankWriteDoneVec) =
@@ -71,19 +74,6 @@ multiCycleTransformerLayer layer kvRamOwner layerIndex processingStateSignal int
   attentionDoneThisLayerSignal =
     liftA2 (\now prev -> now && not prev) allHeadsDoneSignal allHeadsDonePrevSignal
 
-  -- xHat = rmsnorm(x, rms_att) for debugging
-  xHatSignal =
-    (\idata -> rmsNorm (inputVector idata) (MultiHeadAttention.rmsAtt mha)) <$> intermediateDataSignal
-
-  -- Per-head WO @ head, then sum across heads (equivalent to WO @ concatHeads)
-  perHeadProjectedSignalsVec =
-    zipWith (\wo hSig -> matrixVectorMult wo <$> hSig) (MultiHeadAttention.mWo mha) perHeadOutputSignalsVec
-  perHeadProjectedSignal = sequenceA perHeadProjectedSignalsVec
-  woHeadsSignal          = fmap (foldl1 (zipWith (+))) perHeadProjectedSignal
-
-  -- x_after_attn = x + WO@heads
-  xAfterAttnSignal = (zipWith (+) . inputVector <$> intermediateDataSignal) <*> woHeadsSignal
-
   -- Default per-stage work within this layer
   baseNextIntermediateDataSignal =
     liftA2 (processStage mha ffn layerIndex) processingStateSignal intermediateDataSignal
@@ -96,6 +86,31 @@ multiCycleTransformerLayer layer kvRamOwner layerIndex processingStateSignal int
         && processingLayer ps == layerIndex
         && banksDone)
         <$> processingStateSignal <*> allBanksDoneSignal
+
+  -- Per-head WO @ head, then sum across heads (equivalent to WO @ concatHeads)
+  perHeadProjectedSignalsVec =
+    zipWith (\wo hSig -> matrixVectorMult wo <$> hSig) (MultiHeadAttention.mWo mha) perHeadOutputSignalsVec
+
+  perHeadProjectedSignal = sequenceA perHeadProjectedSignalsVec
+  woHeadsSignal          = fmap (foldl1 (zipWith (+))) perHeadProjectedSignal
+
+  -- x_after_attn = x + WO@heads
+  xAfterAttnSignal =
+      liftA3
+        (\ps idata woHeads ->
+          let xInput = inputVector idata
+              summed = zipWith (+) xInput woHeads
+              seqPos = sequencePosition ps
+              !_ = trace
+                    ("[TRACE][L" P.++ show layerIndex
+                      P.++ " P" P.++ show seqPos
+                      P.++ "] WO@head_concat=" P.++ show (P.take 4 (toList woHeads)) P.++ "...")
+                    ()
+          in summed)
+        processingStateSignal
+        intermediateDataSignal
+        woHeadsSignal
+
 
   -- Commit attention output on this layer’s attnDone pulse in Stage3_Attend.
   -- Print the exact vector being committed (first 8 elems) once per (L, P).
