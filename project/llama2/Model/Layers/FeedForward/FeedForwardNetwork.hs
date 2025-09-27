@@ -4,8 +4,10 @@ module Model.Layers.FeedForward.FeedForwardNetwork (
 
 import Clash.Prelude
 
-import Model.Core.Types (CArray2D, ModelDim, HiddenDim)
+import Model.Core.Types (CArray2D, ModelDim, HiddenDim, NumLayers, NumKeyValueHeads, SeqLen)
 import Helpers (rmsNorm, matrixVectorMult)
+import qualified Prelude as P
+import Debug.Trace (trace)
 
 data FeedForwardNetworkComponent = FeedForwardNetworkComponent
   { fW1 :: CArray2D HiddenDim ModelDim,
@@ -18,11 +20,27 @@ data FeedForwardNetworkComponent = FeedForwardNetworkComponent
 computeFeedForward
   :: FeedForwardNetworkComponent
   -> Vec ModelDim Float
+  -> Index SeqLen
+  -> Index NumLayers
   -> Vec ModelDim Float
-computeFeedForward ffn x =
-  let xHat     = rmsNorm x (fRMSFfn ffn)                  -- single pre-norm here
-      ffnCore  = runFeedForward ffn xHat                  -- no extra norm inside
-  in zipWith (+) x ffnCore
+computeFeedForward ffn inputVector seqPos layerIndex =
+  let
+    xHat     = rmsNorm inputVector (fRMSFfn ffn)        -- single pre-norm here
+    ffnCore  = runFeedForward ffn xHat                  -- no extra norm inside
+    out = zipWith (+) inputVector ffnCore
+    !_ = trace ("[TRACE][L" P.++ show layerIndex
+                P.++ " P" P.++ show seqPos
+                P.++ "] x_after_attn = "
+                P.++ show (P.take 4 (toList inputVector))) ()
+    !_ = trace ("[TRACE][L" P.++ show layerIndex
+                P.++ " P" P.++ show seqPos
+                P.++ "] xHat_ffn = "
+                P.++ show (P.take 4 (toList xHat))) ()
+    !_ = trace ("[TRACE][L" P.++ show layerIndex
+                P.++ " P" P.++ show seqPos
+                P.++ "] x_after_ffn(1) = "
+                P.++ show (P.take 4 (toList out))) ()
+  in out
 
 runFeedForward :: FeedForwardNetworkComponent -> Vec ModelDim Float -> Vec ModelDim Float
 runFeedForward ffn xHat =

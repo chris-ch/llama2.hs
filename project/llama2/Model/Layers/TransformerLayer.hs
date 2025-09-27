@@ -84,16 +84,9 @@ multiCycleTransformerLayer layer kvRamOwner layerIndex processingStateSignal int
   -- x_after_attn = x + WO@heads
   xAfterAttnSignal = (zipWith (+) . inputVector <$> intermediateDataSignal) <*> woHeadsSignal
 
-  -- Commit attention output on this layer’s attnDone pulse in Stage3_Attend
-  nextIntermediateDataSignal =
-    liftA4
-      (\ps cur attOut done ->
-         if processingLayer ps == layerIndex
-            && processingStage ps == Stage3_Attend
-            && done
-           then cur { attentionOutput = attOut }
-           else cur)
-      processingStateSignal baseNextIntermediateDataSignal xAfterAttnSignal attentionDoneThisLayerSignal
+  -- Default per-stage work within this layer
+  baseNextIntermediateDataSignal =
+    liftA2 (processStage mha ffn layerIndex) processingStateSignal intermediateDataSignal
 
   -- Layer write-done = AND across banks (Stage2_WriteKV)
   writeDoneThisLayerSignal =
@@ -104,7 +97,26 @@ multiCycleTransformerLayer layer kvRamOwner layerIndex processingStateSignal int
         && banksDone)
         <$> processingStateSignal <*> allBanksDoneSignal
 
-  -- The same gated-commit view, exposed as a tap at Cycle3
+  -- Commit attention output on this layer’s attnDone pulse in Stage3_Attend.
+  -- Print the exact vector being committed (first 8 elems) once per (L, P).
+  nextIntermediateDataSignal =
+    liftA4
+      (\ps cur attOut done ->
+         if processingLayer ps == layerIndex
+            && processingStage ps == Stage3_Attend
+            && done
+           then
+             let seqPos = sequencePosition ps
+                 !_ = trace ("[TRACE][L" P.++ show layerIndex
+                             P.++ " P" P.++ show seqPos
+                             P.++ "] attnOut(commit) = "
+                             P.++ show (P.take 8 (toList attOut)))
+                             ()
+             in cur { attentionOutput = attOut }
+           else cur)
+      processingStateSignal baseNextIntermediateDataSignal xAfterAttnSignal attentionDoneThisLayerSignal
+
+  -- The same gated-commit view, exposed as a tap at Cycle3 (no trace here to avoid duplicate prints)
   commitCycle3Signal =
     liftA4
       (\ps cur attOut done ->
@@ -114,10 +126,6 @@ multiCycleTransformerLayer layer kvRamOwner layerIndex processingStateSignal int
            then cur { attentionOutput = attOut }
            else cur)
       processingStateSignal intermediateDataSignal xAfterAttnSignal attentionDoneThisLayerSignal
-
-  -- Default per-stage work within this layer
-  baseNextIntermediateDataSignal =
-    liftA2 (processStage mha ffn layerIndex) processingStateSignal intermediateDataSignal
 
 processStage
   :: MultiHeadAttention.MultiHeadAttentionComponent
@@ -134,38 +142,42 @@ processStage mha ffn layerIndex ps idata
       Stage1_ProjectQKV ->
         let (qs, ks, vs) = MultiHeadAttention.projectQKV mha ps (inputVector idata) layerIndex
             seqPos = sequencePosition ps
-            !_ = trace ("[TRACE][L" P.++ show layerIndex P.++
-                        " P" P.++ show seqPos P.++ "] x_input = " P.++
-                        show (P.take 4 (toList (inputVector idata)))) ()
+            !_ = trace ("[TRACE][L" P.++ show layerIndex
+                        P.++ " P" P.++ show seqPos
+                        P.++ "] x_input = "
+                        P.++ show (P.take 4 (toList (inputVector idata)))) ()
         in idata { queryVectors = qs, keyVectors = ks, valueVectors = vs }
 
       -- Stage2: write K,V(pos) to cache
       Stage2_WriteKV -> idata
 
-      -- Stage3: stream attention (sequenced outside)
+      -- Stage3: stream attention (sequenced outside).
+      -- NOTE: This prints the previous attentionOutput. The new value is printed at commit.
       Stage3_Attend ->
         let seqPos = sequencePosition ps
-            attnOut = attentionOutput idata
-            !_ = trace ("[TRACE][L" P.++ show layerIndex P.++
-                        " P" P.++ show seqPos P.++ "] attnOut = " P.++
-                        show (P.take 4 (toList attnOut))) ()
+            prevAttnOut = attentionOutput idata
+            !_ = trace ("[TRACE][L" P.++ show layerIndex
+                        P.++ " P" P.++ show seqPos
+                        P.++ "] attnOut(prev) = "
+                        P.++ show (P.take 4 (toList prevAttnOut))) ()
         in idata
 
       -- Stage4: FFN
       Stage4_FeedForward ->
         let seqPos = sequencePosition ps
-            ffnOut = FeedForwardNetwork.computeFeedForward ffn (attentionOutput idata)
-            !_ = trace ("[TRACE][L" P.++ show layerIndex P.++
-                        " P" P.++ show seqPos P.++ "] x_after_ffn = " P.++
-                        show (P.take 4 (toList ffnOut))) ()
+            ffnOut = FeedForwardNetwork.computeFeedForward ffn (attentionOutput idata) seqPos layerIndex
+            !_ = trace ("[TRACE][L" P.++ show layerIndex
+                        P.++ " P" P.++ show seqPos
+                        P.++ "] x_after_ffn = "
+                        P.++ show (P.take 4 (toList ffnOut))) ()
         in idata { feedForwardOutput = ffnOut }
 
       -- Stage5: bookkeeping only
       Stage5_Bookkeeping ->
-        -- optional: trace summary of everything here if desired
         let seqPos = sequencePosition ps
-            !_ = trace ("[TRACE][L" P.++ show layerIndex P.++
-                        " P" P.++ show seqPos P.++ "] bookkeeping") ()
+            !_ = trace ("[TRACE][L" P.++ show layerIndex
+                        P.++ " P" P.++ show seqPos
+                        P.++ "] bookkeeping") ()
         in idata
 
 
