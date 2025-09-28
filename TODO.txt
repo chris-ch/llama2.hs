@@ -55,8 +55,12 @@ A workable 5‑stage per‑layer micro‑architecture (each stage can itself ite
 -------------------------------------
 Unit test attention
 State machine at Attention level? Bad idea?
+Merge fillOneBank with Attention for isolating problem and refactor
 
 --------------------------------- Bug fixing
+Reference run:
+./run data/stories15M.bin -t 0 -i "Hi" -z data/tokenizer.bin | head -1000
+"Hippy was a little boy who loved to play with his toys. He had a big box full of them, and he liked to make them talk[...]"
 
 [L-1 P1] token_embedding: 0.00937854 0.00358759 -0.00300581 0.00509678 ...
 [L0 P1] x_input: 0.00937854 0.00358759 -0.00300581 0.00509678 ...

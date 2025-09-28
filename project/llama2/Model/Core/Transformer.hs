@@ -26,8 +26,6 @@ import qualified Model.Core.PipelineController as PipelineController
   ( runPipelineController
   , PipelineOutputs (..)
   )
-import Debug.Trace (trace)
-import qualified Prelude as P
 
 initialIntermediateData :: IntermediateData
 initialIntermediateData = IntermediateData
@@ -75,7 +73,7 @@ multiCycleTransformer
      , Signal dom (Vec ModelDim Float)
      )
 multiCycleTransformer decoder cacheOwners inputTokenSignal inputTokenValid temperatureSignal seedSignal =
-  ( selectedTokenSignalDebug
+  ( selectedTokenSignal
   , PipelineController.readyPulse ctrl
   , tapValid
   , tapLayerIdxOut
@@ -107,18 +105,7 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal inputTokenValid tempe
   selectedTokenSignal =
     mux inputTokenValid inputTokenSignal feedbackTokenSignal
 
-  -- === DEBUG TRACE TOKEN only when readyPulse ===
-  selectedTokenSignalDebug :: Signal dom Token
-  selectedTokenSignalDebug =
-    liftA2
-      (\tok ready ->
-         if ready
-           then trace ("[TOKEN] " P.++ show tok) tok
-           else tok)
-      selectedTokenSignal
-      (PipelineController.readyPulse ctrl)
-
-  tokenEmbeddingSignal = embed (vocabulary embeddingComponent) <$> selectedTokenSignalDebug
+  tokenEmbeddingSignal = embed (vocabulary embeddingComponent) <$> selectedTokenSignal
 
   -- Per-position intermediate data register
   intermediateDataSignal = register initialIntermediateData nextIntermediateDataSignal

@@ -31,7 +31,6 @@ executable llama2
     Model.Embedding.PRNG,
     Model.Layers.Attention.MultiHeadAttention,
     Model.Layers.Attention.AttentionHead,
-    Model.Layers.Attention.AttentionHeadComb,
     Model.Layers.FeedForward.FeedForwardNetwork,
     Model.Layers.TransformerLayer,
     Model.Memory.Addressing,

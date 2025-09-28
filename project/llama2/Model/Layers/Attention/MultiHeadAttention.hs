@@ -6,10 +6,9 @@ import Clash.Prelude
 
 import Model.Core.Types (NumQueryHeads, ModelDim, NumKeyValueHeads,
   HeadDimension, CArray2D (..), SingleHeadComponent (..),
-  FreqDim, RotaryEncodingComponent (..), ProcessingState (..), NumLayers)
+  FreqDim, RotaryEncodingComponent (..))
 import Helpers (matrixVectorMult, rmsNorm)
 import qualified Prelude as P
-import Debug.Trace (trace)
 
 newtype StepCount = StepCount (Unsigned 32) deriving (Show, Eq, Ord)
 
@@ -62,10 +61,8 @@ computeHeadKV
   :: SingleHeadComponent
   -> StepCount
   -> Vec ModelDim Float
-  -> Index NumKeyValueHeads
-  -> Index NumLayers
   -> (Vec HeadDimension Float, Vec HeadDimension Float)
-computeHeadKV headComp step xHat headIdx layerIdx =
+computeHeadKV headComp step xHat =
   let
     k = matrixVectorMult (wkHead headComp) xHat  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
     v = matrixVectorMult (wvHead headComp) xHat  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
@@ -73,25 +70,6 @@ computeHeadKV headComp step xHat headIdx layerIdx =
     CArray2D _wQ = wqHead headComp
     CArray2D _wK = wkHead headComp
     CArray2D _wV = wvHead headComp
-    StepCount stp = step
-    !_ = traceIf (headIdx == 0)
-                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] k_before_rope = " P.++ P.show (P.take 4 $ toList k) P.++ "...")
-                ()
-    !_ = traceIf (headIdx == 0)
-                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] Wk[layer] = " P.++ P.show (P.take 4 $ toList (_wK !! 0)) P.++ "...")
-                ()
-    !_ = traceIf (headIdx == 0)
-                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] Wv[layer] = " P.++ P.show (P.take 4 $ toList (_wV !! 0)) P.++ "...")
-                ()
-    !_ = traceIf (headIdx == 0)
-                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] Wq[layer] = " P.++ P.show (P.take 4 $ toList (_wQ !! 0)) P.++ "...")
-                ()
-    !_ = traceIf (headIdx == 0)
-                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] v = " P.++ P.show (P.take 4 $ toList v) P.++ "...")
-                ()
-    !_ = traceIf (headIdx == 0)
-                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] k_after_rope = " P.++ P.show (P.take 4 $ toList kRot) P.++ "...")
-                ()
   in (kRot, v)
 
 -- Compute Q for a head
@@ -99,37 +77,22 @@ computeHeadQ
   :: SingleHeadComponent
   -> StepCount
   -> Vec ModelDim Float
-  -> Index NumKeyValueHeads
-  -> Index NumLayers
   -> Vec HeadDimension Float
-computeHeadQ headComp step xHat headIdx layerIdx =
+computeHeadQ headComp step xHat =
   let
     q = matrixVectorMult (wqHead headComp) xHat  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
     qRot = applyRotation (rotary headComp) step q
 
     CArray2D _wK = wkHead headComp
-    StepCount stp = step
-    -- Trace only when we are processing the very first head (headIdx == 0)
-    !_ = traceIf (headIdx == 0)
-                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] q_before_rope = " P.++ P.show (P.take 4 $ toList q) P.++ "...")
-                ()
-    !_ = traceIf (headIdx == 0)
-                ("[TRACE][L" P.++ P.show layerIdx P.++ " P" P.++ P.show stp P.++ "] q_after_rope = " P.++ P.show (P.take 4 $ toList qRot) P.++ "...")
-                ()
   in qRot
-
-traceIf :: Bool -> String -> a -> a
-traceIf True  msg x = trace msg x
-traceIf False _   x = x
 
 projectQKV :: MultiHeadAttentionComponent
   -> StepCount
   -> Vec ModelDim Float
-  -> Index NumLayers
   -> (Vec NumQueryHeads (Vec HeadDimension Float), 
   Vec NumKeyValueHeads (Vec HeadDimension Float), 
   Vec NumKeyValueHeads (Vec HeadDimension Float))
-projectQKV multiHeadAttentionComponent stepCount inputVector layerIdx = 
+projectQKV multiHeadAttentionComponent stepCount inputVector = 
   let
     normalizedInput = rmsNorm inputVector (rmsAtt multiHeadAttentionComponent)
     -- Queries: one per Q head (with RoPE on Q)
@@ -137,7 +100,7 @@ projectQKV multiHeadAttentionComponent stepCount inputVector layerIdx =
       imap (\queryHeadIdx _ ->
         let
           headComponent = heads multiHeadAttentionComponent !! queryHeadIdx
-          queryRotated = computeHeadQ headComponent stepCount normalizedInput queryHeadIdx layerIdx
+          queryRotated = computeHeadQ headComponent stepCount normalizedInput
         in queryRotated) indicesI
 
     -- Keys/Values: one per KV head (apply RoPE to K only)
@@ -147,7 +110,7 @@ projectQKV multiHeadAttentionComponent stepCount inputVector layerIdx =
           qIdx0 = fromEnum keyValueHeadIdx * (natToNum @NumQueryHeads `P.div` natToNum @NumKeyValueHeads)
           queryIndex = toEnum (min (natToNum @NumQueryHeads - 1) qIdx0) :: Index NumQueryHeads
           headComponent = heads multiHeadAttentionComponent !! queryIndex
-          (keyRotated, valueRotated) = computeHeadKV headComponent stepCount normalizedInput keyValueHeadIdx layerIdx
+          (keyRotated, valueRotated) = computeHeadKV headComponent stepCount normalizedInput
         in (keyRotated, valueRotated)) indicesI
     (keys, values) = unzip keysAndValues
   in (queries, keys, values)
