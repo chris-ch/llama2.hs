@@ -2,49 +2,43 @@ module Model.Layers.Attention.AttentionHead (
   streamHeadAttentionAddrIO
 ) where
 
-import Model.Core.Types (HeadDimension, SeqLen, BankAddress)
 import Clash.Prelude
 import qualified Model.Memory.Addressing as Addressing
+import Model.Core.Types (HeadDimension, SeqLen, BankAddress)
 
--- FSM phases of the attention head
-data AttentionPhase = PhaseDotProduct | PhaseAccumulate | PhaseFinalize
-  deriving (Generic, NFDataX, Eq, Show)
-
--- Full FSM / working state
-data AttentionState = AttentionState
-  { currentPhase      :: AttentionPhase
-  , isRunning         :: Bool
-  , prevStartSignal   :: Bool
-  , currentSeqIndex   :: Index SeqLen
-  , queryVector       :: Vec HeadDimension Float
-  , keyBypassVector   :: Vec HeadDimension Float
-  , valueBypassVector :: Vec HeadDimension Float
-  , seqIndexCounter   :: Index SeqLen
-  , headDimCounter    :: Index HeadDimension
-  , prevSeqIndex      :: Index SeqLen
-  , prevHeadDimIndex  :: Index HeadDimension
-  , prevDataValid     :: Bool
-  , prevKeyValue      :: Float
-  , prevValueValue    :: Float
-  , attentionScores   :: Vec SeqLen Float
-  , maxAttentionScore :: Float
-  , expDenominator    :: Float
-  , isSecondPass      :: Bool
-  , outputVector      :: Vec HeadDimension Float
-  , dotAccumulator    :: Float
-  , currentAddress    :: BankAddress
-  , donePulse         :: Bool
+-- Internal state for one-pass streaming attention over a single head
+data OnePassState = OnePassState
+  { running      :: Bool
+  , prevStart    :: Bool
+  , pos          :: Index SeqLen
+  , qVec         :: Vec HeadDimension Float
+  , kByp         :: Vec HeadDimension Float
+  , vByp         :: Vec HeadDimension Float
+  , tCtr         :: Index SeqLen
+  , iCtr         :: Index HeadDimension
+  , prevT        :: Index SeqLen
+  , prevI        :: Index HeadDimension
+  , prevValid    :: Bool
+  , prevK        :: Float
+  , prevV        :: Float
+  , dotAcc       :: Float
+  , maxScore     :: Float
+  , denom        :: Float
+  , outVec       :: Vec HeadDimension Float
+  , vBuf         :: Vec HeadDimension Float
+  , curAddr      :: BankAddress
+  , donePulse    :: Bool
   }
   deriving (Generic, NFDataX)
 
 type AttentionInput =
-  ( Bool                           -- start
-  , Index SeqLen                   -- current sequence position
-  , Vec HeadDimension Float        -- query vector (Q)
-  , Vec HeadDimension Float        -- current key vector bypass (K[pos])
-  , Vec HeadDimension Float        -- current value vector bypass (V[pos])
-  , Float                          -- key RAM read data
-  , Float                          -- value RAM read data
+  ( Bool                           -- start (true during Stage3_Attend)
+  , Index SeqLen                   -- pos (current sequence index)
+  , Vec HeadDimension Float        -- query vector Q
+  , Vec HeadDimension Float        -- K(pos) bypass vector
+  , Vec HeadDimension Float        -- V(pos) bypass vector
+  , Float                          -- key RAM read data (aligned)
+  , Float                          -- value RAM read data (aligned)
   )
 
 type AttentionOutput =
@@ -54,224 +48,140 @@ type AttentionOutput =
   , Bool                           -- done (1-cycle pulse)
   )
 
+{-# INLINE selectBypass #-}
+selectBypass
+  :: Index SeqLen -> Index SeqLen -> Index HeadDimension
+  -> Vec HeadDimension Float -> Float -> Float
+selectBypass pos t i bypassVec ramOut =
+  if t == pos then bypassVec !! i else ramOut
+
 streamHeadAttentionAddrIO
-  :: (HiddenClockResetEnable dom)
-  => Signal dom Bool                               -- start (true during Stage3_Attend)
-  -> Signal dom (Index SeqLen)                     -- current sequence position
-  -> Signal dom (Vec HeadDimension Float)          -- query vector Q
-  -> Signal dom (Vec HeadDimension Float)          -- current key bypass K(pos)
-  -> Signal dom (Vec HeadDimension Float)          -- current value bypass V(pos)
-  -> Signal dom Float                              -- key RAM read data
-  -> Signal dom Float                              -- value RAM read data
+  :: HiddenClockResetEnable dom
+  => Signal dom Bool
+  -> Signal dom (Index SeqLen)
+  -> Signal dom (Vec HeadDimension Float)
+  -> Signal dom (Vec HeadDimension Float)
+  -> Signal dom (Vec HeadDimension Float)
+  -> Signal dom Float
+  -> Signal dom Float
   -> ( Signal dom BankAddress
      , Signal dom (Vec HeadDimension Float)
      , Signal dom Bool
      , Signal dom Bool )
-streamHeadAttentionAddrIO startSignal seqIndexSignal qSignal kBypassSignal vBypassSignal kRamSignal vRamSignal =
-  (addressOut, outputVecOut, busyOut, doneOut)
+streamHeadAttentionAddrIO startSig posSig qSig kBypSig vBypSig kRamSig vRamSig =
+  unbundle oSig
  where
-  -- Constants
   scale :: Float
-  scale = 1.0 / sqrt ((natToNum @HeadDimension) :: Float)
+  scale = 1.0 / sqrt (natToNum @HeadDimension :: Float)
 
   negBig :: Float
   negBig = -1.0e30
 
-  initialState :: AttentionState
-  initialState = AttentionState
-    { currentPhase      = PhaseDotProduct
-    , isRunning         = False
-    , prevStartSignal   = False
-    , currentSeqIndex   = 0
-    , queryVector       = repeat 0
-    , keyBypassVector   = repeat 0
-    , valueBypassVector = repeat 0
-    , seqIndexCounter   = 0
-    , headDimCounter    = 0
-    , prevSeqIndex      = 0
-    , prevHeadDimIndex  = 0
-    , prevDataValid     = False
-    , prevKeyValue      = 0
-    , prevValueValue    = 0
-    , attentionScores   = repeat 0
-    , maxAttentionScore = negBig
-    , expDenominator    = 0
-    , isSecondPass      = False
-    , outputVector      = repeat 0
-    , dotAccumulator    = 0
-    , currentAddress    = 0
-    , donePulse         = False
+  initialState :: OnePassState
+  initialState = OnePassState
+    { running   = False, prevStart = False
+    , pos       = 0, qVec = repeat 0, kByp = repeat 0, vByp = repeat 0
+    , tCtr      = 0, iCtr = 0, prevT = 0, prevI = 0, prevValid = False
+    , prevK     = 0, prevV = 0
+    , dotAcc    = 0, maxScore = negBig, denom = 0
+    , outVec    = repeat 0, vBuf = repeat 0
+    , curAddr   = 0, donePulse = False
     }
 
-  step :: AttentionState -> AttentionInput -> (AttentionState, AttentionOutput)
-  step st (startNow, seqIndexIn, qIn, kBypassIn, vBypassIn, kRamIn, vRamIn) =
+  step :: OnePassState -> AttentionInput -> (OnePassState, AttentionOutput)
+  step st (startNow, posIn, qIn, kBypIn, vBypIn, kRamIn, vRamIn) =
     let
-      -- detect rising edge of start signal
-      startRise = startNow && not (prevStartSignal st)
+      startRise = startNow && not (prevStart st)
 
-      -- reset on new start
+      -- Start: latch Q/K(pos)/V(pos), reset accumulators and counters
       st0 = if startRise
-        then (initialState
-                { isRunning         = True
-                , currentPhase      = PhaseDotProduct
-                , currentSeqIndex   = seqIndexIn
-                , queryVector       = qIn
-                , keyBypassVector   = kBypassIn
-                , valueBypassVector = vBypassIn })
-        else st { donePulse = False }
-
-      seqIdx     = currentSeqIndex st0
-      qVec       = queryVector st0
-      kByp       = keyBypassVector st0
-      vByp       = valueBypassVector st0
-
-      incHeadDim d' = if d' == maxBound then 0 else succ d'
-      incSeqIdx t'  = if t' == maxBound then maxBound else succ t'
-      lastHeadDim d' = d' == maxBound
-      lastSeqIdx t' = t' == seqIdx
-
-      addressThisCycle =
-        case currentPhase st0 of
-          PhaseDotProduct ->
-            Addressing.computeBankAddress (seqIndexCounter st0) (headDimCounter st0)
-          PhaseAccumulate ->
-            if isSecondPass st0
-              then Addressing.computeBankAddress (seqIndexCounter st0) (headDimCounter st0)
-              else 0
-          PhaseFinalize -> 0
-
-      -- RAM read values align with previous issued address
-      kAligned = if prevSeqIndex st0 == seqIdx
-                   then kByp !! prevHeadDimIndex st0 else prevKeyValue st0
-      vAligned = if prevSeqIndex st0 == seqIdx
-                   then vByp !! prevHeadDimIndex st0 else prevValueValue st0
-      qAligned = qVec !! prevHeadDimIndex st0
-
-      dotAccNow =
-        if isRunning st0 && currentPhase st0 == PhaseDotProduct && prevDataValid st0
-          then dotAccumulator st0 + qAligned * kAligned
-          else dotAccumulator st0
-
-      endOfPrevVec = prevDataValid st0 && lastHeadDim (prevHeadDimIndex st0)
-
-      scoreThisStep = dotAccNow * scale
-      scores'       = if endOfPrevVec
-                        then replace (prevSeqIndex st0) scoreThisStep (attentionScores st0)
-                        else attentionScores st0
-      maxScore'     = if endOfPrevVec
-                        then max (maxAttentionScore st0) scoreThisStep
-                        else maxAttentionScore st0
-      dotAcc'       = if endOfPrevVec then 0 else dotAccNow
-
-      dotPhaseDone  = endOfPrevVec && lastSeqIdx (prevSeqIndex st0)
-
-      dNext = incHeadDim (headDimCounter st0)
-      tNext = if lastHeadDim (headDimCounter st0)
-                then (if lastSeqIdx (seqIndexCounter st0) then seqIndexCounter st0 else incSeqIdx (seqIndexCounter st0))
-                else seqIndexCounter st0
-
-      -- Next state after DOT phase
-      st1 = case currentPhase st0 of
-              PhaseDotProduct ->
-                if isRunning st0
-                  then if dotPhaseDone
-                         then st0 { currentPhase      = PhaseAccumulate
-                                  , seqIndexCounter   = 0
-                                  , headDimCounter    = 0
-                                  , prevDataValid     = False
-                                  , dotAccumulator    = 0
-                                  , attentionScores   = scores'
-                                  , maxAttentionScore = maxScore'
-                                  , currentAddress    = 0
-                                  }
-                         else st0 { seqIndexCounter   = tNext
-                                  , headDimCounter    = dNext
-                                  , dotAccumulator    = dotAcc'
-                                  , attentionScores   = scores'
-                                  , maxAttentionScore = maxScore'
-                                  , currentAddress    = addressThisCycle
-                                  }
-                  else st0 { currentAddress = 0 }
-              _ -> st0
-
-      -- ACC phase passes
-      (denom', isSecondPass', outVec', addrAcc, accDoneNow) =
-        case currentPhase st1 of
-          PhaseAccumulate | isRunning st1 && not (isSecondPass st1) ->
-            let t'      = seqIndexCounter st1
-                sVal    = attentionScores st1 !! t'
-                addVal  = exp (sVal - maxAttentionScore st1)
-                denomN  = expDenominator st1 + addVal
-                lastT   = t' == seqIdx
-            in if lastT
-                 then (denomN, True,  outputVector st1, 0, False)
-                 else (denomN, False, outputVector st1, 0, False)
-          PhaseAccumulate | isRunning st1 && isSecondPass st1 ->
-            let outV   = outputVector st1
-                wUn    = if prevDataValid st1 then exp ( (attentionScores st1 !! prevSeqIndex st1) - maxAttentionScore st1) else 0
-                w      = if expDenominator st1 /= 0 then wUn / expDenominator st1 else 0
-                outAt  = (outV !! prevHeadDimIndex st1) + (if prevDataValid st1 then w * vAligned else 0)
-                outV'  = if prevDataValid st1 then replace (prevHeadDimIndex st1) outAt outV else outV
-                accDone = prevDataValid st1 && lastHeadDim (prevHeadDimIndex st1) && lastSeqIdx (prevSeqIndex st1)
-            in (expDenominator st1, isSecondPass st1, outV', Addressing.computeBankAddress (seqIndexCounter st1) (headDimCounter st1), accDone)
-          _ -> (expDenominator st1, isSecondPass st1, outputVector st1, 0, False)
-
-      st2 = case currentPhase st1 of
-              PhaseAccumulate | isRunning st1 && not (isSecondPass st1) ->
-                let t' = if seqIndexCounter st1 == seqIdx then seqIndexCounter st1 else incSeqIdx (seqIndexCounter st1)
-                in if isSecondPass'
-                     then st1 { isSecondPass   = True
-                              , expDenominator = denom'
-                              , seqIndexCounter = 0
-                              , headDimCounter  = 0
-                              , prevDataValid   = False
-                              , currentAddress  = 0
-                              }
-                     else st1 { expDenominator = denom', seqIndexCounter = t', currentAddress = 0 }
-              PhaseAccumulate | isRunning st1 && isSecondPass st1 ->
-                if accDoneNow
-                  then st1 { currentPhase = PhaseFinalize
-                           , outputVector = outVec'
-                           , currentAddress = 0
-                           }
-                  else st1 { outputVector = outVec'
-                           , seqIndexCounter = if lastHeadDim (headDimCounter st1) then (if lastSeqIdx (seqIndexCounter st1) then seqIndexCounter st1 else incSeqIdx (seqIndexCounter st1)) else seqIndexCounter st1
-                           , headDimCounter  = incHeadDim (headDimCounter st1)
-                           , currentAddress  = addrAcc
-                           }
-              _ -> st1
-
-      -- Final phase
-      st3 = case currentPhase st2 of
-              PhaseFinalize ->
-                st2 { currentPhase = PhaseFinalize
-                    , isRunning    = False
-                    , donePulse    = True
-                    , currentAddress = 0
+              then initialState
+                    { running = True, pos = posIn
+                    , qVec = qIn, kByp = kBypIn, vByp = vBypIn
                     }
-              _ -> st2
+              else st { donePulse = False }
 
-      -- Update pipeline registers
-      st4 = st3
-        { prevStartSignal = startNow
-        , prevSeqIndex    = seqIndexCounter st3
-        , prevHeadDimIndex= headDimCounter st3
-        , prevDataValid   = case currentPhase st3 of
-                              PhaseDotProduct -> True
-                              PhaseAccumulate | isSecondPass st3 -> True
-                              _ -> False
-        , prevKeyValue    = kRamIn
-        , prevValueValue  = vRamIn
-        }
+      run = running st0
+
+      -- Issue address for current (tCtr,iCtr) while running
+      addrThis = if run
+                   then Addressing.computeBankAddress (tCtr st0) (iCtr st0)
+                   else 0
+
+      -- Align RAM outputs (previous address), apply bypass for t==pos
+      kAligned = if prevValid st0
+                   then selectBypass (pos st0) (prevT st0) (prevI st0) (kByp st0) (prevK st0)
+                   else 0
+      vAligned = if prevValid st0
+                   then selectBypass (pos st0) (prevT st0) (prevI st0) (vByp st0) (prevV st0)
+                   else 0
+      qAligned = if prevValid st0 then (qVec st0 !! prevI st0) else 0
+
+      -- Accumulate dot(q,k_t) and capture V(t,i) into a row buffer
+      dotAcc' = if run && prevValid st0 then dotAcc st0 + qAligned * kAligned else dotAcc st0
+      vBuf'   = if run && prevValid st0 then replace (prevI st0) vAligned (vBuf st0) else vBuf st0
+
+      endOfPrevRow = prevValid st0 && prevI st0 == maxBound
+      lastTPrev    = prevT st0 == pos st0
+
+      -- When a full row t finishes, update online softmax:
+      -- Keep track of running max m, denom d, and output outVec.
+      -- If new score s <= m:   d' = d + exp(s-m);   out' = out + exp(s-m) * V(t)
+      -- If new score s  > m:   d' = 1 + d*exp(m-s); out' = V(t) + out*exp(m-s); m' = s
+      sNow       = dotAcc' * scale
+      m0         = maxScore st0
+      d0         = denom st0
+      out0       = outVec st0
+      (m1, d1, out1) =
+        if run && endOfPrevRow then
+          if sNow <= m0
+            then
+              let a = exp (sNow - m0)
+              in (m0, d0 + a, zipWith (+) out0 (map (* a) vBuf'))
+            else
+              let a = exp (m0 - sNow)
+              in (sNow, 1 + d0 * a, zipWith (+) (map (* a) out0) vBuf')
+        else (m0, d0, out0)
+
+      -- Advance (t,i) counters
+      iNext = if run then (if iCtr st0 == maxBound then 0 else succ (iCtr st0)) else iCtr st0
+      tNext = if run
+                then if iCtr st0 == maxBound
+                       then (if tCtr st0 == pos st0 then tCtr st0 else succ (tCtr st0))
+                       else tCtr st0
+                else tCtr st0
+
+      -- Clear accumulators at row end; clear vBuf after we folded it in
+      dotNext = if endOfPrevRow then 0 else dotAcc'
+      vBufNext = if endOfPrevRow then repeat 0 else vBuf'
+
+      -- Done when we just finished row t == pos
+      doneNow = run && endOfPrevRow && lastTPrev
+
+      st1 = st0 { curAddr   = addrThis
+                , dotAcc    = dotNext
+                , maxScore  = m1
+                , denom     = d1
+                , outVec    = out1
+                , vBuf      = vBufNext
+                , tCtr      = tNext
+                , iCtr      = iNext
+                , donePulse = doneNow
+                , running   = if doneNow then False else run
+                }
+
+      -- Register previous address and RAM outputs for next cycle
+      st2 = st1 { prevStart = startNow
+                , prevT     = tCtr st1
+                , prevI     = iCtr st1
+                , prevValid = running st1
+                , prevK     = kRamIn
+                , prevV     = vRamIn
+                , curAddr   = if running st1 then addrThis else 0
+                }
 
       out :: AttentionOutput
-      out = ( currentAddress st4
-            , outputVector st4
-            , isRunning st4
-            , donePulse st4
-            )
-    in (st4, out)
+      out = ( curAddr st2, outVec st2, running st2, donePulse st2 )
+    in (st2, out)
 
-  oSig = mealy step initialState (bundle (startSignal, seqIndexSignal, qSignal, kBypassSignal, vBypassSignal, kRamSignal, vRamSignal))
-
-  (addressOut, outputVecOut, busyOut, doneOut) = unbundle oSig
+  oSig = mealy step initialState (bundle (startSig, posSig, qSig, kBypSig, vBypSig, kRamSig, vRamSig))
