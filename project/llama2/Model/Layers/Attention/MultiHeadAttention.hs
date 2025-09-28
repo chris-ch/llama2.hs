@@ -123,16 +123,15 @@ traceIf True  msg x = trace msg x
 traceIf False _   x = x
 
 projectQKV :: MultiHeadAttentionComponent
-  -> ProcessingState
+  -> StepCount
   -> Vec ModelDim Float
   -> Index NumLayers
   -> (Vec NumQueryHeads (Vec HeadDimension Float), 
   Vec NumKeyValueHeads (Vec HeadDimension Float), 
   Vec NumKeyValueHeads (Vec HeadDimension Float))
-projectQKV multiHeadAttentionComponent processingState inputVector layerIdx = 
+projectQKV multiHeadAttentionComponent stepCount inputVector layerIdx = 
   let
     normalizedInput = rmsNorm inputVector (rmsAtt multiHeadAttentionComponent)
-    stepCount = (StepCount $ fromIntegral $ sequencePosition processingState)
     -- Queries: one per Q head (with RoPE on Q)
     queries =
       imap (\queryHeadIdx _ ->

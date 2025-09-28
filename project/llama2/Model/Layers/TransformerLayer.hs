@@ -18,6 +18,7 @@ import qualified Model.Layers.Attention.MultiHeadAttention as MultiHeadAttention
 import qualified Model.Layers.Attention.AttentionHead as AttentionHead
 import Debug.Trace (trace)
 import qualified Prelude as P
+import Model.Layers.Attention.MultiHeadAttention (StepCount(..))
 
 data TransformerLayerComponent = TransformerLayerComponent
   { multiHeadAttention :: MultiHeadAttention.MultiHeadAttentionComponent
@@ -155,12 +156,14 @@ processStage mha ffn layerIndex ps idata
 
       -- Stage1: compute Q,K,V for current layer/pos
       Stage1_ProjectQKV ->
-        let (qs, ks, vs) = MultiHeadAttention.projectQKV mha ps (inputVector idata) layerIndex
-            seqPos = sequencePosition ps
-            !_ = trace ("[TRACE][L" P.++ show layerIndex
-                        P.++ " P" P.++ show seqPos
-                        P.++ "] x_input = "
-                        P.++ show (P.take 4 (toList (inputVector idata)))) ()
+        let
+          seqPos = sequencePosition ps
+          stepCount = (StepCount $ fromIntegral $ sequencePosition ps)
+          (qs, ks, vs) = MultiHeadAttention.projectQKV mha stepCount (inputVector idata) layerIndex
+          !_ = trace ("[TRACE][L" P.++ show layerIndex
+                      P.++ " P" P.++ show seqPos
+                      P.++ "] x_input = "
+                      P.++ show (P.take 4 (toList (inputVector idata)))) ()
         in idata { queryVectors = qs, keyVectors = ks, valueVectors = vs }
 
       -- Stage2: write K,V(pos) to cache
