@@ -320,7 +320,6 @@ generateTokensSimAutoregressive
 generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperature seed = do
   putStrLn $ "✅ Prompt: " ++ show promptTokens
   putStr "<s>\n"
-  putStr "Generated: "
   hFlush stdout
 
   let temps = repeat temperature
@@ -384,11 +383,11 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
   let tokens = Prelude.map (\(t,_,_,_,_,_) -> t) outputs
   mapM_
     (\(tok, tp, l, p, xhat) -> do
-        when tp $ do
-          let (lI, pI) = showPos l p
+        let (lI, pI) = showPos l p
+        let disp = tp && (lI == 5)
+        when disp $ do
           let decoded = T.decodePiece tokenizer (fromIntegral tok) (fromIntegral tok)
           putStr $ "[L" ++ show lI ++ " P" ++ show pI ++ "] "
-          putStr $ "READY=" ++ show tp ++ " "
           putStr $ "token=" ++ show tok ++ " (" ++ BSC.unpack decoded ++ ") "
           putStrLn $ "xHat=" ++ fmt8 xhat
           hFlush stdout
