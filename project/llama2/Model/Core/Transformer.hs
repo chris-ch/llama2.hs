@@ -123,8 +123,7 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal inputTokenValid tempe
       (PipelineController.processingState ctrl) intermediateDataSignal tokenEmbeddingSignal
 
   -- One layer step
-  layerStep
-    :: ( Signal dom IntermediateData
+  layerStep :: ( Signal dom IntermediateData
        , Vec NumLayers (Signal dom Bool)
        , Vec NumLayers (Signal dom Bool)
        , Vec NumLayers (Signal dom Bool)

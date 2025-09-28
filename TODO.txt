@@ -53,9 +53,10 @@ A workable 5‑stage per‑layer micro‑architecture (each stage can itself ite
 
 
 -------------------------------------
-Unit test attention
-State machine at Attention level? Bad idea?
-Merge fillOneBank with Attention for isolating problem and refactor
+- Unit tests
+- Synthesis
+- State machine at Attention level?
+- Merge fillOneBank with Attention for isolating problems and refactor
 
 --------------------------------- Bug fixing
 Reference run:

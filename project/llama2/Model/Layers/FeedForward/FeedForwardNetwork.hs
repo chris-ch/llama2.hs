@@ -15,8 +15,7 @@ data FeedForwardNetworkComponent = FeedForwardNetworkComponent
   } deriving (Show)
 
 -- Pure feed-forward computation
-computeFeedForward
-  :: FeedForwardNetworkComponent
+computeFeedForward :: FeedForwardNetworkComponent
   -> Vec ModelDim Float
   -> Vec ModelDim Float
 computeFeedForward ffn inputVector =

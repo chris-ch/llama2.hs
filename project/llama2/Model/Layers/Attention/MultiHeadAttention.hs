@@ -6,7 +6,7 @@ import Clash.Prelude
 
 import Model.Core.Types (NumQueryHeads, ModelDim, NumKeyValueHeads,
   HeadDimension, CArray2D (..), SingleHeadComponent (..),
-  FreqDim, RotaryEncodingComponent (..))
+  FreqDim, RotaryEncodingComponent (..), SeqLen)
 import Helpers (matrixVectorMult, rmsNorm)
 import qualified Prelude as P
 
@@ -43,30 +43,30 @@ applyRotaryPositionEncoding inputVec cosVec sinVec =
             rotatedImag = realComponent * sinValue + imagComponent * cosValue
 
 -- Index into CArray2D to get a row
-getRow :: forall n m. (KnownNat n) => StepCount -> CArray2D n m -> Vec m Float
-getRow (StepCount i) (CArray2D arr) = arr !! (fromIntegral i :: Index n)
+getRow :: forall n m. (KnownNat n) => Index SeqLen -> CArray2D n m -> Vec m Float
+getRow index (CArray2D arr) = arr !! (fromIntegral index :: Index n)
 
 -- Apply rotation per head
 applyRotation :: RotaryEncodingComponent
-  -> StepCount
+  -> Index SeqLen
   -> Vec HeadDimension Float
   -> Vec HeadDimension Float
-applyRotation rot step tokenVec =
-  let cosFrequencies = getRow step (freqCos rot)
-      sinFrequencies = getRow step (freqSin rot)
+applyRotation rot stepCount tokenVec =
+  let cosFrequencies = getRow stepCount (freqCos rot)
+      sinFrequencies = getRow stepCount (freqSin rot)
   in applyRotaryPositionEncoding tokenVec cosFrequencies sinFrequencies
 
 -- Compute K/V for a head
 computeHeadKV
   :: SingleHeadComponent
-  -> StepCount
+  -> Index SeqLen
   -> Vec ModelDim Float
   -> (Vec HeadDimension Float, Vec HeadDimension Float)
-computeHeadKV headComp step xHat =
+computeHeadKV headComp stepCount xHat =
   let
     k = matrixVectorMult (wkHead headComp) xHat  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
     v = matrixVectorMult (wvHead headComp) xHat  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
-    kRot = applyRotation (rotary headComp) step k
+    kRot = applyRotation (rotary headComp) stepCount k
     CArray2D _wQ = wqHead headComp
     CArray2D _wK = wkHead headComp
     CArray2D _wV = wvHead headComp
@@ -75,19 +75,19 @@ computeHeadKV headComp step xHat =
 -- Compute Q for a head
 computeHeadQ
   :: SingleHeadComponent
-  -> StepCount
+  -> Index SeqLen
   -> Vec ModelDim Float
   -> Vec HeadDimension Float
-computeHeadQ headComp step xHat =
+computeHeadQ headComp stepCount xHat =
   let
     q = matrixVectorMult (wqHead headComp) xHat  -- HeadDimension x ModelDim * ModelDim -> HeadDimension
-    qRot = applyRotation (rotary headComp) step q
+    qRot = applyRotation (rotary headComp) stepCount q
 
     CArray2D _wK = wkHead headComp
   in qRot
 
 projectQKV :: MultiHeadAttentionComponent
-  -> StepCount
+  -> Index SeqLen
   -> Vec ModelDim Float
   -> (Vec NumQueryHeads (Vec HeadDimension Float), 
   Vec NumKeyValueHeads (Vec HeadDimension Float), 

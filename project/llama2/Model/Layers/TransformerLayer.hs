@@ -15,7 +15,6 @@ import Helpers (rmsNorm, matrixVectorMult, liftA4)
 import qualified Model.Memory.KVCacheBank as Cache
 import qualified Model.Layers.FeedForward.FeedForwardNetwork as FeedForwardNetwork
 import qualified Model.Layers.Attention.MultiHeadAttention as MultiHeadAttention
-import Model.Layers.Attention.MultiHeadAttention (StepCount(..))
 import qualified Model.Layers.Attention.AttentionHead (attendHead)
 
 data TransformerLayerComponent = TransformerLayerComponent
@@ -141,8 +140,7 @@ processStage mha ffn layerIndex ps idata
       -- Stage1: compute Q,K,V for current layer/pos
       Stage1_ProjectQKV ->
         let
-          stepCount = (StepCount $ fromIntegral $ sequencePosition ps)
-          (qs, ks, vs) = MultiHeadAttention.projectQKV mha stepCount (inputVector idata)
+          (qs, ks, vs) = MultiHeadAttention.projectQKV mha (sequencePosition ps) (inputVector idata)
         in idata { queryVectors = qs, keyVectors = ks, valueVectors = vs }
 
       -- Stage2: write K,V(pos) to cache
