@@ -19,36 +19,74 @@ source-repository head
   type: git
   location: https://github.com/chris-ch/llama2.hs
 
+library
+  exposed-modules:
+      Helpers
+    , Model.Core.PipelineController
+    , Model.Core.Transformer
+    , Model.Core.Transformer.Internal
+    , Model.Core.Types
+    , Model.Embedding.PRNG
+    , Model.Layers.Attention.AttentionHead
+    , Model.Layers.Attention.MultiHeadAttention
+    , Model.Layers.Attention.MultiHeadAttention.Internal
+    , Model.Layers.FeedForward.FeedForwardNetwork
+    , Model.Layers.FeedForward.FeedForwardNetwork.Internal
+    , Model.Layers.TransformerLayer
+    , Model.Memory.Addressing
+    , Model.Memory.KVCacheBank
+    , Model.Memory.RamOps
+    , Model.Top
+    , Tokenizer
+  hs-source-dirs:
+      project/llama2
+  build-depends:
+      base
+    , binary
+    , bytestring
+    , clash-prelude
+    , containers
+    , mtl
+    , random
+    , vector
+  default-language: Haskell2010
+  default-extensions:
+    BangPatterns
+    DataKinds
+    DeriveAnyClass
+    DeriveGeneric
+    FlexibleContexts
+    GeneralizedNewtypeDeriving
+    ImplicitParams
+    InstanceSigs
+    KindSignatures
+    LambdaCase
+    MonoLocalBinds
+    NamedFieldPuns
+    NoImplicitPrelude
+    OverloadedStrings
+    RecordWildCards
+    ScopedTypeVariables
+    TemplateHaskell
+    TupleSections
+    TypeApplications
+    TypeOperators
+    UndecidableInstances
 
 executable llama2
   main-is: Main.hs
-  other-modules:
-    Helpers,
-    Tokenizer,
-    Model.Core.Transformer,
-    Model.Core.Types,
-    Model.Core.PipelineController,
-    Model.Embedding.PRNG,
-    Model.Layers.Attention.MultiHeadAttention,
-    Model.Layers.Attention.AttentionHead,
-    Model.Layers.FeedForward.FeedForwardNetwork,
-    Model.Layers.TransformerLayer,
-    Model.Memory.Addressing,
-    Model.Memory.KVCacheBank,
-    Model.Memory.RamOps,
-    Model.Top
   hs-source-dirs:
-      project/llama2
-  build-depends: base,
-    clash-prelude,
-    containers,
-    binary,
-    bytestring,
-    mtl,
-    optparse-applicative,
-    random,
-    time,
-    vector
+    project/app
+  build-depends:
+      base
+    , binary
+    , bytestring
+    , clash-prelude
+    , containers
+    , llama2
+    , optparse-applicative
+    , time
+    , vector
   ghc-options:
     -Wall
     -Wcompat
@@ -84,4 +122,46 @@ executable llama2
     TypeApplications
     TypeOperators
     UndecidableInstances
+
+test-suite llama2-test
+  type: exitcode-stdio-1.0
+  main-is: Spec.hs
+  other-modules:
+      Model.Layers.Attention.AttentionHeadSpec
+      Model.Layers.Attention.MultiHeadAttentionSpec
+      Model.Layers.FeedForward.FeedForwardNetworkSpec
+      Model.Layers.TransformerLayerSpec
+  hs-source-dirs:
+      test
+  build-depends:
+      base
+    , clash-prelude
+    , hspec
+    , llama2
+    , QuickCheck
+  build-tool-depends:
+      hspec-discover:hspec-discover
+  ghc-options: -Wall -threaded -rtsopts -with-rtsopts=-N -main-is Spec.main
   default-language: Haskell2010
+  default-extensions:
+    BangPatterns
+    DataKinds
+    DeriveAnyClass
+    DeriveGeneric
+    FlexibleContexts
+    GeneralizedNewtypeDeriving
+    ImplicitParams
+    InstanceSigs
+    KindSignatures
+    LambdaCase
+    MonoLocalBinds
+    NamedFieldPuns
+    NoImplicitPrelude
+    OverloadedStrings
+    RecordWildCards
+    ScopedTypeVariables
+    TemplateHaskell
+    TupleSections
+    TypeApplications
+    TypeOperators
+    UndecidableInstances

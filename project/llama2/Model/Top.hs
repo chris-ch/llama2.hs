@@ -5,7 +5,7 @@ module Model.Top
 import Clash.Prelude
 
 import Model.Core.Types
-  ( Temperature, Seed, ModelDim, NumLayers, SeqLen, Token
+  ( Temperature, Seed, ModelDim, NumLayers, SequenceLength, Token
   )
 
 import qualified Model.Memory.KVCacheBank as Cache
@@ -25,7 +25,7 @@ topEntity
      , Signal dom Bool                 -- ready pulse (end of last FFN)
      , Signal dom Bool                 -- tap pulse (end of Cycle3 for active layer)
      , Signal dom (Index NumLayers)    -- tap layer index
-     , Signal dom (Index SeqLen)       -- tap sequence position
+     , Signal dom (Index SequenceLength)       -- tap sequence position
      , Signal dom (Vec ModelDim Float) -- dbgXHat
      )
 topEntity decoder = Transformer.multiCycleTransformer decoder (repeat Cache.makeRamOwnerKV)

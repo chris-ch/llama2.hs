@@ -29,7 +29,7 @@ import Model.Core.Types
       Token,
       CArray2D(CArray2D),
       HeadDimension,
-      SeqLen,
+      SequenceLength,
       VocabSize,
       NumQueryHeads,
       NumLayers,
@@ -233,8 +233,8 @@ parseModelConfigFile = do
   w2' <- readVec3D @NumLayers @ModelDim @HiddenDim
   w3' <- readVec3D @NumLayers @HiddenDim @ModelDim
   rmsFinalWeight' <- readVec1D @ModelDim
-  freqCisReal' <- readVec2D @SeqLen @FreqDim
-  freqCisImag' <- readVec2D @SeqLen @FreqDim
+  freqCisReal' <- readVec2D @SequenceLength @FreqDim
+  freqCisImag' <- readVec2D @SequenceLength @FreqDim
   let
     embedding = EmbeddingComponent
       { vocabulary     = CArray2D tokenEmbeddingTable'
@@ -332,7 +332,7 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
 
       -- Run DUT; inputs depend on outputs only through tails (breaks <<loop>>)
       outputs :: [( Token, Bool, Bool
-                  , C.Index NumLayers, C.Index SeqLen
+                  , C.Index NumLayers, C.Index SequenceLength
                   , C.Vec ModelDim Float
                   )]
       outputs =
@@ -374,7 +374,7 @@ generateTokensSimAutoregressive decoder tokenizer nSteps promptTokens temperatur
       succIdx :: forall n. (Bounded (C.Index n), Enum (C.Index n)) => C.Index n -> C.Index n
       succIdx p = if p == maxBound then p else succ p
 
-      showPos :: C.Index NumLayers -> C.Index SeqLen -> (Int, Int)
+      showPos :: C.Index NumLayers -> C.Index SequenceLength -> (Int, Int)
       showPos l p =
         let lInt = fromEnum l
             pAdj = if l == maxBound then succIdx p else p
@@ -419,7 +419,7 @@ bundledOutputs
                          , Bool
                          , Bool
                          , C.Index NumLayers
-                         , C.Index SeqLen
+                         , C.Index SequenceLength
                          , C.Vec ModelDim Float
                          )
 bundledOutputs decoder =
@@ -437,7 +437,7 @@ topEntityBundled :: CS.HiddenClockResetEnable dom
      , C.Signal dom Bool
      , C.Signal dom Bool
     , C.Signal dom (C.Index NumLayers)
-    , C.Signal dom (C.Index SeqLen)
+    , C.Signal dom (C.Index SequenceLength)
     , C.Signal dom (C.Vec ModelDim Float)
     )
 topEntityBundled decoder bundledInputs =

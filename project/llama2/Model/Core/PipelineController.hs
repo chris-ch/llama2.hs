@@ -4,7 +4,7 @@ module Model.Core.PipelineController
   ) where
 
 import Clash.Prelude
-import Model.Core.Types (NumLayers, SeqLen, ProcessingState(..), CycleStage(..))
+import Model.Core.Types (NumLayers, SequenceLength, ProcessingState(..), CycleStage(..))
 
 initialProcessingState :: ProcessingState
 initialProcessingState = ProcessingState
@@ -37,7 +37,7 @@ data PipelineOutputs dom = PipelineOutputs
   { processingState   :: Signal dom ProcessingState
   , stageSignal       :: Signal dom CycleStage
   , layerIndex        :: Signal dom (Index NumLayers)
-  , seqPos            :: Signal dom (Index SeqLen)
+  , seqPos            :: Signal dom (Index SequenceLength)
   , readyPulse        :: Signal dom Bool
   , stageFinished     :: Signal dom Bool
   }

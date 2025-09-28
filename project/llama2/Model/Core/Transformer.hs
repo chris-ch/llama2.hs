@@ -3,6 +3,8 @@ module Model.Core.Transformer (
 ) where
 
 import Clash.Prelude
+import Model.Core.Transformer.Internal
+
 import Helpers (liftA4)
 import Model.Core.Types
   ( IntermediateData(..)
@@ -11,7 +13,7 @@ import Model.Core.Types
   , NumLayers, Temperature, Seed
   , EmbeddingComponent (..)
   , CArray2D (..)
-  , VocabSize, Token, ModelDim, SeqLen
+  , VocabSize, Token, ModelDim, SequenceLength
   )
 import qualified Model.Memory.KVCacheBank as Cache
 import qualified Model.Layers.TransformerLayer as TransformerLayer
@@ -27,37 +29,7 @@ import qualified Model.Core.PipelineController as PipelineController
   , PipelineOutputs (..)
   )
 
-initialIntermediateData :: IntermediateData
-initialIntermediateData = IntermediateData
-  { inputVector       = repeat 0
-  , queryVectors      = repeat (repeat 0)
-  , keyVectors        = repeat (repeat 0)
-  , valueVectors      = repeat (repeat 0)
-  , attentionOutput   = repeat 0
-  , feedForwardOutput = repeat 0
-  }
-
-outputTokenSignal
-  :: forall dom
-   . HiddenClockResetEnable dom
-  => Signal dom Bool
-  -> Signal dom Temperature
-  -> Signal dom (Unsigned 32)
-  -> TransformerLayer.TransformerDecoderComponent
-  -> Signal dom IntermediateData
-  -> Signal dom (Unsigned 32)
-outputTokenSignal readyPulseSignal temperatureSignal seedSignal decoder nextIntermediateDataSignal =
-  regEn 0 readyPulseSignal
-        (PRNG.sampledTokenSignal readyPulseSignal temperatureSignal seedSignal decoder nextIntermediateDataSignal)
-
-embed :: CArray2D VocabSize ModelDim -> Token -> Vec ModelDim Float
-embed (CArray2D vocab) tokenCode = vocab !! (fromIntegral tokenCode :: Int)
-
-firstJustV :: Vec n (Maybe a) -> Maybe a
-firstJustV = foldr (\m acc -> case m of { Just _ -> m; Nothing -> acc }) Nothing
-
-multiCycleTransformer
-  :: forall dom
+multiCycleTransformer :: forall dom
    . HiddenClockResetEnable dom
   => TransformerLayer.TransformerDecoderComponent
   -> Vec NumLayers (Cache.KVRamOwner dom)
@@ -69,7 +41,7 @@ multiCycleTransformer
      , Signal dom Bool
      , Signal dom Bool
      , Signal dom (Index NumLayers)
-     , Signal dom (Index SeqLen)
+     , Signal dom (Index SequenceLength)
      , Signal dom (Vec ModelDim Float)
      )
 multiCycleTransformer decoder cacheOwners inputTokenSignal inputTokenValid temperatureSignal seedSignal =
@@ -173,7 +145,7 @@ multiCycleTransformer decoder cacheOwners inputTokenSignal inputTokenValid tempe
 
   -- =================== Layer-accurate tap fan-in ====================
   tapPayloadPerLayer :: Vec NumLayers (Signal dom (Maybe ( Index NumLayers
-                                        , Index SeqLen
+                                        , Index SequenceLength
                                         , Vec ModelDim Float
                                         )))
   tapPayloadPerLayer =

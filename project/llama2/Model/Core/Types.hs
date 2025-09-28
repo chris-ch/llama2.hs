@@ -13,10 +13,10 @@ module Model.Core.Types
   , Seed
   , HiddenDim
   , ModelDim
-  ,  NumQueryHeads
+  , NumQueryHeads
   , NumLayers
   , NumKeyValueHeads
-  , SeqLen
+  , SequenceLength
   , HeadDimension
   , FreqDim
   , VocabSize
@@ -56,7 +56,7 @@ type NumKeyValueHeads = 6
 type HeadDimension  = 48
 type FreqDim = 24
 type VocabSize = 32000 :: Nat
-type SeqLen         = 256
+type SequenceLength = 256
 
 {- 
 -- model config 42M
@@ -95,11 +95,11 @@ seqLen = natToNum @SeqLen
 -- Bank and Cache Geometry
 -- ============================================================================
 
-type BankDepth   = SeqLen GHC.TypeNats.* HeadDimension
+type BankDepth   = SequenceLength GHC.TypeNats.* HeadDimension
 type BankAddress = Index BankDepth
 
 -- Global KV-cache geometry (all layers × KV heads × seq × headDim)
-type CacheDepth   = NumLayers GHC.TypeNats.* NumKeyValueHeads GHC.TypeNats.* SeqLen GHC.TypeNats.* HeadDimension
+type CacheDepth   = NumLayers GHC.TypeNats.* NumKeyValueHeads GHC.TypeNats.* SequenceLength GHC.TypeNats.* HeadDimension
 
 -- Dual-port RAM runner type (true dual port)
 type TrueDualPortRunner dom n a =
@@ -137,7 +137,7 @@ instance NFDataX CycleStage where
 data ProcessingState = ProcessingState
   { processingStage  :: CycleStage
   , processingLayer  :: Index NumLayers
-  , sequencePosition :: Index SeqLen
+  , sequencePosition :: Index SequenceLength
   } deriving (Show, Generic, NFDataX)
 
 -- ============================================================================
@@ -153,7 +153,7 @@ data IntermediateData = IntermediateData
   , valueVectors      :: Vec NumKeyValueHeads (Vec HeadDimension Float)
   , attentionOutput   :: Vec ModelDim Float
   , feedForwardOutput :: Vec ModelDim Float
-  } deriving (Show, Generic, NFDataX)
+  } deriving (Show, Generic, NFDataX, Eq)
 
 newtype CArray2D (n :: Nat) (m :: Nat) = CArray2D (Vec n (Vec m Float)) deriving (Show)
 
@@ -169,8 +169,8 @@ data EmbeddingComponent = EmbeddingComponent
   } deriving (Show)
 
 data RotaryEncodingComponent = RotaryEncodingComponent
-  { freqCos :: CArray2D SeqLen FreqDim,
-    freqSin :: CArray2D SeqLen FreqDim
+  { freqCos :: CArray2D SequenceLength FreqDim,
+    freqSin :: CArray2D SequenceLength FreqDim
   } deriving (Show)
 
 data SingleHeadComponent = SingleHeadComponent

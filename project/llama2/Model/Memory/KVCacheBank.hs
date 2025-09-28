@@ -8,7 +8,7 @@ module Model.Memory.KVCacheBank (
 import Clash.Prelude
 import qualified Prelude as P
 
-import Model.Core.Types (TrueDualPortRunner, BankDepth, BankAddress, NumKeyValueHeads, HeadDimension, SeqLen)
+import Model.Core.Types (TrueDualPortRunner, BankDepth, BankAddress, NumKeyValueHeads, HeadDimension, SequenceLength)
 import qualified Model.Memory.RamOps as RamOps (toRamOperation)
 import qualified Model.Memory.Addressing as Addressing
 
@@ -38,7 +38,7 @@ makeRamOwnerKV = KVRamOwner { kvBanks = map (const makeBankKV) indicesI }
 writeSequencer
   :: HiddenClockResetEnable dom
   => Signal dom Bool                                    -- enable signal
-  -> Signal dom (Index SeqLen)                          -- sequence position signal
+  -> Signal dom (Index SequenceLength)                          -- sequence position signal
   -> Signal dom (Vec HeadDimension Float, Vec HeadDimension Float) -- K and V vectors signal
   -> ( Signal dom BankAddress
      , Signal dom (Maybe (BankAddress, Float))  -- K write signal
