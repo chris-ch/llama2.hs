@@ -26,7 +26,7 @@ attendHeadComb q ks vs pos =
               in if fromIntegral (fromEnum t) <= fromIntegral (fromEnum pos) then s else negBig)
            ks
 
-    m   = foldl1 max scores
+    m   = maximum scores
     exps = map (\s -> if s == negBig then 0 else exp (s - m)) scores
     d   = fold (+) exps
 
