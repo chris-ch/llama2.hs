@@ -204,48 +204,48 @@ optionsParser =
 --------------------------------------------------------------------------------
 parseModelConfigFile :: BG.Get ModelConfig
 parseModelConfigFile = do
-  modelDim' <- fromIntegral <$> BG.getInt32le
-  hiddenDim' <- fromIntegral <$> BG.getInt32le
-  nLayers' <- fromIntegral <$> BG.getInt32le
-  numAttentionHeads' <- fromIntegral <$> BG.getInt32le
-  numKeyValueHeads' <- fromIntegral <$> BG.getInt32le
-  vocabSize' <- fromIntegral <$> BG.getInt32le
-  seqLen' <- fromIntegral <$> BG.getInt32le
-  tokenEmbeddingTable' <- readArray2D vocabSize' modelDim'
-  rmsAttWeight' <- readArray2D nLayers' modelDim' :: BG.Get Array2D
-  wq' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
-  wk' <- readArray3D nLayers' modelDim' (numKeyValueHeads' * (modelDim' `div` numAttentionHeads')) :: BG.Get Array3D
-  wv' <- readArray3D nLayers' modelDim' (numKeyValueHeads' * (modelDim' `div` numAttentionHeads')) :: BG.Get Array3D
-  wo' <- readArray3D nLayers' modelDim' modelDim' :: BG.Get Array3D
-  rmsFfnWeight' <- readArray2D nLayers' modelDim' :: BG.Get Array2D
-  w1' <- readArray3D nLayers' hiddenDim' modelDim' :: BG.Get Array3D
-  w2' <- readArray3D nLayers' modelDim' hiddenDim' :: BG.Get Array3D
-  w3' <- readArray3D nLayers' hiddenDim' modelDim' :: BG.Get Array3D
-  rmsFinalWeight' <- readVector modelDim'
-  freqCisReal' <- readArray2D seqLen' ((modelDim' `div` numAttentionHeads') `div` 2)
-  freqCisImag' <- readArray2D seqLen' ((modelDim' `div` numAttentionHeads') `div` 2)
+  modelDim <- fromIntegral <$> BG.getInt32le
+  hiddenDim <- fromIntegral <$> BG.getInt32le
+  numLayers <- fromIntegral <$> BG.getInt32le
+  numAttentionHeads <- fromIntegral <$> BG.getInt32le
+  numKeyValueHeads <- fromIntegral <$> BG.getInt32le
+  vocabSize <- abs . fromIntegral <$> BG.getInt32le
+  seqLen <- fromIntegral <$> BG.getInt32le
+  tokenEmbeddingTable <- readArray2D vocabSize modelDim
+  rmsAttWeight <- readArray2D numLayers modelDim :: BG.Get Array2D
+  wq' <- readArray3D numLayers modelDim modelDim :: BG.Get Array3D
+  wk' <- readArray3D numLayers modelDim (numKeyValueHeads * (modelDim `div` numAttentionHeads)) :: BG.Get Array3D
+  wv' <- readArray3D numLayers modelDim (numKeyValueHeads * (modelDim `div` numAttentionHeads)) :: BG.Get Array3D
+  wo' <- readArray3D numLayers modelDim modelDim :: BG.Get Array3D
+  rmsFfnWeight' <- readArray2D numLayers modelDim :: BG.Get Array2D
+  w1' <- readArray3D numLayers hiddenDim modelDim :: BG.Get Array3D
+  w2' <- readArray3D numLayers modelDim hiddenDim :: BG.Get Array3D
+  w3' <- readArray3D numLayers hiddenDim modelDim :: BG.Get Array3D
+  rmsFinalWeight <- readVector modelDim
+  freqCisReal' <- readArray2D seqLen ((modelDim `div` numAttentionHeads) `div` 2)
+  freqCisImag' <- readArray2D seqLen ((modelDim `div` numAttentionHeads) `div` 2)
 
   let
-      headDim = modelDim' `div` numAttentionHeads'
+      headDimension = modelDim `div` numAttentionHeads
       -- Construct the Embedding
       embedding = EmbeddingComponent
-        { vocabulary = tokenEmbeddingTable',
-          rmsFinalWeight = rmsFinalWeight'
+        { vocabulary = tokenEmbeddingTable,
+          rmsFinalWeight = rmsFinalWeight
         }
       -- Construct the parameters for Transformer layers
       layers =
         [ TransformerLayerComponent {
           multiHeadAttention = MultiHeadAttentionComponent
                 { heads = [ SingleHeadComponent
-                              { wqHead = getHeadArray2D layerIdx headIdx headDim wq'
-                              , wkHead = getHeadArray2D layerIdx (headIdx `div` (numAttentionHeads' `div` numKeyValueHeads')) headDim wk'
-                              , wvHead = getHeadArray2D layerIdx headIdx headDim wv'
+                              { wqHead = getHeadArray2D layerIdx headIdx headDimension wq'
+                              , wkHead = getHeadArray2D layerIdx (headIdx `div` (numAttentionHeads `div` numKeyValueHeads)) headDimension wk'
+                              , wvHead = getHeadArray2D layerIdx headIdx headDimension wv'
                               , rotary = RotaryEncodingComponent { freqCos = freqCisReal', freqSin = freqCisImag' }
                               }
-                          | headIdx <- [0..numAttentionHeads' - 1]
+                          | headIdx <- [0..numAttentionHeads - 1]
                           ]
                 , mWo     = getArray2D layerIdx wo'
-                , rmsAtt = getRow layerIdx rmsAttWeight'
+                , rmsAtt = getRow layerIdx rmsAttWeight
                 },
             feedforwardNetwork = FeedForwardNetworkComponent
                      { fW1 = getArray2D layerIdx w1',
@@ -254,25 +254,15 @@ parseModelConfigFile = do
                        fRMSFfn = getRow layerIdx rmsFfnWeight'
                      }
             }
-        | layerIdx <- [0..nLayers' - 1]
+        | layerIdx <- [0..numLayers - 1]
         ]
       -- Construct the TransformerArchitecture
       decoder = TransformerDecoderComponent
         { modelEmbedding = embedding,
           modelLayers = layers
         }
-  return $
-    ModelConfig
-      { modelDim = modelDim',
-        hiddenDim = hiddenDim',
-        numLayers = nLayers',
-        numAttentionHeads = numAttentionHeads',
-        numKeyValueHeads = numKeyValueHeads',
-        vocabSize = abs vocabSize',
-        seqLen = seqLen',
-        headDimension = headDim,
-        decoder = decoder
-      }
+  return $ ModelConfig {modelDim, hiddenDim, numLayers, numAttentionHeads,
+   numKeyValueHeads, vocabSize, seqLen, headDimension, decoder}
 
 getHeadArray2D :: Int      -- ^ layer index
                -> Int      -- ^ head index

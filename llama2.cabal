@@ -47,8 +47,29 @@ executable llama2
     -threaded
     -haddock
   default-extensions:
-    InstanceSigs
-    NamedFieldPuns
-    OverloadedStrings
+    BangPatterns
+    DataKinds
+    DeriveGeneric
+    DerivingStrategies
+    DoAndIfThenElse
+    FlexibleContexts
+    GADTs
     GeneralizedNewtypeDeriving
+    ImplicitParams
+    InstanceSigs
+    KindSignatures
+    LambdaCase
+    MonoLocalBinds
+    NamedFieldPuns
+    NumericUnderscores
+    OverloadedStrings
+    RecordWildCards
+    ScopedTypeVariables
+    StandaloneDeriving
+    TemplateHaskell
+    TupleSections
+    TypeApplications
+    TypeFamilies
+    TypeOperators
+    UndecidableInstances
   default-language: Haskell2010

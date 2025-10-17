@@ -46,7 +46,13 @@ From that day on, Lily and Tom became good friends. They would often talk and sh
 ## Reproducible output
 
 ```shell
-cabal run -- llama2 --model-file data/stories15M.bin --temperature 0.8 --steps 256 --seed 123 "In that little town"
+cabal run -- llama2 --model-file data/stories42M.bin --temperature 0.8 --steps 256 --seed 123 "In that little town"
+```
+
+```text
+<s>
+In that little town, there was a store. The store was very popular. Everyone loved to go there. The store had many toys and treats for the kids.<0x0A>One day, a little girl named Lily went to the store with her mom. Lily saw a big teddy bear. She asked her mom if she could have it. Her mom said yes. Lily was very happy.<0x0A>When they got home, Lily put the teddy bear in her room. She gave it a hug and a kiss. The teddy bear was her new best friend. They played together all day long.
+<s>
 ```
 
 ## Testing performance
